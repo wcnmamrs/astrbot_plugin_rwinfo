@@ -13,7 +13,7 @@ import traceback
 
 from astrbot.api.all import *
 from astrbot.api import logger
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import filter, AstrMessageEvent, PermissionType
 
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOM_INFO_PY = os.path.join(_PLUGIN_DIR, "room_info.py")
@@ -220,8 +220,9 @@ class RWInfoPlugin(Star):
             return gid not in self.config.get("black_list", [])
         return True
 
-    # ---- 指令 ----
+    # ---- 指令 (全部要求管理员权限) ----
     @filter.command("铁锈全局解析")
+    @filter.permission_type(PermissionType.ADMIN)
     async def cmd_global(self, event: AstrMessageEvent, arg: str = ""):
         arg = (arg or "").strip()
         if not arg:
@@ -236,6 +237,7 @@ class RWInfoPlugin(Star):
         yield event.plain_result(f"全局解析已{'开启' if self.config['global_enabled'] else '关闭'}")
 
     @filter.command("铁锈模式")
+    @filter.permission_type(PermissionType.ADMIN)
     async def cmd_mode(self, event: AstrMessageEvent, arg: str = ""):
         arg = (arg or "").strip()
         if not arg:
@@ -252,6 +254,7 @@ class RWInfoPlugin(Star):
         yield event.plain_result(f"当前模式已切换为：{mode_name}")
 
     @filter.command("铁锈玩家列表")
+    @filter.permission_type(PermissionType.ADMIN)
     async def cmd_show_players(self, event: AstrMessageEvent, arg: str = ""):
         arg = (arg or "").strip()
         if not arg:
@@ -266,18 +269,21 @@ class RWInfoPlugin(Star):
         yield event.plain_result(f"玩家列表显示已{'开启' if self.config['show_players'] else '关闭'}")
 
     @filter.command("铁锈白名")
+    @filter.permission_type(PermissionType.ADMIN)
     async def cmd_white(self, event: AstrMessageEvent, arg: str = ""):
         text = self._cmd_list_text(arg, "white_list", "白名单")
         yield event.plain_result(text)
         self._save_config()
 
     @filter.command("铁锈黑名")
+    @filter.permission_type(PermissionType.ADMIN)
     async def cmd_black(self, event: AstrMessageEvent, arg: str = ""):
         text = self._cmd_list_text(arg, "black_list", "黑名单")
         yield event.plain_result(text)
         self._save_config()
 
     @filter.command("铁锈重试")
+    @filter.permission_type(PermissionType.ADMIN)
     async def cmd_retry(self, event: AstrMessageEvent, arg: str = ""):
         arg = (arg or "").strip()
         if not arg:
