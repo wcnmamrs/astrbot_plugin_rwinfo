@@ -5,7 +5,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-%E6%8F%92%E4%BB%B6-blue)](https://github.com/Soulter/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-green)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
-[![GitHub](https://img.shields.io/badge/GitHub-wcnmamrs%2Fastrbot_plugin_rw_roominfo-black)](https://github.com/wcnmamrs/astrbot_plugin_rw_roominfo)
+[![GitHub](https://img.shields.io/badge/GitHub-wcnmamrs%2Fastrbot_plugin_rwinfo-black)](https://github.com/wcnmamrs/astrbot_plugin_rwinfo)
 
 群内自动识别铁锈战争（Rusted Warfare）房间号，安排探针机器人（ABAB探针01~99）进入房间查询信息并回传：**版本 / 地图 / 资金 / 迷雾 / 禁核 / 倍率 / 模式 / 单位上限 / 默认单位 / 共享控制 / 旁观 / 队伍锁定 / 人数 / Mod / 玩家列表**。
 
@@ -35,7 +35,7 @@
 AstrBot 插件商店搜索安装，或 **WebUI 直接安装**：
 
 1. 打开 AstrBot 管理面板 → **插件管理**
-2. 方式一：粘贴 GitHub 仓库地址 `https://github.com/wcnmamrs/astrbot_plugin_rw_roominfo` 自动拉取安装
+2. 方式一：粘贴 GitHub 仓库地址 `https://github.com/wcnmamrs/astrbot_plugin_rwinfo` 自动拉取安装
 3. 方式二：点击上传，选择本仓库打包的 zip 上传安装
 4. 安装后启用插件即可，无需命令行操作
 
