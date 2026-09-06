@@ -9,4 +9,4 @@ desc: |
   - 支持黑白名单群权限控制
 version: 1.1.0
 author: wcnmamrs
-repo: "https://github.com/wcnmamrs/astrbot_plugin_rw_roominfo"
+repo: "https://github.com/wcnmamrs/astrbot_plugin_rwinfo"
