@@ -1,0 +1,12 @@
+name: astrbot_plugin_rwinfo
+display_name: 铁锈查房
+short_desc: 自动识别群消息中的铁锈战争房间号并安排探针查房
+desc: |
+  铁锈战争房间查询插件:
+  - 自动识别群消息中的房间号 (r/s房 如 r5132, 国际房 如 HLBIFZ)
+  - 安排探针机器人 (ABAB探针01~99) 查询房间信息并回传
+  - 查询到有效房间信息才发送, 查不到自动静默
+  - 支持黑白名单群权限控制
+version: 1.1.0
+author: wcnmamrs
+repo: "https://github.com/wcnmamrs/astrbot_plugin_rw_roominfo"
