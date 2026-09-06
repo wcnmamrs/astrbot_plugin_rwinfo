@@ -1,0 +1,45 @@
+{
+    "global_enabled": {
+        "description": "全局解析开关",
+        "type": "bool",
+        "default": true
+    },
+    "mode": {
+        "description": "名单模式: white(白名单) / black(黑名单)",
+        "type": "string",
+        "default": "black",
+        "options": ["white", "black"]
+    },
+    "white_list": {
+        "description": "白名单群号列表",
+        "type": "list",
+        "default": []
+    },
+    "black_list": {
+        "description": "黑名单群号列表",
+        "type": "list",
+        "default": []
+    },
+    "debug": {
+        "description": "开启调试日志（输出详细运行信息）",
+        "type": "bool",
+        "default": false
+    },
+    "max_players_display": {
+        "description": "玩家列表最多显示人数，超过则折叠",
+        "type": "int",
+        "default": 10
+    },
+    "show_players": {
+        "description": "是否显示玩家列表（默认关闭，避免解析不稳定）",
+        "type": "bool",
+        "default": false
+    },
+    "retry_times": {
+        "description": "探针名字被过滤时自动重试次数（0-10，默认3）",
+        "type": "int",
+        "default": 3,
+        "min": 0,
+        "max": 10
+    }
+}
