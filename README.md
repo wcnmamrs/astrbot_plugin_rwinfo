@@ -32,8 +32,12 @@
 
 ## 📦 安装
 
-1. 将 `astrbot_plugin_rwinfo/` 整个目录（或 zip）复制到 AstrBot 的 `addons/` 目录下
-2. 重启 AstrBot（或热加载插件）
+AstrBot 插件商店搜索安装，或 **WebUI 直接安装**：
+
+1. 打开 AstrBot 管理面板 → **插件管理**
+2. 方式一：粘贴 GitHub 仓库地址 `https://github.com/wcnmamrs/astrbot_plugin_rw_roominfo` 自动拉取安装
+3. 方式二：点击上传，选择本仓库打包的 zip 上传安装
+4. 安装后启用插件即可，无需命令行操作
 
 > 兼容模式：若插件目录内没有 `room_info.py`，会自动回退查找上级目录的 `room_info.py`。
 
