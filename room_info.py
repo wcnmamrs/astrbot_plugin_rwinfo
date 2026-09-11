@@ -51,6 +51,62 @@ STARTING_UNITS = {1: "Normal (1 builder)", 2: "Small Army", 3: "3 Engineers",
 
 # ================================================================ 二进制协议工具
 
+def _decode_lenient(b: bytes) -> str:
+    """容错解码: 处理游戏端把 UTF-16 代理对误当 UTF-8 发送的情况.
+
+    正常 UTF-8 解码遇到 ED A0-BF ... 会抛 UnicodeDecodeError / 替换为 U+FFFD.
+    这里手动解析: 合法 UTF-8 序列照常, 代理对 (ED xx) 还原为正确 Emoji 码点.
+    """
+    out = []
+    i = 0
+    n = len(b)
+    while i < n:
+        c = b[i]
+        # 单字节 ASCII
+        if c < 0x80:
+            out.append(chr(c))
+            i += 1
+            continue
+        # 2 字节 UTF-8
+        if 0xC2 <= c <= 0xDF and i + 1 < n and 0x80 <= b[i+1] <= 0xBF:
+            cp = ((c & 0x1F) << 6) | (b[i+1] & 0x3F)
+            out.append(chr(cp))
+            i += 2
+            continue
+        # 3 字节 UTF-8
+        if 0xE0 <= c <= 0xEF and i + 2 < n and 0x80 <= b[i+1] <= 0xBF and 0x80 <= b[i+2] <= 0xBF:
+            cp = ((c & 0x0F) << 12) | ((b[i+1] & 0x3F) << 6) | (b[i+2] & 0x3F)
+            # 代理区 (U+D800-DFFF): 非法单字符, 视为代理对的一部分
+            if 0xD800 <= cp <= 0xDBFF and i + 3 < n and 0xED <= b[i+3] <= 0xED and 0x80 <= b[i+4] <= 0xBF and 0x80 <= b[i+5] <= 0xBF:
+                # 完整代理对: 高代理 + 低代理
+                lo_cp = ((b[i+3] & 0x0F) << 12) | ((b[i+4] & 0x3F) << 6) | (b[i+5] & 0x3F)
+                if 0xDC00 <= lo_cp <= 0xDFFF:
+                    # 组合成 Unicode 码点
+                    combined = 0x10000 + ((cp - 0xD800) << 10) + (lo_cp - 0xDC00)
+                    out.append(chr(combined))
+                    i += 6
+                    continue
+            # 单独高/低代理 (无配对): 替换
+            if 0xD800 <= cp <= 0xDFFF:
+                out.append('\ufffd')
+                i += 3
+                continue
+            # 普通 3 字节中文等: 正常追加
+            out.append(chr(cp))
+            i += 3
+            continue
+        # 4 字节 UTF-8 (正常 Emoji)
+        if 0xF0 <= c <= 0xF4 and i + 3 < n and 0x80 <= b[i+1] <= 0xBF and 0x80 <= b[i+2] <= 0xBF and 0x80 <= b[i+3] <= 0xBF:
+            cp = ((c & 0x07) << 18) | ((b[i+1] & 0x3F) << 12) | ((b[i+2] & 0x3F) << 6) | (b[i+3] & 0x3F)
+            out.append(chr(cp))
+            i += 4
+            continue
+        # 其他非法字节
+        out.append('\ufffd')
+        i += 1
+    return ''.join(out)
+
+
 class NetReader:
     def __init__(self, data: bytes):
         self.buf = io.BytesIO(data)
@@ -78,7 +134,13 @@ class NetReader:
 
     def utf(self) -> str:
         n = struct.unpack(">H", self.read(2))[0]
-        return self.read(n).decode("utf-8", "replace")
+        b = self.read(n)
+        # 兼容游戏端异常编码: UTF-16 代理对被当成 UTF-8 发出 (如 ED A0 BD ED B4 B4 = U+D83D U+DD34 = Emoji)
+        # 正常 UTF-8 解码会得到 U+FFFD (�), 这里先把代理对还原为正确码点
+        try:
+            return b.decode("utf-8")
+        except UnicodeDecodeError:
+            return _decode_lenient(b)
 
     def nullable_str(self):
         return self.utf() if self.boolean() else None
@@ -1122,6 +1184,9 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
                 if not name or all(not ch.isprintable() or ch.isspace() for ch in name):
                     name = "(未命名)"
                 if p.get('is_ai'):
+                    # 协议里 AI 名形如 "5号 - Hard"/"- Hard" (无 AI 字样), 显示时补前缀
+                    if "AI" not in name:
+                        name = f"AI {name}"
                     name += " (AI)"
                 elif p.get('is_id_only'):
                     name += " (ID-only)"
@@ -1266,8 +1331,11 @@ def _classify_name(name: str):
     # 64字符全大写hex = player_id fallback
     if len(name) == 64 and all(c in '0123456789ABCDEF' for c in name):
         return False, False, True
-    # "AI - " 前缀 = AI 难度名
-    if name.startswith('AI - '):
+    # AI 难度名: "AI - xxx" 或 "- xxx" (协议里 AI 名常为 "- Hard"/"5号 - Hard")
+    nm = name.strip()
+    if nm.startswith('AI - '):
+        return True, True, False
+    if nm.startswith('- ') and any(d in nm for d in ('Easy', 'Medium', 'Hard', 'Impossible')):
         return True, True, False
     return True, False, False
 
@@ -1376,14 +1444,14 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
                 if p_cred <= 0 or X not in (0, 1):
                     o += 1
                     continue
-                is_real, _, is_id_only = _classify_name(name)
+                is_real, is_ai_name, is_id_only = _classify_name(name)
                 players.append({
                     'slot': p_l,
                     'team': p_s,
                     'num': p_l + 1,
                     'name': name if is_real else None,
                     'raw_name': name,
-                    'is_ai': is_ai != 0 or (name and name.startswith('AI - ')),
+                    'is_ai': is_ai != 0 or is_ai_name,
                     'is_id_only': is_id_only,
                     'player_id': name if is_id_only else None,
                     'ping': None,
