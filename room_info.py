@@ -1080,28 +1080,29 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
     cver = detect_client(info)
     lines.append(f"版本：{cver}")
 
-    mapname = info['mapname']
+    mapname = info.get('mapname') or "(未知地图)"
     if mapname.endswith('.tmx'):
         mapname = mapname[:-4]
     mapname = _re.sub(r'^\[[^\]]*\]', '', mapname).strip()
     lines.append(f"地图名称：{mapname}")
 
-    c = info['credits']
+    c = info.get('credits', 0)
     if c == 0:
         money_str = "4000¤"
     else:
         money_str = CREDITS_NAMES.get(c, f"${c}")
-    mul = MULTIPLIER_NAMES.get(int((info['multiplier'] - 1.0) * 2.0), f"{info['multiplier']}x")
+    mul = MULTIPLIER_NAMES.get(int((info.get('multiplier', 1.0) - 1.0) * 2.0), f"{info.get('multiplier', 1.0)}x")
     lines.append(f"初始资金：{money_str}[{mul}倍率]")
 
-    lines.append(f"初始禁核：{'禁用核蛋蛋' if info['no_nukes'] else '未禁用核蛋蛋'}")
-    lines.append("初始迷雾：" + FOG_NAMES.get(info['fog'], '未知(' + str(info['fog']) + ')'))
+    lines.append(f"初始禁核：{'禁用核蛋蛋' if info.get('no_nukes', False) else '未禁用核蛋蛋'}")
+    _fog = info.get('fog')
+    lines.append("初始迷雾：" + (FOG_NAMES.get(_fog, '未知(' + str(_fog) + ')') if _fog is not None else "未知"))
     mode_str = {0: '遭遇战', 1: '自定义', 2: '存档'}.get(info.get('mode'), '未知(' + str(info.get('mode')) + ')')
     lines.append(f"地图模式：{mode_str}")
     # 默认单位: 客户端下拉 ae.d() = 1..4 + 可选起始单位(100+, RWPP isPickableStartingUnit)
     # 100+ 是 g 列表索引 (客户端 ae.d 100+ 部分), 不是服务器 custom_unit_list 顺序!
     # g: 100=experimentalDropship(飞行堡垒), 101=experimentalGunship(实验悬浮型气垫船), 102=experimentalSpider(实验型战斗蜘蛛), 103=modularSpider(模块蜘蛛)
-    u = info['units']
+    u = info.get('units', 0)
     dbg = []
     if u in UNIT_NAMES:
         unit_str = UNIT_NAMES[u]
@@ -1146,10 +1147,10 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
 
     maxp = capacity if capacity else 0
     if not maxp:
-        m = _re.search(r'\((\d+)p\)', info['mapname'])
+        m = _re.search(r'\((\d+)p\)', info.get('mapname', ''))
         if m:
             maxp = int(m.group(1))
-        elif '10p' in info['mapname']:
+        elif '10p' in info.get('mapname', ''):
             maxp = 10
     count = player_count if player_count is not None else len(players)
     lines.append(f"当前人数：{count}/{maxp if maxp else '?'}")
@@ -1185,7 +1186,8 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
                     name = "(未命名)"
                 if p.get('is_ai'):
                     # 协议里 AI 名形如 "5号 - Hard"/"- Hard" (无 AI 字样), 显示时补前缀
-                    if "AI" not in name:
+                    # 只有纯 "- Hard" 补 AI, 带槽位前缀 "5号 - Hard" 保持原名
+                    if name.startswith('- '):
                         name = f"AI {name}"
                     name += " (AI)"
                 elif p.get('is_id_only'):
@@ -1328,6 +1330,8 @@ def _scan_nullable_names(block: bytes):
 
 def _classify_name(name: str):
     """确定性分类玩家名. 返回 (is_real_name, is_ai, is_id_only)."""
+    if not name:
+        return False, False, False
     # 64字符全大写hex = player_id fallback
     if len(name) == 64 and all(c in '0123456789ABCDEF' for c in name):
         return False, False, True
@@ -1380,8 +1384,12 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
         block_body = r.read(block_len)
         if stream_ver >= 141:
             try:
-                block_body = gzip.decompress(block_body)
-            except OSError:
+                # 限制解压后大小, 防 gzip 炸弹 (用 zlib 底层, 兼容 3.11/3.12 及魔改环境)
+                import zlib as _zlib
+                _d = _zlib.decompressobj(16 + _zlib.MAX_WBITS)
+                block_body = _d.decompress(block_body, 512 * 1024)
+                block_body += _d.flush()
+            except (OSError, EOFError, zlib.error):
                 if DEBUG_MODE:
                     print("[DEBUG] teams块gzip解压失败, 按明文处理")
 
@@ -1439,12 +1447,15 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
                         continue
                 else:
                     o2 += 1
+                if o2 >= len(b):
+                    o += 1
+                    continue
                 X = b[o2]
                 # 真记录: is_ai 合法 + credits 合理 + 名字可读
                 if p_cred <= 0 or X not in (0, 1):
                     o += 1
                     continue
-                is_real, is_ai_name, is_id_only = _classify_name(name)
+                is_real, is_ai_name, is_id_only = _classify_name(name or "")
                 players.append({
                     'slot': p_l,
                     'team': p_s,
@@ -1517,7 +1528,7 @@ def finish_report(sock, got_106, got_115, target):
         players_detail = t.get('players', [])
         players_detail = [p for p in players_detail
                           if p.get('exists') and p.get('name')
-                          and not p['name'].startswith(NAME)]
+                          and NAME not in p['name']]
         players_names = [p['name'] for p in players_detail if p.get('exists')]
         capacity = t.get('capacity') or t.get('team_count')
         current_players = len(players_detail)
