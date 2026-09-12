@@ -7,6 +7,6 @@ desc: |
   - 安排探针机器人 (ABAB探针01~99) 查询房间信息并回传
   - 查询到有效房间信息才发送, 查不到自动静默
   - 支持黑白名单群权限控制
-version: 1.2.3
+version: 1.2.4
 author: wcnmamrs
 repo: "https://github.com/wcnmamrs/astrbot_plugin_rwinfo"
