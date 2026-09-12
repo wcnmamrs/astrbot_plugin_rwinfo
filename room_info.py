@@ -1526,8 +1526,10 @@ def finish_report(sock, got_106, got_115, target):
     if got_115:
         t = parse_115(got_115)
         players_detail = t.get('players', [])
+        own_slot = t.get('own_player_id')
         players_detail = [p for p in players_detail
                           if p.get('exists') and p.get('name')
+                          and (own_slot is None or p.get('slot') != own_slot)
                           and NAME not in p['name']]
         players_names = [p['name'] for p in players_detail if p.get('exists')]
         capacity = t.get('capacity') or t.get('team_count')
