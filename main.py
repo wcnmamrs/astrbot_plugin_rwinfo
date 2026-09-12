@@ -25,7 +25,7 @@ QUERY_TIMEOUT = 120
 COOLDOWN = 10
 PROBE_MIN, PROBE_MAX = 1, 99
 
-CN_RE = re.compile(r'(?<![A-Za-z0-9])[rRsS]\d{3,7}(?![A-Za-z0-9])')
+CN_RE = re.compile(r'(?<![A-Za-z0-9])[rRsS]\d{3,}(?![A-Za-z0-9])')
 INTL_RE = re.compile(r'(?<![A-Za-z])[hH][A-Za-z]{2,9}(?![A-Za-z])')
 
 
