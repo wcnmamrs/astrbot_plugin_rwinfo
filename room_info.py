@@ -1440,7 +1440,12 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
                 if b[o2] == 1:
                     ln = struct.unpack('>H', b[o2+1:o2+3])[0]
                     if 0 < ln <= 64 and o2+3+ln <= len(b):
-                        name = b[o2+3:o2+3+ln].decode('utf-8', errors='replace')
+                        _nb = b[o2+3:o2+3+ln]
+                        # 与 NetReader.utf() 一致: 处理游戏端 UTF-16 代理对误当 UTF-8 的 Emoji
+                        try:
+                            name = _nb.decode('utf-8')
+                        except UnicodeDecodeError:
+                            name = _decode_lenient(_nb)
                         o2 += 3 + ln
                     else:
                         o += 1
