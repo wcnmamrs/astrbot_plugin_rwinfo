@@ -891,6 +891,11 @@ def parse_106(data):
                         nullable_str()
                     # 客户端 ae.c(i): 100+ 显示 lVarC.e() (本地化名, 回退单位ID)
                     info['custom_unit_list'].append(unit_id if unit_id else dname)
+                    # 收集 mod 引入单位的显示名 (如"炮塔科技1.4") → mod 名来源
+                    if dname:
+                        d = dname.strip()
+                        if d and d not in info['mod_names'] and d != unit_id:
+                            info['mod_names'].append(d)
             except (EOFError, struct.error):
                 # 单位解析中途失败: 放弃块内容, 但确保跳到块尾, 后续字段不错位
                 if DEBUG_MODE:
@@ -1158,10 +1163,13 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
     # 显示 Mod 信息
     mod_names = info.get('mod_names', [])
     unit_count = info.get('custom_unit_count', len(info.get('custom_units', [])))
-    # mod_names 是自定义 mod 包名; 为空 = 原版 (custom_unit_count 只是内置单位数)
+    # mod_names 收集自 customUnits 块每条单位的 mod 归属名(如"炮塔科技1.4"), 去重后=房间用的 mod 列表
+    # 为空 = 原版 (custom_unit_count 只是内置单位数)
     if mod_names:
-        mod_str = ', '.join(f"[{m}]" for m in mod_names)
-        lines.append(f"使用Mod：{mod_str}（{unit_count}个单位）")
+        mod_str = ', '.join(f"[{m}]" for m in mod_names[:5])
+        if len(mod_names) > 5:
+            mod_str += f" 等{len(mod_names)}个"
+        lines.append(f"使用Mod：{mod_str}（{unit_count} 个单位）")
     else:
         lines.append(f"使用Mod：原版（{unit_count} 内置单位）")
 
