@@ -1189,6 +1189,12 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
                 team_letter = chr(ord('A') + team) if 0 <= team <= 25 else str(team)
                 num = p.get('num', 1)
                 label = f"{team_letter}{num}"
+                # AI/ID-only 标记移到槽位后、名字前: "B2 (AI): AI - Impossible"
+                mark = ""
+                if p.get('is_ai'):
+                    mark = " (AI)"
+                elif p.get('is_id_only'):
+                    mark = " (ID-only)"
                 name = p.get('name', '')
                 if not name or all(not ch.isprintable() or ch.isspace() for ch in name):
                     name = "(未命名)"
@@ -1197,9 +1203,6 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
                     # 只有纯 "- Hard" 补 AI, 带槽位前缀 "5号 - Hard" 保持原名
                     if name.startswith('- '):
                         name = f"AI {name}"
-                    name += " (AI)"
-                elif p.get('is_id_only'):
-                    name += " (ID-only)"
                 ping = p.get('ping', None)
                 if ping is None:
                     ping_str = ""
@@ -1209,7 +1212,7 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
                     ping_str = " (超时)"
                 else:
                     ping_str = f" (ping {ping}ms)"
-                lines.append(f"  {label}: {name}{ping_str}")
+                lines.append(f"  {label}{mark}: {name}{ping_str}")
             if total > max_players_display:
                 lines.append(f"  ... 还有 {total - max_players_display} 人")
         elif players:
@@ -1426,64 +1429,77 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
         # 过滤: 真记录 p=credits(初始资金) 且 X=0 (false)
         players = []
         b = block_body
-        o = 0
-        while o + 14 <= len(b):
-            if b[o] != 1:
-                o += 1
+        # RCN 服务器: 玩家记录之间以 ff ff d8 f1 分隔, 每条记录一段。
+        # 段内可能含不定长 00 填充 + 真实记录。若整块逐字节滑动扫描,
+        # 会误匹配填充里的"假记录头"(exists=1 但 name=None、team 错位),
+        # 并因 o=o2+1 跳过真实记录 → 真人房主丢失(如 r12345 "一个无常人")。
+        # 修复: 按分隔符切段, 每段只取"名字非空且字段合法"的真实记录
+        # (填充误报的假记录 name=None 自动跳过), 每段至多一条。
+        for seg in b.split(b'\xff\xff\xd8\xf1'):
+            if not seg:
                 continue
-            try:
-                is_ai = struct.unpack('>i', b[o+1:o+5])[0]
-                if is_ai not in (0, 1):
+            n = len(seg)
+            o = 0
+            while o + 14 <= n:
+                if seg[o] != 1:
                     o += 1
                     continue
-                p_l = b[o+5]
-                p_cred = struct.unpack('>i', b[o+6:o+10])[0]
-                p_s = struct.unpack('>i', b[o+10:o+14])[0]
-                if not (0 <= p_s < team_count):
-                    o += 1
-                    continue
-                o2 = o + 14
-                # nullable name
-                name = None
-                if b[o2] == 1:
-                    ln = struct.unpack('>H', b[o2+1:o2+3])[0]
-                    if 0 < ln <= 64 and o2+3+ln <= len(b):
-                        _nb = b[o2+3:o2+3+ln]
-                        # 与 NetReader.utf() 一致: 处理游戏端 UTF-16 代理对误当 UTF-8 的 Emoji
-                        try:
-                            name = _nb.decode('utf-8')
-                        except UnicodeDecodeError:
-                            name = _decode_lenient(_nb)
-                        o2 += 3 + ln
-                    else:
+                try:
+                    is_ai = struct.unpack('>i', seg[o+1:o+5])[0]
+                    if is_ai not in (0, 1):
                         o += 1
                         continue
-                else:
-                    o2 += 1
-                if o2 >= len(b):
+                    p_l = seg[o+5]
+                    p_cred = struct.unpack('>i', seg[o+6:o+10])[0]
+                    p_s = struct.unpack('>i', seg[o+10:o+14])[0]
+                    if not (0 <= p_s < team_count):
+                        o += 1
+                        continue
+                    o2 = o + 14
+                    name = None
+                    if o2 < n and seg[o2] == 1:
+                        ln = struct.unpack('>H', seg[o2+1:o2+3])[0]
+                        if 0 < ln <= 64 and o2+3+ln <= n:
+                            _nb = seg[o2+3:o2+3+ln]
+                            # 与 NetReader.utf() 一致: 处理游戏端 UTF-16 代理对误当 UTF-8 的 Emoji
+                            try:
+                                name = _nb.decode('utf-8')
+                            except UnicodeDecodeError:
+                                name = _decode_lenient(_nb)
+                            o2 += 3 + ln
+                        else:
+                            o += 1
+                            continue
+                    else:
+                        o2 += 1
+                    if o2 >= n:
+                        o += 1
+                        continue
+                    X = seg[o2]
+                    # 真记录: is_ai 合法 + credits 合理 + 名字可读
+                    if p_cred <= 0 or X not in (0, 1):
+                        o += 1
+                        continue
+                    is_real, is_ai_name, is_id_only = _classify_name(name or "")
+                    # 只收名字非空的真实记录 (填充误报 name=None 被跳过)
+                    if not is_real:
+                        o += 1
+                        continue
+                    players.append({
+                        'slot': p_l,
+                        'team': p_s,
+                        'num': p_l + 1,
+                        'name': name,
+                        'raw_name': name,
+                        'is_ai': is_ai != 0 or is_ai_name,
+                        'is_id_only': is_id_only,
+                        'player_id': name if is_id_only else None,
+                        'ping': None,
+                        'exists': True,
+                    })
+                    break  # 一段只取一条记录
+                except (struct.error, IndexError):
                     o += 1
-                    continue
-                X = b[o2]
-                # 真记录: is_ai 合法 + credits 合理 + 名字可读
-                if p_cred <= 0 or X not in (0, 1):
-                    o += 1
-                    continue
-                is_real, is_ai_name, is_id_only = _classify_name(name or "")
-                players.append({
-                    'slot': p_l,
-                    'team': p_s,
-                    'num': p_l + 1,
-                    'name': name if is_real else None,
-                    'raw_name': name,
-                    'is_ai': is_ai != 0 or is_ai_name,
-                    'is_id_only': is_id_only,
-                    'player_id': name if is_id_only else None,
-                    'ping': None,
-                    'exists': True,
-                })
-                o = o2 + 1
-            except (struct.error, IndexError):
-                o += 1
         result['players'] = players
         # 排序: 队伍优先(A<B<C...), 编号优先(1<2<3...)
         players.sort(key=lambda p: (p['team'], p['num']))
