@@ -7,16 +7,7 @@
 
 ## 0. 总体架构
 
-```
-┌────────┐   TCP 5123   ┌──────────────┐   178跳转   ┌──────────────┐
-│ 客户端  │ ───────────► │ 房间中继服务器 │ ─────────► │ 房间服务器(实际)│
-│ (探针)  │  160/161    │ x.relay.cor..│  (按房间ID) │              │
-└────────┘             └──────────────┘            └──────────────┘
-      │                                                      │
-      └────────────── 注册110 ──────────────────────────────►│
-                                    106(SERVER_INFO) ◄───────┘
-                                    115(TEAMS)       ◄───────┘
-```
+探针流程：**TCP 连接中继服务器 `x.relay.corrodinggames.com:5123`（x=房号首字母小写）→ 发 160 握手 → 收 161 → 发 110 注册 → 收 106(房间信息)+115(玩家列表) → 发 111 退出**。若收到 178 则跳转到实际房间服务器（或直连）。
 
 - **官方主服务器**：`http://gs1.corrodinggames.com/masterserver/1.4/interface`（备：`gs4.corrodinggames.net`），用于 `--list` 拉房间列表
 - **中继域名规律**：`<房号首字母小写>.relay.corrodinggames.com`，默认端口 **5123**
@@ -227,7 +218,24 @@ int32 seed
 
 ## 9. 队伍/玩家 115（TEAMS）
 
-`parse_115(payload, stream_ver)` 按流版本解析玩家记录，`_classify_name` 区分真人/AI/观众。玩家名字符处理：过滤控制字符（`c >= " " and c != 0x7f`）。
+服务器按**队伍槽位顺序**广播玩家记录（官方客户端 `ae.java` 发送端 + `p.b()` 写入）。
+
+```
+外层: int32 own_player_id + [版本>=141] bool full_load + int32 team_count
+      + readUTF("teams") + int32 block_len + gzip块
+块内: 每条玩家记录以分隔符 ff ff d8 f1 切分, 每条记录格式:
+      boolean exists + int32 is_ai + byte slot + int32 credits
+      + int32 team + nullable_str name + boolean X
+```
+
+解析要点：
+- **`own_player_id`**：服务器告诉本探针的槽位号，用于过滤自己的探针记录。
+- **记录格式**（7 字段）：`exists(1) + is_ai(4) + slot(1) + credits(4) + team(4) = 14 字节头 + nullable name + bool X`。
+- **AI 识别**：`_classify_name` 区分真人/AI/ID-only。AI 名形如 `"- Hard"`/`"AI - Impossible"`。
+- **Emoji 容错**：玩家名解码用 `_decode_lenient`，处理游戏端 UTF-16 代理对误当 UTF-8 的乱码。
+- **坑（r12345 实测）**：段内开头可能含不定长 `00` 填充。若整块逐字节滑动扫描会误匹配填充里的"假记录头"（exists=1 但 name=None、team 错位），导致**真人房主丢失**（只剩 AI）。修复：**按分隔符切段，每段只取名字非空且字段合法的真实记录**。
+
+**显示**：槽位标签 `队伍字母(A-J)+编号`；AI/ID-only 标记显示在槽位后、名字前（如 `B2 (AI): AI - Impossible`）。
 
 ---
 
