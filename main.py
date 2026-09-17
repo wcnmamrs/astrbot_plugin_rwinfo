@@ -219,6 +219,34 @@ class RWInfoPlugin(Star):
                     return idx
             await asyncio.sleep(1)
 
+    @staticmethod
+    def _short_ts() -> str:
+        """短时间标识: 编码当前'月日时分秒'为5位base36, 可逆解回.
+        相比 int(time.time()) 的10位纯数字, 更短且含字母, 降低被服务器过滤概率."""
+        t = time.localtime()
+        # 月日时分秒压成整数: (月-1)*31+日-1 保证唯一可逆, 最大 32140799, base36 5位足够
+        v = ((((t.tm_mon - 1) * 31 + (t.tm_mday - 1)) * 24 + t.tm_hour) * 60 + t.tm_min) * 60 + t.tm_sec
+        chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+        s = ""
+        while v:
+            s = chars[v % 36] + s
+            v //= 36
+        return s.zfill(5)
+
+    @staticmethod
+    def _ts_decode(s: str):
+        """反解 _short_ts 生成的标识, 返回 (月, 日, 时, 分, 秒)."""
+        chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+        v = 0
+        for c in s:
+            v = v * 36 + chars.index(c)
+        sec = v % 60; v //= 60
+        minute = v % 60; v //= 60
+        hour = v % 24; v //= 24
+        day = v % 31 + 1; v //= 31
+        month = v + 1
+        return month, day, hour, minute, second
+
     async def _release_probe(self, idx: int):
         async with self.lock:
             self.probe_used.discard(idx)
@@ -453,7 +481,8 @@ class RWInfoPlugin(Star):
                 for rid in to_query:
                     idx = await self._acquire_probe()
                     base_name = f"ABAB探针{idx:02d}"
-                    probe_name = f"{base_name}_{int(time.time())}"
+                    # 短时间标识: base36 编码当前时间戳后5位, 避免过长的数字后缀被服务器过滤
+                    probe_name = f"{base_name}_{self._short_ts()}"
                     task = asyncio.create_task(self._query_room(rid, probe_name))
                     tasks.append((rid, idx, task))
 
@@ -483,7 +512,8 @@ class RWInfoPlugin(Star):
                                 while retried < max_retry:
                                     retried += 1
                                     await self._send_recallable(event, f"[房间查询] 重试中({retried}/{max_retry})")
-                                    new_name = f"{base_name}_{int(time.time())}_{retried}"
+                                    # 重试时去掉时间后缀, 直接 _序号 最短, 最不容易被过滤
+                                    new_name = f"{base_name}_{retried}"
                                     retry_task = asyncio.create_task(self._query_room(rid, new_name))
                                     try:
                                         retry_result = await asyncio.wait_for(retry_task, timeout=QUERY_TIMEOUT)
