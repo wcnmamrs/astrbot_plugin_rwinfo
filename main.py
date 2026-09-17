@@ -326,6 +326,27 @@ class RWInfoPlugin(Star):
         return True
 
     # ---- 指令 (全部要求管理员权限) ----
+    @filter.command("铁锈查房帮助")
+    @filter.command("铁锈帮助")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_help(self, event: AstrMessageEvent, arg: str = ""):
+        """显示本插件所有指令及用法."""
+        lines = [
+            "【铁锈查房插件指令】",
+            "/铁锈查房帮助 - 显示本帮助",
+            "/铁锈全局解析 开|关 - 全局解析总开关(无参查看)",
+            "/铁锈模式 白|黑 - 切换白/黑名单模式(无参查看)",
+            "/铁锈白名 +群号|-群号 - 白名单管理(无参列出)",
+            "/铁锈黑名 +群号|-群号 - 黑名单管理(无参列出)",
+            "/铁锈玩家列表 开|关 - 是否显示玩家列表(无参查看)",
+            "/铁锈重试 [0-10] - 探针名被过滤时自动重试次数(无参查看)",
+            "/铁锈撤回 开|关|秒数(0-300) - 自动撤回房间信息开关/延迟秒数(无参查看)",
+            "",
+            "【自动触发】",
+            "群内发送房间号(如 r5132、HLBIFZ) 自动查询回传房间信息",
+        ]
+        yield event.plain_result("\n".join(lines))
+
     @filter.command("铁锈全局解析")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_global(self, event: AstrMessageEvent, arg: str = ""):
