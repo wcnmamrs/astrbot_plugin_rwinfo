@@ -95,7 +95,7 @@ def normalize_gid(gid) -> str:
     return m.group(0) if m else s
 
 
-@register("rwinfo", "Operit", "铁锈战争房间查询: 自动识别房号并安排探针查房", "1.0.0")
+@register("rwinfo", "Operit", "铁锈战争房间查询: 自动识别房号并安排探针查房", "1.2.8")
 class RWInfoPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -113,7 +113,6 @@ class RWInfoPlugin(Star):
 
         self.room_cooldown = {}
         self._last_cleanup = None
-        self.lock = asyncio.Lock()
         self.probe_used = set()
         self.probe_released = []
         self.probe_next = PROBE_MIN
@@ -211,9 +210,9 @@ class RWInfoPlugin(Star):
             # QQ 普通成员有时间窗口限制(约2分钟), 超时/无权限撤回失败属正常
             self.logger.debug(f"撤回失败(可能超时间窗口或无权限): {e}")
 
-    def _acquire_probe_locked(self) -> int:
-        """锁内调用: 分配一个探针编号. 无空闲探针时返回 None (调用方跳过该房号本轮查询).
-        相比旧版无限等待, 返回 None 避免当所有探针都被占用时的死循环/长时间阻塞."""
+    def _acquire_probe(self) -> int:
+        """分配一个探针编号 (同步). 无空闲探针时返回 None (调用方跳过该房号本轮查询).
+        "判定冷却→分配探针→建任务"整段无 await, 单线程 asyncio 下天然原子, 无需加锁."""
         if self.probe_released:
             idx = min(self.probe_released)
             self.probe_released.remove(idx)
@@ -226,11 +225,11 @@ class RWInfoPlugin(Star):
             return idx
         return None
 
-    async def _release_probe(self, idx: int):
-        async with self.lock:
-            self.probe_used.discard(idx)
-            if idx not in self.probe_released:
-                self.probe_released.append(idx)
+    def _release_probe(self, idx: int):
+        """释放探针编号 (同步). 无 await, 天然原子."""
+        self.probe_used.discard(idx)
+        if idx not in self.probe_released:
+            self.probe_released.append(idx)
 
     @staticmethod
     def _short_ts() -> str:
@@ -259,12 +258,6 @@ class RWInfoPlugin(Star):
         day = v % 31 + 1; v //= 31
         month = v + 1
         return month, day, hour, minute, sec
-
-    async def _release_probe(self, idx: int):
-        async with self.lock:
-            self.probe_used.discard(idx)
-            if idx not in self.probe_released:
-                self.probe_released.append(idx)
 
     async def _query_room(self, rid: str, probe_name: str) -> str:
         if not os.path.exists(ROOM_INFO_PY):
@@ -510,46 +503,44 @@ class RWInfoPlugin(Star):
 
             self.logger.debug(f"群 {gid} 提取到房号: {rids}")
 
-            # ---- 并发安全区: 冷却判定 + 探针分配 ----
+            # ---- 冷却判定 + 探针分配 (全部同步代码, 单线程 asyncio 下天然原子, 无需加锁) ----
             now = time.time()
             tasks = []  # (rid, idx, task)
-            async with self.lock:
-                # 定期清理冷却字典, 防止长期运行无限膨胀
-                if not self.room_cooldown or self._last_cleanup is None or now - self._last_cleanup > 300:
-                    stale = [rid for rid, ts in self.room_cooldown.items() if now - ts > COOLDOWN * 2]
-                    for rid in stale:
-                        del self.room_cooldown[rid]
-                    self._last_cleanup = now
-                to_query = []
-                for rid in rids:
-                    last = self.room_cooldown.get(rid, 0)
-                    if now - last >= COOLDOWN:
-                        self.room_cooldown[rid] = now
-                        to_query.append(rid)
-                    if len(to_query) >= 5:
-                        break
-                if not to_query:
-                    self.logger.debug("所有房号均在冷却中")
-                    return
+            # 定期清理冷却字典, 防止长期运行无限膨胀
+            if not self.room_cooldown or self._last_cleanup is None or now - self._last_cleanup > 300:
+                stale = [rid for rid, ts in self.room_cooldown.items() if now - ts > COOLDOWN * 2]
+                for rid in stale:
+                    del self.room_cooldown[rid]
+                self._last_cleanup = now
+            to_query = []
+            for rid in rids:
+                last = self.room_cooldown.get(rid, 0)
+                if now - last >= COOLDOWN:
+                    self.room_cooldown[rid] = now
+                    to_query.append(rid)
+                if len(to_query) >= 5:
+                    break
+            if not to_query:
+                self.logger.debug("所有房号均在冷却中")
+                return
 
-                self.logger.debug(f"待查询房号: {to_query}")
+            self.logger.debug(f"待查询房号: {to_query}")
 
-                # 在锁内为每个待查房号分配探针, 避免并发重复分配
-                for rid in to_query:
-                    idx = self._acquire_probe_locked()
-                    if idx is None:
-                        # 所有探针均被占用: 跳过该房号本轮查询(保持冷却中, 下轮消息再触发)
-                        self.logger.debug(f"探针池已满, 跳过房号 {rid}")
-                        continue
-                    base_name = f"ABAB探针{idx:02d}"
-                    # 短时间标识: 编码"月日时分秒"为5位base36, 可逆解回, 避免过长的数字后缀被过滤
-                    probe_name = f"{base_name}_{self._short_ts()}"
-                    task = asyncio.create_task(self._query_room(rid, probe_name))
-                    self.pending_tasks.add(task)
-                    task.add_done_callback(self.pending_tasks.discard)
-                    tasks.append((rid, idx, task))
-                if not tasks:
-                    return
+            for rid in to_query:
+                idx = self._acquire_probe()
+                if idx is None:
+                    # 所有探针均被占用: 跳过该房号本轮查询(保持冷却中, 下轮消息再触发)
+                    self.logger.debug(f"探针池已满, 跳过房号 {rid}")
+                    continue
+                base_name = f"ABAB探针{idx:02d}"
+                # 短时间标识: 编码"月日时分秒"为5位base36, 可逆解回, 避免过长的数字后缀被过滤
+                probe_name = f"{base_name}_{self._short_ts()}"
+                task = asyncio.create_task(self._query_room(rid, probe_name))
+                self.pending_tasks.add(task)
+                task.add_done_callback(self.pending_tasks.discard)
+                tasks.append((rid, idx, task))
+            if not tasks:
+                return
 
             try:
                 remaining = tasks.copy()
@@ -609,7 +600,7 @@ class RWInfoPlugin(Star):
                                 yield event.plain_result(translate_error(result))
                             else:
                                 self.logger.debug(f"房间 {rid} 无有效信息, 静默丢弃")
-                            await self._release_probe(idx)
+                            self._release_probe(idx)
                             remaining.remove(t)
                             break
             finally:
@@ -621,7 +612,7 @@ class RWInfoPlugin(Star):
                             await task
                         except (asyncio.CancelledError, Exception):
                             pass
-                    await self._release_probe(idx)
+                    self._release_probe(idx)
         except Exception as e:
             self.logger.error(f"rwinfo on_all_message error: {e}\n{traceback.format_exc()}")
 
