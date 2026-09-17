@@ -41,5 +41,17 @@
         "default": 3,
         "min": 0,
         "max": 10
+    },
+    "auto_recall": {
+        "description": "是否自动撤回房间解析信息/重试进度（默认关闭）",
+        "type": "bool",
+        "default": false
+    },
+    "recall_delay": {
+        "description": "自动撤回延迟秒数（默认60秒，0=不撤回）",
+        "type": "int",
+        "default": 60,
+        "min": 0,
+        "max": 300
     }
 }
