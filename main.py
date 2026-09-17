@@ -252,7 +252,7 @@ class RWInfoPlugin(Star):
         hour = v % 24; v //= 24
         day = v % 31 + 1; v //= 31
         month = v + 1
-        return month, day, hour, minute, second
+        return month, day, hour, minute, sec
 
     async def _release_probe(self, idx: int):
         async with self.lock:
@@ -549,12 +549,21 @@ class RWInfoPlugin(Star):
                                     await self._send_recallable(event, f"[房间查询] 重试中({retried}/{max_retry})")
                                     # 重试时去掉时间后缀, 直接 _序号 最短, 最不容易被过滤
                                     new_name = f"{base_name}_{retried}"
-                                    retry_task = asyncio.create_task(self._query_room(rid, new_name))
+                                    retry_result = ""
+                                    retry_task = None
                                     try:
+                                        retry_task = asyncio.create_task(self._query_room(rid, new_name))
                                         retry_result = await asyncio.wait_for(retry_task, timeout=QUERY_TIMEOUT)
                                     except asyncio.TimeoutError:
-                                        retry_task.cancel()
                                         retry_result = ""
+                                    finally:
+                                        # 确保重试任务被取消并回收, 避免协程泄漏
+                                        if retry_task is not None and not retry_task.done():
+                                            retry_task.cancel()
+                                            try:
+                                                await retry_task
+                                            except (asyncio.CancelledError, Exception):
+                                                pass
                                     if is_room_info(retry_result):
                                         await self._send_room_result(event, retry_result)
                                         break
