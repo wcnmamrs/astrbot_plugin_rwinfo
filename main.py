@@ -117,6 +117,7 @@ class RWInfoPlugin(Star):
         self.probe_released = []
         self.probe_next = PROBE_MIN
         self.pending_tasks = set()
+        self.pending_recall_tasks = set()
 
     def _default_config(self) -> dict:
         return {
@@ -128,6 +129,8 @@ class RWInfoPlugin(Star):
             "max_players_display": 10,
             "show_players": False,
             "retry_times": 3,
+            "auto_recall": False,
+            "recall_delay": 60,
         }
 
     def _save_config(self):
@@ -138,6 +141,40 @@ class RWInfoPlugin(Star):
                 self.logger.warning("配置对象不支持 save_config 方法，请检查 AstrBot 版本")
         except Exception as e:
             self.logger.warning(f"保存配置失败: {e}")
+
+    async def _send_recallable(self, event, text: str):
+        """发送一条"可撤回"的消息. 返回 message_id; 若平台不支持则返回 None.
+        发送后若开启自动撤回, 则安排延迟撤回任务."""
+        text = text.strip()
+        if not text:
+            return None
+        try:
+            result = await event.send(event.plain_result(text), wait_recall=True)
+            mid = getattr(result, "recall_message_id", None)
+        except Exception as e:
+            self.logger.warning(f"发送可撤回消息失败: {e}")
+            return None
+        if not mid:
+            # 平台不支持 wait_recall / 未拿到 ID: 消息已发出但不撤回
+            self.logger.debug("未获取到 message_id, 不安排撤回")
+            return None
+        if self.config.get("auto_recall", False):
+            delay = int(self.config.get("recall_delay", 60))
+            if delay > 0:
+                task = asyncio.create_task(self._delayed_recall(event, mid, delay))
+                self.pending_recall_tasks.add(task)
+                task.add_done_callback(self.pending_recall_tasks.discard)
+        return mid
+
+    async def _delayed_recall(self, event, message_id, delay: int):
+        """延迟 delay 秒后撤回指定消息 (仅撤回房间解析信息/重试进度)."""
+        await asyncio.sleep(delay)
+        try:
+            await event.bot.unsend(message_id=message_id)
+            self.logger.debug(f"已自动撤回消息: {message_id}")
+        except Exception as e:
+            # QQ 普通成员有时间窗口限制(约2分钟), 超时/无权限撤回失败属正常
+            self.logger.debug(f"撤回失败(可能超时间窗口或无权限): {e}")
 
     async def _acquire_probe(self) -> int:
         while True:
@@ -297,6 +334,28 @@ class RWInfoPlugin(Star):
         self._save_config()
         yield event.plain_result(f"重试次数已设置为：{self.config['retry_times']}")
 
+    @filter.command("铁锈撤回")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_recall(self, event: AstrMessageEvent, arg: str = ""):
+        arg = (arg or "").strip()
+        if not arg:
+            on = self.config.get("auto_recall", False)
+            delay = self.config.get("recall_delay", 60)
+            state = "开启" if on else "关闭"
+            yield event.plain_result(f"自动撤回：{state}；延迟秒数：{delay} 秒")
+            return
+        if arg in ("开", "关"):
+            self.config["auto_recall"] = (arg == "开")
+            self._save_config()
+            yield event.plain_result(f"自动撤回已{'开启' if self.config['auto_recall'] else '关闭'}")
+            return
+        if arg.isdigit() and 0 <= int(arg) <= 300:
+            self.config["recall_delay"] = int(arg)
+            self._save_config()
+            yield event.plain_result(f"自动撤回延迟已设置为：{self.config['recall_delay']} 秒")
+            return
+        yield event.plain_result("用法: /铁锈撤回 开|关|秒数(0-300)  (无参数查看当前配置)")
+
     def _cmd_list_text(self, arg, key, label) -> str:
         arg = (arg or "").strip()
         lst = self.config.get(key, [])
@@ -388,14 +447,14 @@ class RWInfoPlugin(Star):
                                 self.logger.info(f"房间 {rid} 查询成功, 回传")
                                 if len(result) > 3500:
                                     result = result[:3500] + "\n...(已截断)"
-                                yield event.plain_result(result)
+                                await self._send_recallable(event, result)
                             elif is_name_check_error(result):
                                 # 探针名被过滤: 自动改名重试
                                 max_retry = int(self.config.get("retry_times", 3))
                                 retried = 0
                                 while retried < max_retry:
                                     retried += 1
-                                    yield event.plain_result(f"[房间查询] 重试中({retried}/{max_retry})")
+                                    await self._send_recallable(event, f"[房间查询] 重试中({retried}/{max_retry})")
                                     new_name = f"{base_name}_{int(time.time())}_{retried}"
                                     retry_task = asyncio.create_task(self._query_room(rid, new_name))
                                     try:
@@ -406,7 +465,7 @@ class RWInfoPlugin(Star):
                                     if is_room_info(retry_result):
                                         if len(retry_result) > 3500:
                                             retry_result = retry_result[:3500] + "\n...(已截断)"
-                                        yield event.plain_result(retry_result)
+                                        await self._send_recallable(event, retry_result)
                                         break
                                     if not is_name_check_error(retry_result):
                                         if is_error_info(retry_result):
@@ -435,3 +494,14 @@ class RWInfoPlugin(Star):
                         await self._release_probe(idx)
         except Exception as e:
             self.logger.error(f"rwinfo on_all_message error: {e}\n{traceback.format_exc()}")
+
+    async def terminate(self):
+        """插件卸载时取消所有待执行的延迟撤回任务，避免资源泄漏。"""
+        for task in list(self.pending_recall_tasks):
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self.pending_recall_tasks.clear()
