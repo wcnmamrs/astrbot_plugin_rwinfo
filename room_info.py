@@ -1571,9 +1571,11 @@ def finish_report(sock, got_106, got_115, target):
 
     timestamp = int(time.time())
     safe_target = re.sub(r'[^\w\-]', '_', target)
-    open(f"server_info_106_{safe_target}_{timestamp}.bin", "wb").write(got_106)
+    with open(f"server_info_106_{safe_target}_{timestamp}.bin", "wb") as f:
+        f.write(got_106)
     if got_115:
-        open(f"server_info_115_{safe_target}_{timestamp}.bin", "wb").write(got_115)
+        with open(f"server_info_115_{safe_target}_{timestamp}.bin", "wb") as f:
+            f.write(got_115)
     if sock is not None:
         send_leave(sock)
         time.sleep(0.5)
