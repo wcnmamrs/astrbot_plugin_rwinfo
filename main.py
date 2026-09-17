@@ -327,7 +327,6 @@ class RWInfoPlugin(Star):
 
     # ---- 指令 (全部要求管理员权限) ----
     @filter.command("铁锈查房帮助")
-    @filter.command("铁锈帮助")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_help(self, event: AstrMessageEvent, arg: str = ""):
         """显示本插件所有指令及用法."""
