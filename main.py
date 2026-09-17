@@ -112,6 +112,7 @@ class RWInfoPlugin(Star):
             self.logger.setLevel(logging.INFO)
 
         self.room_cooldown = {}
+        self._last_cleanup = None
         self.lock = asyncio.Lock()
         self.probe_used = set()
         self.probe_released = []
@@ -141,6 +142,12 @@ class RWInfoPlugin(Star):
                 self.logger.warning("配置对象不支持 save_config 方法，请检查 AstrBot 版本")
         except Exception as e:
             self.logger.warning(f"保存配置失败: {e}")
+
+    async def _send_room_result(self, event, result: str):
+        """发送房间查询结果(可撤回). 处理超长截断."""
+        if len(result) > 3500:
+            result = result[:3500] + "\n...(已截断)"
+        await self._send_recallable(event, result)
 
     async def _send_recallable(self, event, text: str):
         """发送一条"可撤回"的消息. 返回 message_id; 若平台不支持则返回 None.
@@ -239,7 +246,7 @@ class RWInfoPlugin(Star):
         chars = "0123456789abcdefghijklmnopqrstuvwxyz"
         v = 0
         for c in s:
-            v = v * 36 + chars.index(c)
+            v = v * 36 + chars.find(c)
         sec = v % 60; v //= 60
         minute = v % 60; v //= 60
         hour = v % 24; v //= 24
@@ -301,6 +308,11 @@ class RWInfoPlugin(Star):
             # 无输出 = 房间不存在/英文单词误报, 静默丢弃 (避免国际房批量尝试刷屏)
             self.logger.debug(f"查询 {rid} 无输出, 静默 (python={python} rc={rc}) stderr: {err[:300]}")
             return ""
+        # 过滤调试行: room_info.py 的流程日志以 [DEBUG]/[n] 中继/===/151 relay 等开头,
+        # 房间信息正文以 "版本：" 开头. 只保留正文, 避免 debug 模式下调试输出刷屏群里.
+        mark = out.find("版本：")
+        if mark != -1:
+            return out[mark:]
         return out
 
     def _is_allowed(self, gid: str) -> bool:
@@ -462,6 +474,12 @@ class RWInfoPlugin(Star):
             self.logger.debug(f"群 {gid} 提取到房号: {rids}")
 
             now = time.time()
+            # 定期清理冷却字典, 防止长期运行无限膨胀
+            if not self.room_cooldown or self._last_cleanup is None or now - self._last_cleanup > 300:
+                stale = [rid for rid, ts in self.room_cooldown.items() if now - ts > COOLDOWN * 2]
+                for rid in stale:
+                    del self.room_cooldown[rid]
+                self._last_cleanup = now
             to_query = []
             for rid in rids:
                 last = self.room_cooldown.get(rid, 0)
@@ -481,7 +499,7 @@ class RWInfoPlugin(Star):
                 for rid in to_query:
                     idx = await self._acquire_probe()
                     base_name = f"ABAB探针{idx:02d}"
-                    # 短时间标识: base36 编码当前时间戳后5位, 避免过长的数字后缀被服务器过滤
+                    # 短时间标识: 编码"月日时分秒"为5位base36, 可逆解回, 避免过长的数字后缀被过滤
                     probe_name = f"{base_name}_{self._short_ts()}"
                     task = asyncio.create_task(self._query_room(rid, probe_name))
                     tasks.append((rid, idx, task))
@@ -502,9 +520,7 @@ class RWInfoPlugin(Star):
                                 result = ""
                             if is_room_info(result):
                                 self.logger.info(f"房间 {rid} 查询成功, 回传")
-                                if len(result) > 3500:
-                                    result = result[:3500] + "\n...(已截断)"
-                                await self._send_recallable(event, result)
+                                await self._send_room_result(event, result)
                             elif is_name_check_error(result):
                                 # 探针名被过滤: 自动改名重试
                                 max_retry = int(self.config.get("retry_times", 3))
@@ -521,9 +537,7 @@ class RWInfoPlugin(Star):
                                         retry_task.cancel()
                                         retry_result = ""
                                     if is_room_info(retry_result):
-                                        if len(retry_result) > 3500:
-                                            retry_result = retry_result[:3500] + "\n...(已截断)"
-                                        await self._send_recallable(event, retry_result)
+                                        await self._send_room_result(event, retry_result)
                                         break
                                     if not is_name_check_error(retry_result):
                                         if is_error_info(retry_result):
