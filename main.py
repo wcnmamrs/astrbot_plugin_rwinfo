@@ -148,29 +148,57 @@ class RWInfoPlugin(Star):
         text = text.strip()
         if not text:
             return None
+        if not self.config.get("auto_recall", False):
+            # 未开启自动撤回: 用原生发送, 不关心 message_id
+            try:
+                await event.send(event.plain_result(text))
+            except Exception as e:
+                self.logger.warning(f"发送消息失败: {e}")
+            return None
+        # 开启自动撤回: 用 bot.send_msg 发送以拿 message_id (wait_recall 是特定适配器扩展, 非核心 API)
         try:
-            result = await event.send(event.plain_result(text), wait_recall=True)
-            mid = getattr(result, "recall_message_id", None)
+            gid = event.get_group_id()
+            if gid:
+                result = await event.bot.send_msg(
+                    message_type="group",
+                    group_id=int(gid),
+                    message=text,
+                )
+            else:
+                # 私聊/直聊: 用 user_id
+                result = await event.bot.send_msg(
+                    message_type="private",
+                    user_id=int(event.get_sender_id()),
+                    message=text,
+                )
+            mid = None
+            if isinstance(result, dict):
+                mid = result.get("message_id")
+            elif result is not None:
+                mid = getattr(result, "message_id", None)
         except Exception as e:
             self.logger.warning(f"发送可撤回消息失败: {e}")
+            # 发送失败: 回退原生发送, 保证消息能发出
+            try:
+                await event.send(event.plain_result(text))
+            except Exception:
+                pass
             return None
         if not mid:
-            # 平台不支持 wait_recall / 未拿到 ID: 消息已发出但不撤回
             self.logger.debug("未获取到 message_id, 不安排撤回")
             return None
-        if self.config.get("auto_recall", False):
-            delay = int(self.config.get("recall_delay", 60))
-            if delay > 0:
-                task = asyncio.create_task(self._delayed_recall(event, mid, delay))
-                self.pending_recall_tasks.add(task)
-                task.add_done_callback(self.pending_recall_tasks.discard)
+        delay = int(self.config.get("recall_delay", 60))
+        if delay > 0:
+            task = asyncio.create_task(self._delayed_recall(event, mid, delay))
+            self.pending_recall_tasks.add(task)
+            task.add_done_callback(self.pending_recall_tasks.discard)
         return mid
 
     async def _delayed_recall(self, event, message_id, delay: int):
         """延迟 delay 秒后撤回指定消息 (仅撤回房间解析信息/重试进度)."""
         await asyncio.sleep(delay)
         try:
-            await event.bot.unsend(message_id=message_id)
+            await event.bot.delete_msg(message_id=int(message_id))
             self.logger.debug(f"已自动撤回消息: {message_id}")
         except Exception as e:
             # QQ 普通成员有时间窗口限制(约2分钟), 超时/无权限撤回失败属正常
