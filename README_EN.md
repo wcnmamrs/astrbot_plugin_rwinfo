@@ -26,7 +26,7 @@ Automatically detects Rusted Warfare room IDs in group messages and dispatches p
 - **Auto-recall room info**: successfully reported room info and retry progress are auto-recalled after `recall_delay` sec (error info & command replies not recalled); off by default, toggle/set via `/铁锈撤回`
 - **Probe pool**: `ABAB探针01` ~ `ABAB探针99` concurrent reuse, queue waiting beyond 99; max 5 room IDs per message
 - **Room cooldown**: same room ID not re-parsed within 10s, anti-spam
-- **Permission control**: global switch + whitelist/blacklist modes
+- **Permission control**: global switch + whitelist/blacklist modes, support per-**user** (`@userID`, private/group sender) and per-**group** (`#groupID`) control
 - **Player-list folding**: folds when over `max_players_display` (default 10) to avoid spam
 - **Special character support**: any UTF-8 player name (Chinese/symbols/whitespace)
 - **Fully self-contained**: built-in protocol probe `room_info.py`, no third-party deps, no hardcoded absolute paths, upload-and-go on any device
@@ -192,7 +192,7 @@ astrbot_plugin_rwinfo/
 
 - Queries run via subprocess calling `room_info.py`, isolated; auto-sends 111 to leave after query, never occupies a room slot
 - Same room ID has a 10s cooldown to avoid repeated parsing
-- Private messages: processed as group if the unified session id contains a group id passing whitelist/blacklist; pure private (no group id) is ignored
+- Private messages: checked against `@userID` list; group messages check both `#groupID` and sender `@userID` (user blacklist also effective in groups)
 - Player list shown by slot order, empty names shown as `(空)`
 - This plugin is for learning & entertainment; please do not use it to spam rooms or disturb other players
 
