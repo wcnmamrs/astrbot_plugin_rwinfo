@@ -95,7 +95,7 @@ def normalize_gid(gid) -> str:
     return m.group(0) if m else s
 
 
-@register("rwinfo", "Operit", "铁锈战争房间查询: 自动识别房号并安排探针查房", "1.2.9")
+@register("rwinfo", "Operit", "铁锈战争房间查询: 自动识别房号并安排探针查房", "1.3.0")
 class RWInfoPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -104,6 +104,9 @@ class RWInfoPlugin(Star):
         for k, v in self._default_config().items():
             if k not in self.config:
                 self.config[k] = v
+        # 旧配置迁移: 无前缀的纯数字名单条目统一转成 #群号 (兼容 v1.2.9 及更早)
+        self._migrate_list("white_list")
+        self._migrate_list("black_list")
 
         if self.config.get("debug", False):
             self.logger.setLevel(logging.DEBUG)
@@ -141,6 +144,21 @@ class RWInfoPlugin(Star):
                 self.logger.warning("配置对象不支持 save_config 方法，请检查 AstrBot 版本")
         except Exception as e:
             self.logger.warning(f"保存配置失败: {e}")
+
+    def _migrate_list(self, key: str):
+        """旧配置迁移: 名单里无前缀的纯数字条目统一转成 #群号."""
+        lst = self.config.get(key, [])
+        changed = False
+        for i, item in enumerate(lst):
+            if isinstance(item, (int, float)):
+                lst[i] = f"#{int(item)}"
+                changed = True
+            elif isinstance(item, str) and item and item[0] not in ("@", "#"):
+                if item.isdigit():
+                    lst[i] = f"#{item}"
+                    changed = True
+        if changed:
+            self._save_config()
 
     async def _send_room_result(self, event, result: str):
         """发送房间查询结果(可撤回). 处理超长截断."""
@@ -335,14 +353,16 @@ class RWInfoPlugin(Star):
             return out[mark:]
         return out
 
-    def _is_allowed(self, gid: str) -> bool:
+    def _is_allowed(self, key: str) -> bool:
+        """名单判定. key 为 '@用户ID' 或 '#群号'.
+        黑名单模式: 不在黑名单即放行; 白名单模式: 在白名单才放行."""
         if not self.config.get("global_enabled", True):
             return False
         mode = self.config.get("mode", "black")
         if mode == "white":
-            return gid in self.config.get("white_list", [])
+            return key in self.config.get("white_list", [])
         elif mode == "black":
-            return gid not in self.config.get("black_list", [])
+            return key not in self.config.get("black_list", [])
         return True
 
     # ---- 指令 (除帮助外均要求管理员权限) ----
@@ -354,8 +374,8 @@ class RWInfoPlugin(Star):
             "/铁锈查房帮助 - 显示本帮助",
             "/铁锈全局解析 开|关 - 全局解析总开关(无参查看)",
             "/铁锈模式 白|黑 - 切换白/黑名单模式(无参查看)",
-            "/铁锈白名 +群号|-群号 - 白名单管理(无参列出)",
-            "/铁锈黑名 +群号|-群号 - 黑名单管理(无参列出)",
+            "/铁锈白名 +@用户ID|+#群号 - 白名单管理(@用户私聊/#群聊, 无参列出)",
+            "/铁锈黑名 +@用户ID|+#群号 - 黑名单管理(@用户私聊/#群聊, 无参列出)",
             "/铁锈玩家列表 开|关 - 是否显示玩家列表(无参查看)",
             "/铁锈重试 [0-10] - 探针名被过滤时自动重试次数(无参查看)",
             "/铁锈撤回 开|关|秒数(0-300) - 自动撤回房间信息开关/延迟秒数(无参查看)",
@@ -469,26 +489,31 @@ class RWInfoPlugin(Star):
         if not arg:
             if not lst:
                 return f"{label}为空"
-            return f"{label}内群聊: {', '.join(lst)}"
-        if arg.startswith("+"):
-            gid = normalize_gid(arg[1:])
-            if not gid:
-                return f"群号无效: {arg[1:]}"
-            if gid not in lst:
-                lst.append(gid)
+            # 兼容迁移: 旧配置纯数字条目视为 #群号
+            lst2 = [("@" + x) if x.startswith("@") else ("#" + x) if not x.startswith("#") else x for x in lst]
+            return f"{label}内: {', '.join(lst2)}"
+        # 解析 +条目 / -条目
+        op = arg[0] if arg[0] in "+-" else ""
+        body = arg[1:] if op else arg
+        if not body.startswith(("@", "#")):
+            body = "#" + body  # 无前缀默认当群号
+        digits = re.search(r"\d+", body[1:])
+        if not digits:
+            return f"无效标识: {arg}"
+        key_val = body[0] + digits.group(0)  # 规范化 @数字 / #数字
+        if op == "-":
+            if key_val in lst:
+                lst.remove(key_val)
                 self._save_config()
-                return f"已加入{label}: {gid}"
-            return f"{label}中已存在: {gid}"
-        elif arg.startswith("-"):
-            gid = normalize_gid(arg[1:])
-            if not gid:
-                return f"群号无效: {arg[1:]}"
-            if gid in lst:
-                lst.remove(gid)
+                return f"已移出{label}: {key_val}"
+            return f"{label}中不存在: {key_val}"
+        if op == "+":
+            if key_val not in lst:
+                lst.append(key_val)
                 self._save_config()
-                return f"已移出{label}: {gid}"
-            return f"{label}中不存在: {gid}"
-        return f"用法: /{label} [+群号|-群号] (无参数列出)"
+                return f"已加入{label}: {key_val}"
+            return f"{label}中已存在: {key_val}"
+        return f"用法: /{label} [+@用户ID|+#群号] (无参数列出)"
 
     # ---- 消息监听 ----
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -500,18 +525,22 @@ class RWInfoPlugin(Star):
             if text.strip().startswith("/"):
                 return
 
+            # 群聊按 #群号, 私聊按 @用户ID, 各自进黑/白名单判定
             gid = normalize_gid(event.get_group_id())
-            if not gid:
-                # 私聊/未知会话: 检查统一标识中是否含有效群号, 否则不处理
-                alt = getattr(event, 'unified_msg_origin', None) or getattr(event, 'session_id', '')
-                alt_gid = normalize_gid(alt)
-                if alt_gid and self._is_allowed(alt_gid):
-                    gid = alt_gid
-                else:
+            if gid:
+                # 群聊: 标识 = #群号
+                key = f"#{gid}"
+                if not self._is_allowed(key):
                     return
             else:
-                if not self._is_allowed(gid):
+                # 私聊/未知会话: 标识 = @发送者ID
+                uid = normalize_gid(event.get_sender_id())
+                if not uid:
                     return
+                key = f"@{uid}"
+                if not self._is_allowed(key):
+                    return
+                gid = uid  # 后续日志/回传沿用 gid 变量(此处为用户ID)
 
             rids = extract_room_ids(text)
             if not rids:
