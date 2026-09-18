@@ -54,7 +54,7 @@ Install from the AstrBot plugin store, or via the **WebUI**:
 |---------|-----------|-------------|
 | `/铁锈查房帮助` | Everyone | Show all plugin commands and usage |
 | `/铁锈全局解析 开\|关` | 🔒 Admin | Global on/off switch (default on); no arg shows current state |
-| `/铁锈模式 白\|黑` | 🔒 Admin | List mode: white=only whitelist groups; black=blacklist groups disabled (default black); no arg shows mode |
+| `/铁锈模式 白\|黑` | 🔒 Admin | List mode: white=only listed items pass; black=listed items disabled (default black); no arg shows mode |
 | `/铁锈玩家列表 开\|关` | 🔒 Admin | Whether to show player list (default off); no arg shows state |
 | `/铁锈白名 +@3245987504` | 🔒 Admin | Add user to whitelist (private chat) |
 | `/铁锈白名 +#123456` | 🔒 Admin | Add group to whitelist |
@@ -90,7 +90,7 @@ Config is auto-persisted by the AstrBot framework, editable via WebUI or command
 |-----|-------------|
 | `global_enabled` | Global parsing switch |
 | `mode` | List mode (`white` or `black`) |
-| `white_list` / `black_list` | Group ID lists |
+| `white_list` / `black_list` | Group(`#`)/UserID(`@`) lists |
 | `debug` | Enable debug logging |
 | `max_players_display` | Max players shown in list, fold beyond |
 | `show_players` | Show player list (default off) |
