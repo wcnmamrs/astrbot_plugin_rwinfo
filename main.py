@@ -363,16 +363,20 @@ class RWInfoPlugin(Star):
             return out[mark:]
         return out
 
-    def _is_allowed(self, key: str) -> bool:
-        """名单判定. key 为 '@用户ID' 或 '#群号'.
-        黑名单模式: 不在黑名单即放行; 白名单模式: 在白名单才放行."""
+    def _is_allowed(self, keys) -> bool:
+        """名单判定. keys 为 '@用户ID' 或 '#群号' 的列表.
+        黑名单模式: 任一命中黑名单即拦截; 白名单模式: 全部在白名单才放行."""
+        if isinstance(keys, str):
+            keys = [keys]
         if not self.config.get("global_enabled", True):
             return False
         mode = self.config.get("mode", "black")
         if mode == "white":
-            return key in self.config.get("white_list", [])
+            wl = self.config.get("white_list", [])
+            return all(k in wl for k in keys)
         elif mode == "black":
-            return key not in self.config.get("black_list", [])
+            bl = self.config.get("black_list", [])
+            return not any(k in bl for k in keys)
         return True
 
     # ---- 指令 (除帮助外均要求管理员权限) ----
@@ -548,18 +552,19 @@ class RWInfoPlugin(Star):
             except Exception:
                 is_private = False
             gid = normalize_gid(event.get_group_id())
+            uid = normalize_gid(event.get_sender_id())
             if not is_private and gid:
-                # 群聊: 标识 = #群号
-                key = f"#{gid}"
-                if not self._is_allowed(key):
+                # 群聊: 同时检查 #群号 和 @发送者ID (用户黑名单在群聊里也生效, 参考 GUGUblack)
+                keys = [f"#{gid}"]
+                if uid:
+                    keys.append(f"@{uid}")
+                if not self._is_allowed(keys):
                     return
             else:
-                # 私聊/未知会话(含 is_private_chat 不可用或群号缺失): 标识 = @发送者ID
-                uid = normalize_gid(event.get_sender_id())
+                # 私聊/未知会话(含 is_private_chat 不可用或群号缺失): 只查 @发送者ID
                 if not uid:
                     return
-                key = f"@{uid}"
-                if not self._is_allowed(key):
+                if not self._is_allowed(f"@{uid}"):
                     return
                 gid = uid  # 后续日志/回传沿用 gid 变量(此处为用户ID)
 
