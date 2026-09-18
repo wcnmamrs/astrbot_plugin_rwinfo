@@ -153,9 +153,19 @@ class RWInfoPlugin(Star):
             if isinstance(item, (int, float)):
                 lst[i] = f"#{int(item)}"
                 changed = True
-            elif isinstance(item, str) and item and item[0] not in ("@", "#"):
-                if item.isdigit():
-                    lst[i] = f"#{item}"
+            elif isinstance(item, str):
+                s = item
+                # 清理重复/混合前缀: @@3245 -> @3245, ##123 -> #123, #@/ @# -> 去重为单个前缀
+                while len(s) >= 2 and s[0] in ("@", "#") and s[1] in ("@", "#"):
+                    s = s[0] + s[1:].lstrip("@#")
+                if not s:
+                    continue
+                if s[0] not in ("@", "#"):
+                    if s.isdigit():
+                        s = "#" + s
+                        changed = True
+                if s != item:
+                    lst[i] = s
                     changed = True
         if changed:
             self._save_config()
@@ -489,8 +499,13 @@ class RWInfoPlugin(Star):
         if not arg:
             if not lst:
                 return f"{label}为空"
-            # 兼容迁移: 旧配置纯数字条目视为 #群号
-            lst2 = [("@" + x) if x.startswith("@") else ("#" + x) if not x.startswith("#") else x for x in lst]
+            # 兼容迁移: 旧配置纯数字条目视为 #群号; 已有 @/# 前缀的不重复加
+            lst2 = []
+            for x in lst:
+                if x.startswith(("@", "#")):
+                    lst2.append(x)
+                else:
+                    lst2.append("#" + x)
             return f"{label}内: {', '.join(lst2)}"
         # 解析 +条目 / -条目
         op = arg[0] if arg[0] in "+-" else ""
@@ -526,14 +541,20 @@ class RWInfoPlugin(Star):
                 return
 
             # 群聊按 #群号, 私聊按 @用户ID, 各自进黑/白名单判定
+            # 优先用 event.is_private_chat() 判断私聊 (更可靠, 参考 astrbot_plugin_GUGUblack)
+            is_private = False
+            try:
+                is_private = bool(event.is_private_chat())
+            except Exception:
+                is_private = False
             gid = normalize_gid(event.get_group_id())
-            if gid:
+            if not is_private and gid:
                 # 群聊: 标识 = #群号
                 key = f"#{gid}"
                 if not self._is_allowed(key):
                     return
             else:
-                # 私聊/未知会话: 标识 = @发送者ID
+                # 私聊/未知会话(含 is_private_chat 不可用或群号缺失): 标识 = @发送者ID
                 uid = normalize_gid(event.get_sender_id())
                 if not uid:
                     return
