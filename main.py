@@ -95,7 +95,7 @@ def normalize_gid(gid) -> str:
     return m.group(0) if m else s
 
 
-@register("rwinfo", "Operit", "铁锈战争房间查询: 自动识别房号并安排探针查房", "1.2.8")
+@register("rwinfo", "Operit", "铁锈战争房间查询: 自动识别房号并安排探针查房", "1.2.9")
 class RWInfoPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -300,6 +300,22 @@ class RWInfoPlugin(Star):
             except Exception:
                 pass
             return f"[rwinfo] 查询超时(>{QUERY_TIMEOUT}s): {rid}"
+        except asyncio.CancelledError:
+            # 协程被取消(插件卸载/任务清理): 必须终止并回收子进程, 避免留下孤儿进程
+            proc.kill()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
+            raise
+        except Exception as e:
+            # 通信阶段其他异常: 同样回收子进程后透传
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
+            raise e
         out = stdout.decode("utf-8", "replace").strip()
         err = stderr.decode("utf-8", "replace").strip()
         rc = proc.returncode
@@ -542,6 +558,7 @@ class RWInfoPlugin(Star):
             if not tasks:
                 return
 
+            released = set()  # 已释放的探针编号, 避免 finally 重复释放
             try:
                 remaining = tasks.copy()
                 while remaining:
@@ -568,7 +585,8 @@ class RWInfoPlugin(Star):
                                     retried += 1
                                     await self._send_recallable(event, f"[房间查询] 重试中({retried}/{max_retry})")
                                     # 重试时去掉时间后缀, 直接 _序号 最短, 最不容易被过滤
-                                    new_name = f"{base_name}_{retried}"
+                                    # 用当前任务的 idx 构造, 避免 for 循环残留的 base_name 串号
+                                    new_name = f"ABAB探针{idx:02d}_{retried}"
                                     retry_result = ""
                                     retry_task = None
                                     try:
@@ -600,11 +618,12 @@ class RWInfoPlugin(Star):
                                 yield event.plain_result(translate_error(result))
                             else:
                                 self.logger.debug(f"房间 {rid} 无有效信息, 静默丢弃")
+                            released.add(idx)  # 先标记再释放, 确保 finally 不重复释放
                             self._release_probe(idx)
                             remaining.remove(t)
                             break
             finally:
-                # 取消所有尚未完成的查询任务并释放对应探针
+                # 取消所有尚未完成的查询任务并释放对应探针 (跳过已释放的, 避免重复)
                 for rid, idx, task in tasks:
                     if not task.done():
                         task.cancel()
@@ -612,7 +631,9 @@ class RWInfoPlugin(Star):
                             await task
                         except (asyncio.CancelledError, Exception):
                             pass
-                    self._release_probe(idx)
+                    if idx not in released:
+                        self._release_probe(idx)
+                        released.add(idx)
         except Exception as e:
             self.logger.error(f"rwinfo on_all_message error: {e}\n{traceback.format_exc()}")
 
