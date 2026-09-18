@@ -1583,9 +1583,13 @@ def finish_report(sock, got_106, got_115, target):
 
 
 def direct_main():
-    if not QUIET:
+    # 无端口时直接默认 5123, 避免 rpartition 把整个地址当端口
+    if ":" in DIRECT_TARGET:
         ip, _, port = DIRECT_TARGET.rpartition(":")
         port = int(port or 5123)
+    else:
+        ip, port = DIRECT_TARGET, 5123
+    if not QUIET:
         print(f"=== 直连 {ip}:{port} (客户端 1.15) ===")
     s, probe = connect_and_161(ip, port)
     sid = probe.server_id
