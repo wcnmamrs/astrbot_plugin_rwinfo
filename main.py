@@ -146,7 +146,7 @@ class RWInfoPlugin(Star):
             self.logger.warning(f"保存配置失败: {e}")
 
     def _migrate_list(self, key: str):
-        """旧配置迁移: 名单里无前缀的纯数字条目统一转成 #群号."""
+        """旧配置迁移: 无前缀的纯数字条目转成 #群号; 清理 @@/##/混合前缀的脏数据."""
         lst = self.config.get(key, [])
         changed = False
         for i, item in enumerate(lst):
@@ -395,7 +395,7 @@ class RWInfoPlugin(Star):
             "/铁锈撤回 开|关|秒数(0-300) - 自动撤回房间信息开关/延迟秒数(无参查看)",
             "",
             "【自动触发】",
-            "群内发送房间号(如 r5132、HLBIFZ) 自动查询回传房间信息",
+            "群聊/私聊发送房间号(如 r5132、HLBIFZ) 自动查询回传房间信息",
         ]
         yield event.plain_result("\n".join(lines))
 
@@ -553,19 +553,21 @@ class RWInfoPlugin(Star):
                 is_private = False
             gid = normalize_gid(event.get_group_id())
             uid = normalize_gid(event.get_sender_id())
-            self.logger.info(f"[名单判定] is_private={is_private} gid={gid!r} uid={uid!r} mode={self.config.get('mode')} black={self.config.get('black_list', [])}")
+            self.logger.info(f"[权限] 会话={'私聊' if is_private else '群聊'} 群号={gid or '-'} 发送者={uid or '-'} 模式={self.config.get('mode')}")
             if not is_private and gid:
                 # 群聊: 同时检查 #群号 和 @发送者ID (用户黑名单在群聊里也生效, 参考 GUGUblack)
                 keys = [f"#{gid}"]
                 if uid:
                     keys.append(f"@{uid}")
                 if not self._is_allowed(keys):
+                    self.logger.info(f"[权限] 群聊 {gid} 发送者 {uid} 命中名单, 已拦截查房")
                     return
             else:
                 # 私聊/未知会话(含 is_private_chat 不可用或群号缺失): 只查 @发送者ID
                 if not uid:
                     return
                 if not self._is_allowed(f"@{uid}"):
+                    self.logger.info(f"[权限] 私聊发送者 {uid} 命中名单, 已拦截查房")
                     return
                 gid = uid  # 后续日志/回传沿用 gid 变量(此处为用户ID)
 
