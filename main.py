@@ -553,6 +553,7 @@ class RWInfoPlugin(Star):
                 is_private = False
             gid = normalize_gid(event.get_group_id())
             uid = normalize_gid(event.get_sender_id())
+            self.logger.info(f"[名单判定] is_private={is_private} gid={gid!r} uid={uid!r} mode={self.config.get('mode')} black={self.config.get('black_list', [])}")
             if not is_private and gid:
                 # 群聊: 同时检查 #群号 和 @发送者ID (用户黑名单在群聊里也生效, 参考 GUGUblack)
                 keys = [f"#{gid}"]
