@@ -21,6 +21,8 @@ Automatically detects Rusted Warfare room IDs in group messages and dispatches p
   - Sends only when a valid room is found; silently drops on failure (room not found / English-word false positive) — no filter wordlist needed
 - **Localized failure reasons**: full room / game started / room locked etc. return clear Chinese hints (e.g. `[房间查询失败] 房间已满，无法加入`)
 - **Auto-retry on probe-name filter**: automatically renames and retries when the server blocks the probe name, sending progress `[房间查询] 重试中(1/3)`; retry count configurable (default 3)
+- **Unique retry names**: with multiple rooms per message, retry names use each probe's own index (`ABAB探针01_1`, `02_1`...) to avoid cross-room collisions
+- **Direct-connect default port**: `room_info.py 18.216.139.119` defaults to port 5123 when omitted
 - **Auto-recall room info**: successfully reported room info and retry progress are auto-recalled after `recall_delay` sec (error info & command replies not recalled); off by default, toggle/set via `/铁锈撤回`
 - **Probe pool**: `ABAB探针01` ~ `ABAB探针99` concurrent reuse, queue waiting beyond 99; max 5 room IDs per message
 - **Room cooldown**: same room ID not re-parsed within 10s, anti-spam
@@ -54,12 +56,12 @@ Install from the AstrBot plugin store, or via the **WebUI**:
 | `/铁锈全局解析 开\|关` | 🔒 Admin | Global on/off switch (default on); no arg shows current state |
 | `/铁锈模式 白\|黑` | 🔒 Admin | List mode: white=only whitelist groups; black=blacklist groups disabled (default black); no arg shows mode |
 | `/铁锈玩家列表 开\|关` | 🔒 Admin | Whether to show player list (default off); no arg shows state |
-| `/铁锈白名 +123456` | 🔒 Admin | Add to whitelist |
-| `/铁锈白名 -123456` | 🔒 Admin | Remove from whitelist |
-| `/铁锈白名` | 🔒 Admin | Print whitelisted groups |
-| `/铁锈黑名 +123456` | 🔒 Admin | Add to blacklist |
-| `/铁锈黑名 -123456` | 🔒 Admin | Remove from blacklist |
-| `/铁锈黑名` | 🔒 Admin | Print blacklisted groups |
+| `/铁锈白名 +@3245987504` | 🔒 Admin | Add user to whitelist (private chat) |
+| `/铁锈白名 +#123456` | 🔒 Admin | Add group to whitelist |
+| `/铁锈白名` | 🔒 Admin | Print whitelist |
+| `/铁锈黑名 +@3245987504` | 🔒 Admin | Add user to blacklist (private chat) |
+| `/铁锈黑名 +#123456` | 🔒 Admin | Add group to blacklist |
+| `/铁锈黑名` | 🔒 Admin | Print blacklist |
 | `/铁锈重试 [0-10]` | 🔒 Admin | Set auto-retry count when probe name is filtered; no arg shows config |
 | `/铁锈撤回 开\|关\|秒数(0-300)` | 🔒 Admin | Auto-recall on/off / delay seconds; no arg shows config |
 
@@ -190,7 +192,7 @@ astrbot_plugin_rwinfo/
 
 - Queries run via subprocess calling `room_info.py`, isolated; auto-sends 111 to leave after query, never occupies a room slot
 - Same room ID has a 10s cooldown to avoid repeated parsing
-- Private messages are not processed (group chat only)
+- Private messages: processed as group if the unified session id contains a group id passing whitelist/blacklist; pure private (no group id) is ignored
 - Player list shown by slot order, empty names shown as `(空)`
 - This plugin is for learning & entertainment; please do not use it to spam rooms or disturb other players
 
