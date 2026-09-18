@@ -406,7 +406,7 @@ class RWInfoPlugin(Star):
         arg = (arg or "").strip()
         if not arg:
             mode = self.config.get("mode", "black")
-            mode_name = "白名单(仅白名单群可用)" if mode == "white" else "黑名单(黑名单群禁用)"
+            mode_name = "白名单(仅名单内放行)" if mode == "white" else "黑名单(名单内禁用)"
             yield event.plain_result(f"当前模式：{mode_name}")
             return
         if arg not in ("白", "黑"):
@@ -414,7 +414,7 @@ class RWInfoPlugin(Star):
             return
         self.config["mode"] = "white" if arg == "白" else "black"
         self._save_config()
-        mode_name = "白名单(仅白名单群可用)" if self.config["mode"] == "white" else "黑名单(黑名单群禁用)"
+        mode_name = "白名单(仅名单内放行)" if self.config["mode"] == "white" else "黑名单(名单内禁用)"
         yield event.plain_result(f"当前模式已切换为：{mode_name}")
 
     @filter.command("铁锈玩家列表")
