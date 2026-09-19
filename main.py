@@ -105,10 +105,10 @@ class RWInfoPlugin(Star):
             if k not in self.config:
                 self.config[k] = v
         # 旧配置迁移: 无前缀的纯数字名单条目统一转成 #群号 (兼容 v1.2.9 及更早)
-        self._migrate_list("white_list")
-        self._migrate_list("black_list")
-        self._migrate_list("mixed_white_list")
-        self._migrate_list("mixed_black_list")
+        self._migrate_list("白名单")
+        self._migrate_list("黑名单")
+        self._migrate_list("混合_白名单")
+        self._migrate_list("混合_黑名单")
 
         if self.config.get("debug", False):
             self.logger.setLevel(logging.DEBUG)
@@ -126,14 +126,14 @@ class RWInfoPlugin(Star):
 
     def _default_config(self) -> dict:
         return {
-            "global_enabled": True,
-            "mode": "black",
-            "white_list": [],
-            "black_list": [],
-            "mixed_white_list": [],     # 混合模式独立白名单
-            "mixed_black_list": [],     # 混合模式独立黑名单
-            "mixed_private_policy": "white",  # 混合模式私聊默认策略: white=不在白名单拦 / black=在黑名单拦
-            "private_enabled": True,    # 是否启用私聊处理
+            "global_enabled": True,           # 全局开关：关闭后所有查房都被拦截
+            "mode": "black",                  # 模式：black=黑名单放行 / white=白名单放行 / mixed=混合模式(@优先)
+            "白名单": [],                     # 白名单列表（black/white模式下使用）
+            "黑名单": [],                     # 黑名单列表（black/white模式下使用）
+            "混合_白名单": [],                # 混合模式专用白名单（@用户/#群 独立管理）
+            "混合_黑名单": [],                # 混合模式专用黑名单（@用户/#群 独立管理）
+            "混合_私聊策略": "white",         # 混合模式私聊默认策略：white=不在白名单拦 / black=在黑名单拦
+            "私聊启用": True,                 # 是否处理私聊消息（关闭则私聊不发房号）
             "debug": False,
             "max_players_display": 10,
             "show_players": False,
@@ -383,29 +383,29 @@ class RWInfoPlugin(Star):
         mode = self.config.get("mode", "black")
 
         if mode == "black":
-            bl = self.config.get("black_list", [])
+            bl = self.config.get("黑名单", [])
             if is_private:
                 return not (uid and f"@{uid}" in bl)
             # 群聊: #gid 或 @uid 任一在黑名单 -> 拦
             return not ((gid and f"#{gid}" in bl) or (uid and f"@{uid}" in bl))
 
         if mode == "white":
-            wl = self.config.get("white_list", [])
+            wl = self.config.get("白名单", [])
             if is_private:
                 return bool(uid and f"@{uid}" in wl)
             # 群聊: #gid 或 @uid 任一在白名单 -> 放
             return bool((gid and f"#{gid}" in wl) or (uid and f"@{uid}" in wl))
 
         # ---- mixed 混合模式 ----
-        mwl = self.config.get("mixed_white_list", [])
-        mbl = self.config.get("mixed_black_list", [])
+        mwl = self.config.get("混合_白名单", [])
+        mbl = self.config.get("混合_黑名单", [])
         if is_private:
             if uid and f"@{uid}" in mbl:
                 return False  # 用户在混合黑名单 -> 拦
             if uid and f"@{uid}" in mwl:
                 return True   # 用户在混合白名单 -> 放
             # 用户不在两名单: 跟随配置的私聊默认策略
-            policy = self.config.get("mixed_private_policy", "white")
+            policy = self.config.get("混合_私聊策略", "white")
             return policy != "white"  # white=不在白->拦(False); black=在黑才拦->放(True)
         # 群聊
         if uid and f"@{uid}" in mbl:
@@ -476,10 +476,10 @@ class RWInfoPlugin(Star):
         if new_mode != old_mode:
             if new_mode == "mixed":
                 # 切到混合: 若混合名单为空, 用当前白/黑名单作为初始(保留上次混合配置)
-                if not self.config.get("mixed_white_list"):
-                    self.config["mixed_white_list"] = list(self.config.get("white_list", []))
-                if not self.config.get("mixed_black_list"):
-                    self.config["mixed_black_list"] = list(self.config.get("black_list", []))
+                if not self.config.get("混合_白名单"):
+                    self.config["混合_白名单"] = list(self.config.get("白名单", []))
+                if not self.config.get("混合_黑名单"):
+                    self.config["混合_黑名单"] = list(self.config.get("黑名单", []))
             # 从混合切回白/黑: 白/黑名单保持切换前状态(独立保存), 混合名单保留供下次切回时恢复
             self.config["mode"] = new_mode
             self._save_config()
@@ -504,8 +504,8 @@ class RWInfoPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_white(self, event: AstrMessageEvent, arg: str = ""):
         mixed = self.config.get("mode") == "mixed"
-        key = "mixed_white_list" if mixed else "white_list"
-        opp = "mixed_black_list" if mixed else None
+        key = "混合_白名单" if mixed else "白名单"
+        opp = "混合_黑名单" if mixed else None
         text = self._cmd_list_text(arg, key, "白名单", opp)
         yield event.plain_result(text)
         self._save_config()
@@ -514,8 +514,8 @@ class RWInfoPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_black(self, event: AstrMessageEvent, arg: str = ""):
         mixed = self.config.get("mode") == "mixed"
-        key = "mixed_black_list" if mixed else "black_list"
-        opp = "mixed_white_list" if mixed else None
+        key = "混合_黑名单" if mixed else "黑名单"
+        opp = "混合_白名单" if mixed else None
         text = self._cmd_list_text(arg, key, "黑名单", opp)
         yield event.plain_result(text)
         self._save_config()
@@ -563,16 +563,16 @@ class RWInfoPlugin(Star):
         """混合模式下私聊默认策略: white=不在白名单拦 / black=在黑名单拦."""
         arg = (arg or "").strip()
         if not arg:
-            p = self.config.get("mixed_private_policy", "white")
+            p = self.config.get("混合_私聊策略", "white")
             name = "跟随白名单(不在白名单拦截)" if p == "white" else "跟随黑名单(在黑名单拦截)"
             yield event.plain_result(f"混合模式私聊默认策略：{name}")
             return
         if arg not in ("白", "黑"):
             yield event.plain_result("用法: /铁锈私聊策略 白|黑")
             return
-        self.config["mixed_private_policy"] = "white" if arg == "白" else "black"
+        self.config["混合_私聊策略"] = "white" if arg == "白" else "black"
         self._save_config()
-        name = "跟随白名单(不在白名单拦截)" if self.config["mixed_private_policy"] == "white" else "跟随黑名单(在黑名单拦截)"
+        name = "跟随白名单(不在白名单拦截)" if self.config["混合_私聊策略"] == "white" else "跟随黑名单(在黑名单拦截)"
         yield event.plain_result(f"混合模式私聊默认策略已设为：{name}")
 
     @filter.command("铁锈私聊开关")
@@ -581,15 +581,15 @@ class RWInfoPlugin(Star):
         """是否启用私聊查房处理."""
         arg = (arg or "").strip()
         if not arg:
-            state = "开启" if self.config.get("private_enabled", True) else "关闭"
+            state = "开启" if self.config.get("私聊启用", True) else "关闭"
             yield event.plain_result(f"私聊查房处理当前状态：{state}")
             return
         if arg not in ("开", "关"):
             yield event.plain_result("用法: /铁锈私聊开关 开|关")
             return
-        self.config["private_enabled"] = (arg == "开")
+        self.config["私聊启用"] = (arg == "开")
         self._save_config()
-        yield event.plain_result(f"私聊查房处理已{'开启' if self.config['private_enabled'] else '关闭'}")
+        yield event.plain_result(f"私聊查房处理已{'开启' if self.config['私聊启用'] else '关闭'}")
 
     def _cmd_list_text(self, arg, key, label, opposite_key=None) -> str:
         arg = (arg or "").strip()
@@ -652,7 +652,7 @@ class RWInfoPlugin(Star):
             uid = normalize_gid(event.get_sender_id())
 
             # 私聊处理开关: 关闭私聊时, 私聊消息直接不处理
-            if is_private and not self.config.get("private_enabled", True):
+            if is_private and not self.config.get("私聊启用", True):
                 return
 
             rids = extract_room_ids(text)
