@@ -6,7 +6,7 @@ desc: |
   - 自动识别群/私聊消息中的房间号 (r/s房 如 r5132, 国际房 如 HLBIFZ)
   - 安排探针机器人 (ABAB探针01~99) 查询房间信息并回传
   - 查询到有效房间信息才发送, 查不到自动静默
-  - 支持黑白名单(用户/群)权限控制
-version: 1.3.0
+  - 支持黑白名单(用户/群)权限控制; 混合模式(@用户优先于#群, 同名互斥); 私聊策略可配
+version: 1.4.0
 author: wcnmamrs
 repo: "https://github.com/wcnmamrs/astrbot_plugin_rwinfo"
