@@ -5,20 +5,41 @@
         "default": true
     },
     "mode": {
-        "description": "名单模式: white(白名单) / black(黑名单)",
+        "description": "名单模式: white(白名单) / black(黑名单) / mixed(混合模式@用户优先)",
         "type": "string",
         "default": "black",
+        "options": ["white", "black", "mixed"]
+    },
+    "白名单": {
+        "description": "白名单列表（black/white模式下使用）",
+        "type": "list",
+        "default": []
+    },
+    "黑名单": {
+        "description": "黑名单列表（black/white模式下使用）",
+        "type": "list",
+        "default": []
+    },
+    "混合_白名单": {
+        "description": "混合模式专用白名单（@用户/#群 独立管理）",
+        "type": "list",
+        "default": []
+    },
+    "混合_黑名单": {
+        "description": "混合模式专用黑名单（@用户/#群 独立管理）",
+        "type": "list",
+        "default": []
+    },
+    "混合_私聊策略": {
+        "description": "混合模式私聊默认策略: white(不在白名单拦截) / black(在黑名单拦截)",
+        "type": "string",
+        "default": "white",
         "options": ["white", "black"]
     },
-    "white_list": {
-        "description": "白名单群号列表",
-        "type": "list",
-        "default": []
-    },
-    "black_list": {
-        "description": "黑名单群号列表",
-        "type": "list",
-        "default": []
+    "私聊启用": {
+        "description": "是否启用私聊查房处理（关闭则私聊不发房号）",
+        "type": "bool",
+        "default": true
     },
     "debug": {
         "description": "开启调试日志（输出详细运行信息）",
