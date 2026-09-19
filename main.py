@@ -553,6 +553,12 @@ class RWInfoPlugin(Star):
                 is_private = False
             gid = normalize_gid(event.get_group_id())
             uid = normalize_gid(event.get_sender_id())
+
+            rids = extract_room_ids(text)
+            if not rids:
+                return
+
+            # 只有真正发房号的消息才做权限判定与日志(避免无关消息刷屏)
             self.logger.info(f"[权限] 会话={'私聊' if is_private else '群聊'} 群号={gid or '-'} 发送者={uid or '-'} 模式={self.config.get('mode')}")
             if not is_private and gid:
                 # 群聊: 同时检查 #群号 和 @发送者ID (用户黑名单在群聊里也生效, 参考 GUGUblack)
@@ -570,10 +576,6 @@ class RWInfoPlugin(Star):
                     self.logger.info(f"[权限] 私聊发送者 {uid} 命中名单, 已拦截查房")
                     return
                 gid = uid  # 后续日志/回传沿用 gid 变量(此处为用户ID)
-
-            rids = extract_room_ids(text)
-            if not rids:
-                return
 
             self.logger.debug(f"群 {gid} 提取到房号: {rids}")
 
