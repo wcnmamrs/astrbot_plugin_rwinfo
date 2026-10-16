@@ -651,7 +651,7 @@ class RWInfoPlugin(Star):
             arg = " ".join(parts)
         if not key and not wildcard:
             return
-        scope = "全部群" if wildcard else f"本群({key})"
+        scope = ("全部群" if wildcard else (f"本群({key})" if not is_private else "本私聊"))
         if not arg:
             cfg = self._get_recall_cfg(event)
             state = "开启" if cfg["开"] else "关闭"
