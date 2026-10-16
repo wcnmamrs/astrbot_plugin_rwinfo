@@ -255,6 +255,21 @@ class RWInfoPlugin(Star):
             store[idx] = new_entry
         self._save_config()
 
+    def _recall_full_args(self, event, arg: str) -> str:
+        """AstrBot 仅将第一个空格分隔参数传给 arg, 后续参数会丢失.
+        这里从原始消息文本补全完整参数, 以支持末尾通配符 '*'. 取不到时回退 arg."""
+        try:
+            text = (event.get_message_str() or "").strip()
+        except Exception:
+            text = ""
+        if text:
+            i = text.find("铁锈撤回")
+            if i >= 0:
+                rest = text[i + len("铁锈撤回"):].strip()
+                if rest:
+                    return rest
+        return (arg or "").strip()
+
     async def _send_room_result(self, event, result: str):
         """发送房间查询结果(可撤回). 处理超长截断."""
         if len(result) > 3500:
@@ -619,9 +634,8 @@ class RWInfoPlugin(Star):
     async def cmd_recall(self, event: AstrMessageEvent, arg: str = ""):
         """自动撤回开关/延迟(按会话独立): 群聊需管理员, 私聊任何人可用.
         群聊参数末尾加 '*' 表示对所有群生效(通配符, 可被具体群配置覆盖); 私聊不支持通配符."""
-        arg = (arg or "").strip()
+        arg = self._recall_full_args(event, arg)
         key, is_private = self._recall_session_key(event)
-        # 群聊需管理员鉴权; 私聊无需鉴权(静默忽略非管理员)
         if not is_private and not event.is_admin():
             return
         # 解析末尾 '*' 通配符(仅群聊支持)
