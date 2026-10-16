@@ -601,7 +601,8 @@ class RWInfoPlugin(Star):
         mixed = self.config.get("mode") == "mixed"
         key = "混合_白名单" if mixed else "白名单"
         opp = "混合_黑名单" if mixed else None
-        text = self._cmd_list_text(arg, key, "白名单", opp)
+        label = "混合白名单" if mixed else "白名单"
+        text = self._cmd_list_text(arg, key, label, opp, cmd_name="铁锈白名")
         yield event.plain_result(text)
         self._save_config()
 
@@ -611,7 +612,8 @@ class RWInfoPlugin(Star):
         mixed = self.config.get("mode") == "mixed"
         key = "混合_黑名单" if mixed else "黑名单"
         opp = "混合_白名单" if mixed else None
-        text = self._cmd_list_text(arg, key, "黑名单", opp)
+        label = "混合黑名单" if mixed else "黑名单"
+        text = self._cmd_list_text(arg, key, label, opp, cmd_name="铁锈黑名")
         yield event.plain_result(text)
         self._save_config()
 
@@ -703,7 +705,7 @@ class RWInfoPlugin(Star):
         self._save_config()
         yield event.plain_result(f"私聊查房处理已{'开启' if self.config['私聊启用'] else '关闭'}")
 
-    def _cmd_list_text(self, arg, key, label, opposite_key=None) -> str:
+    def _cmd_list_text(self, arg, key, label, opposite_key=None, cmd_name=None) -> str:
         arg = (arg or "").strip()
         lst = self.config.get(key, [])
         if not arg:
@@ -741,7 +743,7 @@ class RWInfoPlugin(Star):
             lst.remove(key_val)
             self._save_config()
             return f"已移出{label}: {key_val}"
-        return f"用法: /{label} [+@用户ID|+#群号] (无参数列出)"
+        return f"用法: /{cmd_name or label} [+@用户ID|+#群号] (无参数列出)"
 
     # ---- 消息监听 ----
     @filter.event_message_type(filter.EventMessageType.ALL)
