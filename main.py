@@ -207,17 +207,27 @@ class RWInfoPlugin(Star):
         return {"key": key, "开": on, "延迟": delay}
 
     def _get_recall_cfg(self, event) -> dict:
-        """读取当前会话的撤回配置, 缺省为 {开: False, 延迟: 60} (默认关闭)."""
+        """读取当前会话的撤回配置: 精确匹配优先; 群聊其次回退通配符 '*'; 私聊不使用通配符.
+        缺省 {开: False, 延迟: 60}."""
         key, is_private = self._recall_session_key(event)
+        wildcard = None
         for entry in self._recall_store(is_private):
             cfg = self._recall_parse(entry)
             if cfg["key"] == key:
-                return {"开": cfg["开"], "延迟": cfg["延迟"]}
-        return {"开": False, "延迟": 60}
+                return {"开": cfg["开"], "延迟": cfg["延迟"], "通配": False}
+            # 通配符仅对群聊生效, 私聊忽略(防止普通用户设 '*' 越权影响他人)
+            if cfg["key"] == "*" and not is_private:
+                wildcard = {"开": cfg["开"], "延迟": cfg["延迟"], "通配": True}
+        if wildcard is not None:
+            return wildcard
+        return {"开": False, "延迟": 60, "通配": False}
 
-    def _set_recall_cfg(self, event, on=None, delay=None):
-        """写入当前会话的撤回配置并持久化 (仅更新传入的字段, 另一字段沿用现有值)."""
+    def _set_recall_cfg(self, event, on=None, delay=None, wildcard=False):
+        """写入撤回配置并持久化. wildcard=True 时写入 '*' (仅群聊生效).
+        私聊强制忽略通配符(防止普通用户越权). 仅更新传入字段, 另一字段沿用现有值."""
         key, is_private = self._recall_session_key(event)
+        if wildcard and not is_private:
+            key = "*"
         if not key:
             return
         store_key = "私聊撤回" if is_private else "群撤回"
@@ -506,7 +516,7 @@ class RWInfoPlugin(Star):
             "/铁锈私聊开关 开|关 - 是否启用私聊查房(无参查看)",
             "/铁锈玩家列表 开|关 - 是否显示玩家列表(无参查看)",
             "/铁锈重试 [0-10] - 探针名被过滤时自动重试次数(无参查看)",
-            "/铁锈撤回 开|关|秒数(0-300) - 自动撤回房间信息(按群/私聊独立, 无参查看; 群聊需管理员)",
+            "/铁锈撤回 开|关|秒数(0-300) [*] - 自动撤回(按群/私聊独立; 群聊加*对所有群生效且可被具体群覆盖; 群聊需管理员)",
             "",
             "【自动触发】",
             "群聊/私聊发送房间号(如 r5132、HLBIFZ) 自动查询回传房间信息",
@@ -607,33 +617,43 @@ class RWInfoPlugin(Star):
 
     @filter.command("铁锈撤回")
     async def cmd_recall(self, event: AstrMessageEvent, arg: str = ""):
-        """自动撤回开关/延迟(按会话独立): 群聊需管理员, 私聊任何人可用."""
+        """自动撤回开关/延迟(按会话独立): 群聊需管理员, 私聊任何人可用.
+        群聊参数末尾加 '*' 表示对所有群生效(通配符, 可被具体群配置覆盖); 私聊不支持通配符."""
         arg = (arg or "").strip()
         key, is_private = self._recall_session_key(event)
-        # 群聊需管理员鉴权; 私聊无需鉴权(静默忽略非管理员, 群聊同理)
+        # 群聊需管理员鉴权; 私聊无需鉴权(静默忽略非管理员)
         if not is_private and not event.is_admin():
             return
-        if not key:
+        # 解析末尾 '*' 通配符(仅群聊支持)
+        wildcard = False
+        parts = arg.split()
+        if parts and parts[-1] == "*":
+            if is_private:
+                # 私聊不支持通配符, 直接拒绝(防止越权影响他人)
+                yield event.plain_result("私聊不支持通配符 *（仅群聊可用），已忽略")
+                return
+            wildcard = True
+            parts = parts[:-1]
+            arg = " ".join(parts)
+        if not key and not wildcard:
             return
+        scope = "全部群" if wildcard else f"本群({key})"
         if not arg:
             cfg = self._get_recall_cfg(event)
             state = "开启" if cfg["开"] else "关闭"
-            scope = "本私聊" if is_private else f"本群({key})"
+            if cfg.get("通配") and not wildcard:
+                scope = f"{scope}（继承通配 *）"
             yield event.plain_result(f"{scope}自动撤回：{state}；延迟秒数：{cfg['延迟']} 秒")
             return
         if arg in ("开", "关"):
-            self._set_recall_cfg(event, on=(arg == "开"))
-            cfg = self._get_recall_cfg(event)
-            scope = "本私聊" if is_private else f"本群({key})"
-            yield event.plain_result(f"{scope}自动撤回已{'开启' if cfg['开'] else '关闭'}")
+            self._set_recall_cfg(event, on=(arg == "开"), wildcard=wildcard)
+            yield event.plain_result(f"{scope}自动撤回已{'开启' if arg == '开' else '关闭'}")
             return
         if arg.isdigit() and 0 <= int(arg) <= 300:
-            self._set_recall_cfg(event, delay=int(arg))
-            cfg = self._get_recall_cfg(event)
-            scope = "本私聊" if is_private else f"本群({key})"
-            yield event.plain_result(f"{scope}自动撤回延迟已设置为：{cfg['延迟']} 秒")
+            self._set_recall_cfg(event, delay=int(arg), wildcard=wildcard)
+            yield event.plain_result(f"{scope}自动撤回延迟已设置为：{int(arg)} 秒")
             return
-        yield event.plain_result("用法: /铁锈撤回 开|关|秒数(0-300)  (无参数查看当前配置; 群聊需管理员, 私聊所有人可用)")
+        yield event.plain_result("用法: /铁锈撤回 开|关|秒数(0-300) [*]  (无参数查看; 群聊加 * 对所有群生效且可被具体群覆盖; 群聊需管理员, 私聊所有人可用)")
 
     @filter.command("铁锈私聊策略")
     @filter.permission_type(filter.PermissionType.ADMIN)
