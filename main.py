@@ -138,8 +138,8 @@ class RWInfoPlugin(Star):
             "max_players_display": 10,
             "show_players": False,
             "retry_times": 3,
-            "auto_recall": False,
-            "recall_delay": 60,
+            "群撤回": [],                     # 按群独立的撤回配置: 每条 "#群号:开:延迟" 例 "#123456:1:60"
+            "私聊撤回": [],                   # 按用户独立的撤回配置: 每条 "@用户ID:开:延迟" 例 "@3856554669:1:60"
         }
 
     def _save_config(self):
@@ -176,6 +176,75 @@ class RWInfoPlugin(Star):
         if changed:
             self._save_config()
 
+    def _recall_session_key(self, event):
+        """返回 (会话key, 是否私聊). 群聊=#群号, 私聊=@用户ID(与黑白名单前缀一致)."""
+        try:
+            is_private = bool(event.is_private_chat())
+        except Exception:
+            is_private = False
+        gid = normalize_gid(event.get_group_id())
+        uid = normalize_gid(event.get_sender_id())
+        if is_private or not gid:
+            return (f"@{uid}" if uid else "", True)
+        return (f"#{gid}", False)
+
+    def _recall_store(self, is_private: bool) -> list:
+        """取出群/私聊撤回配置列表(容器)."""
+        store = self.config.get("私聊撤回" if is_private else "群撤回", [])
+        return store if isinstance(store, list) else []
+
+    def _recall_parse(self, entry) -> dict:
+        """解析单条 'key:开:延迟' -> {key, 开, 延迟}. 容错: 缺省 开=False, 延迟=60."""
+        s = str(entry).strip()
+        parts = s.split(":")
+        key = parts[0].strip() if parts else ""
+        on = False
+        delay = 60
+        if len(parts) >= 2 and parts[1].strip() != "":
+            on = parts[1].strip() in ("1", "开", "true", "True", "on")
+        if len(parts) >= 3 and parts[2].strip().isdigit():
+            delay = max(0, min(300, int(parts[2].strip())))
+        return {"key": key, "开": on, "延迟": delay}
+
+    def _get_recall_cfg(self, event) -> dict:
+        """读取当前会话的撤回配置, 缺省为 {开: False, 延迟: 60} (默认关闭)."""
+        key, is_private = self._recall_session_key(event)
+        for entry in self._recall_store(is_private):
+            cfg = self._recall_parse(entry)
+            if cfg["key"] == key:
+                return {"开": cfg["开"], "延迟": cfg["延迟"]}
+        return {"开": False, "延迟": 60}
+
+    def _set_recall_cfg(self, event, on=None, delay=None):
+        """写入当前会话的撤回配置并持久化 (仅更新传入的字段, 另一字段沿用现有值)."""
+        key, is_private = self._recall_session_key(event)
+        if not key:
+            return
+        store_key = "私聊撤回" if is_private else "群撤回"
+        store = self.config.get(store_key)
+        if not isinstance(store, list):
+            store = []
+            self.config[store_key] = store
+        # 读取现有值
+        cur = {"开": False, "延迟": 60}
+        idx = None
+        for i, entry in enumerate(store):
+            cfg = self._recall_parse(entry)
+            if cfg["key"] == key:
+                cur = {"开": cfg["开"], "延迟": cfg["延迟"]}
+                idx = i
+                break
+        if on is not None:
+            cur["开"] = bool(on)
+        if delay is not None:
+            cur["延迟"] = max(0, min(300, int(delay)))
+        new_entry = f"{key}:{1 if cur['开'] else 0}:{cur['延迟']}"
+        if idx is None:
+            store.append(new_entry)
+        else:
+            store[idx] = new_entry
+        self._save_config()
+
     async def _send_room_result(self, event, result: str):
         """发送房间查询结果(可撤回). 处理超长截断."""
         if len(result) > 3500:
@@ -188,7 +257,8 @@ class RWInfoPlugin(Star):
         text = text.strip()
         if not text:
             return None
-        if not self.config.get("auto_recall", False):
+        rcfg = self._get_recall_cfg(event)
+        if not rcfg["开"]:
             # 未开启自动撤回: 用原生发送, 不关心 message_id
             try:
                 await event.send(event.plain_result(text))
@@ -227,7 +297,7 @@ class RWInfoPlugin(Star):
         if not mid:
             self.logger.debug("未获取到 message_id, 不安排撤回")
             return None
-        delay = int(self.config.get("recall_delay", 60))
+        delay = int(rcfg["延迟"])
         if delay > 0:
             task = asyncio.create_task(self._delayed_recall(event, mid, delay))
             self.pending_recall_tasks.add(task)
@@ -436,7 +506,7 @@ class RWInfoPlugin(Star):
             "/铁锈私聊开关 开|关 - 是否启用私聊查房(无参查看)",
             "/铁锈玩家列表 开|关 - 是否显示玩家列表(无参查看)",
             "/铁锈重试 [0-10] - 探针名被过滤时自动重试次数(无参查看)",
-            "/铁锈撤回 开|关|秒数(0-300) - 自动撤回房间信息开关/延迟秒数(无参查看)",
+            "/铁锈撤回 开|关|秒数(0-300) - 自动撤回房间信息(按群/私聊独立, 无参查看; 群聊需管理员)",
             "",
             "【自动触发】",
             "群聊/私聊发送房间号(如 r5132、HLBIFZ) 自动查询回传房间信息",
@@ -536,26 +606,34 @@ class RWInfoPlugin(Star):
         yield event.plain_result(f"重试次数已设置为：{self.config['retry_times']}")
 
     @filter.command("铁锈撤回")
-    @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_recall(self, event: AstrMessageEvent, arg: str = ""):
+        """自动撤回开关/延迟(按会话独立): 群聊需管理员, 私聊任何人可用."""
         arg = (arg or "").strip()
+        key, is_private = self._recall_session_key(event)
+        # 群聊需管理员鉴权; 私聊无需鉴权(静默忽略非管理员, 群聊同理)
+        if not is_private and not event.is_admin():
+            return
+        if not key:
+            return
         if not arg:
-            on = self.config.get("auto_recall", False)
-            delay = self.config.get("recall_delay", 60)
-            state = "开启" if on else "关闭"
-            yield event.plain_result(f"自动撤回：{state}；延迟秒数：{delay} 秒")
+            cfg = self._get_recall_cfg(event)
+            state = "开启" if cfg["开"] else "关闭"
+            scope = "本私聊" if is_private else f"本群({key})"
+            yield event.plain_result(f"{scope}自动撤回：{state}；延迟秒数：{cfg['延迟']} 秒")
             return
         if arg in ("开", "关"):
-            self.config["auto_recall"] = (arg == "开")
-            self._save_config()
-            yield event.plain_result(f"自动撤回已{'开启' if self.config['auto_recall'] else '关闭'}")
+            self._set_recall_cfg(event, on=(arg == "开"))
+            cfg = self._get_recall_cfg(event)
+            scope = "本私聊" if is_private else f"本群({key})"
+            yield event.plain_result(f"{scope}自动撤回已{'开启' if cfg['开'] else '关闭'}")
             return
         if arg.isdigit() and 0 <= int(arg) <= 300:
-            self.config["recall_delay"] = int(arg)
-            self._save_config()
-            yield event.plain_result(f"自动撤回延迟已设置为：{self.config['recall_delay']} 秒")
+            self._set_recall_cfg(event, delay=int(arg))
+            cfg = self._get_recall_cfg(event)
+            scope = "本私聊" if is_private else f"本群({key})"
+            yield event.plain_result(f"{scope}自动撤回延迟已设置为：{cfg['延迟']} 秒")
             return
-        yield event.plain_result("用法: /铁锈撤回 开|关|秒数(0-300)  (无参数查看当前配置)")
+        yield event.plain_result("用法: /铁锈撤回 开|关|秒数(0-300)  (无参数查看当前配置; 群聊需管理员, 私聊所有人可用)")
 
     @filter.command("铁锈私聊策略")
     @filter.permission_type(filter.PermissionType.ADMIN)
