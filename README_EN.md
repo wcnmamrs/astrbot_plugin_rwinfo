@@ -65,7 +65,7 @@ Install from the AstrBot plugin store, or via the **WebUI**:
 | `/铁锈私聊策略 白\|黑` | 🔒 Admin | Mixed-mode private default policy: white=follow whitelist (block if not listed); black=follow blacklist (block if listed); no arg shows policy |
 | `/铁锈私聊开关 开\|关` | 🔒 Admin | Enable private-chat room lookup (default on); no arg shows state |
 | `/铁锈重试 [0-10]` | 🔒 Admin | Set auto-retry count when probe name is filtered; no arg shows config |
-| `/铁锈撤回 开\|关\|秒数(0-300)` | 🔒 Group admin / private everyone | Auto-recall on/off / delay seconds, **saved per group / per private session**; group requires admin, private open to everyone; no arg shows current session config |
+| `/铁锈撤回 开\|关\|秒数(0-300) [*]` | 🔒 Group admin / private everyone | Auto-recall on/off / delay seconds, **saved per group / per private session**; in group, append `*` to apply to all groups (wildcard, **overridable by a specific group**); **wildcard not supported in private** (anti-abuse); group requires admin, private open to everyone; no arg shows current session config |
 
 ---
 
