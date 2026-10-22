@@ -12,9 +12,11 @@ room_info.py - 铁锈战争房间信息查询工具（一体化, 1.15）
 import gzip
 import hashlib
 import io
+import json
 import os
 import re
 import socket
+import ssl
 import struct
 import sys
 import time
@@ -25,7 +27,8 @@ import random
 import zlib
 
 # 全局安静模式（插件调用时设为 True，屏蔽调试输出）
-QUIET = True  # 默认静默: 只输出最终结果, --debug 显示完整流程
+# 命令行直接运行时自动关闭静默（否则 --list 等模式看不到任何输出）
+QUIET = True if __name__ != "__main__" else False
 DEBUG_MODE = False
 SHOW_PLAYERS = False   # 默认不显示玩家列表
 
@@ -510,17 +513,32 @@ class RWProbe:
         return last
 
     def _handle_178(self, payload):
-        r = NetReader(payload)
-        b0 = r.byte()
-        i1 = r.int32()
-        b2 = r.boolean()
-        i3 = r.int32()
-        addr = r.utf() if r.remaining() >= 2 else ""
-        if not addr and (b0 != 0 or i1 != 3 or b2 or i3 != 1):
-            r2 = NetReader(payload)
-            addr = r2.utf()
-            self.log(f"178 legacy parse: addr={addr!r}")
-        self.log(f"178 jump addr={addr!r}")
+        """解析 178 PACKET_RECONNECT_TO。
+        客户端 ae.smali sswitch_72f 结构: byte / int32 / boolean / int32(N) / N x utf 地址
+        客户端取 list.get(0) 作为连接目标。
+        """
+        addr = ""
+        try:
+            r = NetReader(payload)
+            b0 = r.byte()
+            i1 = r.int32()
+            b2 = r.boolean()
+            n = r.int32()          # 服务器数量
+            addrs = []
+            for _ in range(max(0, n)):
+                if r.remaining() < 2:
+                    break
+                addrs.append(r.utf())
+            if addrs:
+                addr = addrs[0]
+            self.log(f"178 jump n={n} addrs={addrs!r} b0={b0} i1={i1} b2={b2}")
+        except Exception:
+            try:
+                r2 = NetReader(payload)
+                addr = r2.utf()
+                self.log(f"178 legacy parse: addr={addr!r}")
+            except Exception:
+                addr = ""
         return addr
 
     def _read_after_register(self, wait=5):
@@ -639,16 +657,37 @@ HELP_TEXT = """\
 铁锈战争 1.15 房间信息查询工具
 
 用法:
-  python3 room_info.py <房间ID>           查询中继房间 (如 R5132)
+  python3 room_info.py <房间ID>           查询中继房间 (如 r5132 / a5132 / h1234 / hytvvi)
   python3 room_info.py <IP>:<端口>        直连服务器 (如 1.2.3.4:5123)
-  python3 room_info.py --list             官方房间列表
+  python3 room_info.py --list             房间列表(真人房优先, 自动过滤广告)
+  python3 room_info.py --list-json        房间列表(JSON 输出, 供插件调用)
   python3 room_info.py --help             显示本帮助
 
-选项:
-  --show-players        显示玩家列表 (默认显示)
-  --max-players <N>     玩家列表最多显示 N 人 (默认 10)
+房间列表选项 (配合 --list / --list-json):
+  --source <源>         all(默认) / qroom(真人房) / official(官方Auto Server)
+  --joinable            只列可加入的房间(状态=房间中)
+  --status <状态>       battleroom / ingame
+  --search <关键词>     按 房主名/地图名/描述 搜索(不区分大小写)
+  --mod <类型>          mod(只看模组房) / vanilla(只看原版房)
+  --full <模式>         hide(隐藏人满) / only(只看人满)
+  --all                 official 源保留广告/链接条目(仅调试用)
+
+查询选项:
   --name <名字>         设置探针名字 (默认 ABAB探针)
   --debug               调试输出
+
+支持的中继房号:
+  首字母+数字    r5132 / s1024 / a5132 / b5132 / h1234 / c8888 / o9999 / q7777
+  国际房(纯字母) h 开头, 如 hytvvi / hlbifz
+
+可用中继首字母 (实测 5123 端口开放):
+  a/b/h  官方中继 (Relay US1 / US2 / ASIA2)
+  o/q/r/s 第三方中继 (RELAY-CN / Fancy-CN / Tiexiu.xyz)
+  c/g/j/v 有域名但端口未开放
+
+房间列表数据源:
+  Q Room List    https://www.rtsbox.cn/api/paiwei/room_last.php  (真人房, 有房主/地图/人数)
+  Official       gs1.corrodinggames.com (官方 Auto Server + 广告房)
 """
 
 
@@ -665,7 +704,10 @@ _NAME_ARG = None
 _DEBUG_ARG = False
 
 # 收集非选项参数 (第一个非 -- 开头的即房间ID/目标)
-_positional = [a for a in sys.argv[1:] if not a.startswith("--")]
+# 注意: --list / --list-json 是"模式开关"而非带值选项, 需保留下来供模式判定
+_MODE_SWITCHES = ("--list", "--list-json")
+_positional = [a for a in sys.argv[1:]
+               if not a.startswith("--") or a in _MODE_SWITCHES]
 _arg1 = _positional[0] if _positional else None
 
 # 帮助: 仅命令行直接运行时生效 (import 不触发)
@@ -696,6 +738,15 @@ if "--max-players" in sys.argv:
 SHOW_PLAYERS = "--show-players" in sys.argv
 
 LIST_MODE = _arg1 == "--list"
+LIST_JSON = _arg1 == "--list-json"
+# 列表筛选开关
+LIST_ALL = "--all" in sys.argv              # official 源保留广告/链接条目(调试用)
+LIST_JOINABLE = "--joinable" in sys.argv    # 只保留可加入(battleroom)
+LIST_KEYWORD = _find_arg("--search") or ""  # 按 房主/地图/描述 搜索
+LIST_STATUS = _find_arg("--status") or ""   # 按 status 过滤
+LIST_SOURCE = _find_arg("--source") or "all"  # all / qroom / official
+LIST_MOD = _find_arg("--mod") or ""         # mod / vanilla
+LIST_FULL = _find_arg("--full") or ""       # hide / only
 _DIRECT_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+(:\d+)?$")
 DIRECT_TARGET = _arg1 if _DIRECT_RE.match(_arg1) else None
 RID = _arg1 if DIRECT_TARGET is None else _arg1
@@ -724,10 +775,15 @@ def connect_and_161(host, port, rid=None):
 
 
 def send_110(sock, sid, ck, conn, chal=None):
+    """注册包 110。字段顺序严格对齐客户端 ae.f(c) / sendRegisterConnection:
+       magic / regVer=5 / clientVer / verAdjust / name / password(nullable) /
+       networkClientId / 身份哈希 / unitsChecksum / challenge_e(conn) / hash_e_int(chal)
+    """
     w = NetWriter()
     w.utf(PROTO_MAGIC)
     w.int32(REG_VER); w.int32(CLIENT_VER); w.int32(CLIENT_VER)
-    w.utf(NAME); w.nullable_str(None); w.utf(PROTO_MAGIC)
+    w.utf(NAME); w.nullable_str(None)
+    w.utf(NID)                               # network_client_id (此前误发 PROTO_MAGIC)
     w.utf(sha256_hex(NID + (sid or '')))
     w.int32(ck)
     w.utf(challenge_e(conn or 0))
@@ -743,6 +799,96 @@ def send_leave(sock):
         time.sleep(0.2)
     except OSError:
         pass
+
+
+# ================================================================ Q Room List (真人房)
+# 来源: RW++ 启动器 io.github.rwpp.impl.BaseNetImpl$init$6$1
+#   接口: https://www.rtsbox.cn/api/paiwei/room_last.php
+#   返回: {"status":"success","data":[ {...} ],"page":"1","page_size":"1000"}
+#   字段: internal_id(房号) / map_name(地图) / current_players / max_players
+#         host_name(房主) / is_started(0=房间中,1=游戏中) / is_mod(是否模组)
+#         host_ip / host_port / myhost_ip
+# 这是真人玩家开的房; Official Room List 里几乎全是 Auto Server 与广告房。
+QROOM_URL = "https://www.rtsbox.cn/api/paiwei/room_last.php"
+QROOM_TIMEOUT = 15
+
+
+def _as_int(v, default=0):
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def fetch_qroom_list(timeout=None) -> list:
+    """拉取 Q Room List (真人房), 返回统一结构的房间字典列表。
+
+    统一结构:
+      source      "qroom"
+      id          房号(internal_id, 纯数字, 不展示给用户)
+      name        房主名
+      map         地图名(已去掉 .tmx 后缀)
+      players     当前人数
+      max         人数上限
+      status      "battleroom" / "ingame"
+      is_mod      是否模组房
+      is_started  原始开局标记
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    req = urllib.request.Request(QROOM_URL, headers={
+        "User-Agent": "okhttp/4.12.0",
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip",
+    })
+    data = b""
+    try:
+        with urllib.request.urlopen(req, timeout=timeout or QROOM_TIMEOUT, context=ctx) as resp:
+            data = resp.read()
+            if resp.headers.get("Content-Encoding") == "gzip":
+                try:
+                    data = gzip.decompress(data)
+                except OSError:
+                    pass
+    except Exception as e:
+        if not QUIET:
+            print(f"[qroom] 请求失败: {e}")
+        return []
+
+    try:
+        obj = json.loads(data.decode("utf-8", "replace"))
+    except (ValueError, UnicodeDecodeError):
+        if not QUIET:
+            print("[qroom] JSON 解析失败")
+        return []
+
+    if not isinstance(obj, dict) or obj.get("status") != "success":
+        if not QUIET:
+            print(f"[qroom] 状态异常: {str(obj)[:80]}")
+        return []
+
+    rooms = []
+    for r in obj.get("data") or []:
+        if not isinstance(r, dict):
+            continue
+        mapname = str(r.get("map_name") or "").strip()
+        # 去掉 .tmx 后缀, 便于展示与搜索
+        if mapname.lower().endswith(".tmx"):
+            mapname = mapname[:-4]
+        started = _as_int(r.get("is_started"), 0)
+        rooms.append({
+            "source": "qroom",
+            "id": str(r.get("internal_id") or "").strip(),
+            "name": str(r.get("host_name") or "").strip() or "?",
+            "map": mapname or "?",
+            "players": _as_int(r.get("current_players"), 0),
+            "max": _as_int(r.get("max_players"), 0),
+            "status": "ingame" if started else "battleroom",
+            "is_mod": _as_int(r.get("is_mod"), 0) == 1,
+            "is_started": started,
+        })
+    return rooms
 
 
 def masterserver_request(params: dict) -> list:
@@ -763,41 +909,263 @@ def _clean(s):
     return "".join(c for c in (s or "") if c >= " " and c != "\u007f").strip()
 
 
-def room_list():
-    if not QUIET:
-        print("[list] 获取房间列表(版本 1.15)...")
+# ================================================================ 房间列表 / 广告过滤
+# 官方 masterserver 返回的列表里混有大量第三方(RW-HPS 等)刷出来的广告房。
+#
+# 【只用结构性判据, 不使用人数】—— 人数由服务器自行上报, 可随意伪造(实测有
+# 6360/64921、9720、89842 等), 用它判断必然误杀真百人房。
+#
+# 实测 349 条样本归纳出的可靠结构特征:
+#   ┌ LINK / url: 条目 ──────── 官方列表里的 Discord / QQ 群链接, 不是房间
+#   ├ 含控制字符(\x01 等) ───── 广告机注入的排版符, 真人无法输入
+#   │                          实测 167 条, 端口 100% 是 5158, 同一广告农场
+#   ├ ip 非合法 IPv4 ────────── 无效条目
+#   ├ port 非数字 ───────────── 无效条目
+#   └ 同 ip:port 重复 ───────── 同一台服务器的重复上报
+#
+# 真房特征(NORMAL): port 分散在 5123~5181, 名字/描述为正常文本。
+
+def _has_ctrl(s: str) -> bool:
+    """是否含控制字符。广告机用 \\x01 等做排版, 真人聊天/房名不可能包含。"""
+    return any(ord(c) < 32 and c not in "\t\n\r" for c in (s or ""))
+
+
+_IPV4_RE = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
+
+
+def classify_room(room: dict) -> tuple:
+    """对房间做结构分类, 返回 (类别, 原因)。
+
+    类别:
+      "link"    —— 链接条目(Discord/QQ 群), 不是房间
+      "ad"      —— 广告房(含控制字符)
+      "invalid" —— 字段无效(ip/port 不合法)
+      "ok"      —— 结构正常的房间(仍需按 status 判断是否可加入)
+    """
+    ip = (room.get("ip") or "").strip()
+    port = (room.get("port") or "").strip()
+    mode = (room.get("mode") or "").strip()
+    status = (room.get("status") or "").strip()
+    # 广告判定必须用未清洗的原始字段(否则 \x01 已被 _clean 删掉, 永远检测不到)
+    name = room.get("name_raw", room.get("name") or "")
+    desc = room.get("desc_raw", room.get("desc") or "")
+
+    # 1. 链接条目: mode/status 为 LINK, 或 ip 形如 url:xxx
+    if mode.upper() == "LINK" or status.upper() == "LINK":
+        return "link", "链接条目"
+    if ip.lower().startswith("url:"):
+        return "link", "网页链接"
+
+    # 2. 广告房: 房名/描述含控制字符(广告机排版符)
+    if _has_ctrl(name) or _has_ctrl(desc):
+        return "ad", "含控制字符"
+
+    # 3. 字段无效
+    if not ip:
+        return "invalid", "缺少IP"
+    if not _IPV4_RE.fullmatch(ip):
+        return "invalid", "IP格式非法"
+    if not port.isdigit():
+        return "invalid", "端口非法"
+
+    return "ok", ""
+
+
+def is_joinable(room: dict) -> bool:
+    """是否为可加入的房间(status=battleroom)"""
+    return (room.get("status") or "").strip().lower() == "battleroom"
+
+
+def _parse_room_line(line: str, index: int) -> dict:
+    """把一行 masterserver 数据解析成房间字典。
+
+    注意: 展示用字段经过 _clean() 清洗(去控制字符), 但判定广告必须看
+    清洗前的原文, 因此额外保留 name_raw / desc_raw。
+    """
+    f = line.split(",")
+    def g(i, d=""):
+        return _clean(f[i]) if len(f) > i and f[i] else d
+    def raw(i):
+        return f[i] if len(f) > i else ""
+    # 22 字段含义(实测 351 条样本):
+    #   0 房间UUID  1 房名        2 版本号      3 对外IP
+    #   4 内网IP    5 端口        6 ?          7 SERVER/CLIENT
+    #   8 ?         9 描述        10 模式       11 状态
+    #   12 游戏版本 13 ?           14 描述(备用) 15 当前人数
+    #   16 人数上限 17 ?           18 UUID副本   19 ?
+    #   20 ?        21 端口(辅助)
+    return {
+        "idx": index,
+        "id": g(0),
+        "name": g(1, "?"),
+        "ver": g(2),
+        "ip": g(3),
+        "lan_ip": g(4),
+        "port": g(5),
+        "type": g(7),
+        "mode": g(10),
+        "status": g(11),
+        "game_ver": g(12),
+        "desc": g(9) or g(14, ""),
+        "players": g(15, "0"),
+        "max": g(16, "?"),
+        # 原始未清洗字段: 仅用于广告判定, 不对外展示
+        "name_raw": raw(1),
+        "desc_raw": raw(9) or raw(14),
+        "raw": line,
+    }
+
+
+def _normalize_official(room: dict) -> dict:
+    """把 Official Room List 的一条记录转成统一结构。"""
+    mapname = room.get("desc") or "?"
+    return {
+        "source": "official",
+        "id": room.get("id", ""),
+        "name": room.get("name") or "?",
+        "map": "-",                       # Official 列表不带地图名
+        "players": _as_int(room.get("players"), 0),
+        "max": _as_int(room.get("max"), 0),
+        "status": (room.get("status") or "").strip().lower() or "unknown",
+        "is_mod": False,
+        "is_started": 1 if (room.get("status") or "").strip().lower() == "ingame" else 0,
+        "desc": mapname,                  # Auto Server 的标识放描述
+        "raw": room,
+    }
+
+
+def fetch_official_rooms(include_all: bool = False) -> list:
+    """拉取 Official Room List (官方 masterserver), 过滤广告后返回统一结构。"""
     lines = masterserver_request({"action": "list", "game_version": str(CLIENT_VER),
                                   "game_version_beta": "false"})
     if not lines:
-        if not QUIET:
-            print("[list] 无响应(主服务器离线/被墙)")
         return []
-    if not QUIET:
-        print("头部:", lines[0])
-        print("-" * 104)
-        print(f"{'房间名':<20}{'版本':<6}{'IP':<18}{'端口':<6}{'模式':<10}{'状态':<8}{'人数':<6}{'描述'}")
-        print("-" * 104)
     rooms = []
-    for line in lines[1:]:
+    seen_ep = set()
+    for i, line in enumerate(lines[1:]):
         if not line.strip():
             continue
-        f = line.split(",")
-        def g(i, d=""):
-            return _clean(f[i]) if len(f) > i and f[i] else d
-        room = {"id": g(0), "name": g(1, "?"), "ver": g(2), "ip": g(3),
-                "port": g(5), "mode": g(10), "status": g(11),
-                "desc": g(9, g(14, "")), "players": g(15, "0"), "max": g(16, "?")}
-        rooms.append(room)
-        if not QUIET:
-            mode = {"skirmishMap": "遭遇战", "customMap": "自定义", "savedGame": "存档",
-                    "LINK": "链接"}.get(room["mode"], room["mode"])
-            status = {"ingame": "游戏中", "battleroom": "房间中", "locked": "已锁定",
-                      "chat": "聊天"}.get(room["status"], room["status"])
-            print(f"{room['name'][:18]:<20}{room['ver']:<6}{room['ip']:<18}{room['port']:<6}"
-                  f"{mode:<10}{status:<8}{room['players']}/{room['max']:<4}{room['desc'][:40]}")
+        room = _parse_room_line(line, i)
+        kind, why = classify_room(room)
+        room["kind"] = kind
+        room["kind_reason"] = why
+        if not include_all and kind != "ok":
+            continue
+        ep = (room.get("ip", ""), room.get("port", ""))
+        if ep in seen_ep:
+            continue
+        seen_ep.add(ep)
+        rooms.append(_normalize_official(room))
+    return rooms
+
+
+def fetch_rooms(source: str = "all", include_all: bool = False,
+                only_joinable: bool = False, keyword: str = "",
+                status: str = "", mod_filter: str = "", full: str = "") -> list:
+    """拉取并合并房间列表, 返回统一结构。
+
+    source:        "all"(默认, Q优先+Official补充) / "qroom" / "official"
+    include_all:   True 时不过滤广告条目(仅对 official 生效, 调试用)
+    only_joinable: True 时只保留 status=battleroom(可加入)的房间
+    keyword:       按 房主名/地图名/描述 模糊搜索(不区分大小写)
+    status:        只保留指定 status(battleroom/ingame), 空表示不限
+    mod_filter:    "mod"=只看模组房 / "vanilla"=只看原版房 / 空=不限
+    full:          "hide"=隐藏人满 / "only"=只看人满 / 空=不限
+    """
+    rooms = []
+    if source in ("all", "qroom"):
+        rooms.extend(fetch_qroom_list())
+    if source in ("all", "official"):
+        rooms.extend(fetch_official_rooms(include_all=include_all))
+
+    out = []
+    for room in rooms:
+        st = (room.get("status") or "").strip().lower()
+        # 状态过滤
+        if only_joinable and st != "battleroom":
+            continue
+        if status and st != status.lower():
+            continue
+        # 模组过滤
+        if mod_filter == "mod" and not room.get("is_mod"):
+            continue
+        if mod_filter == "vanilla" and room.get("is_mod"):
+            continue
+        # 人满过滤
+        is_full = (room.get("max") or 0) > 0 and (room.get("players") or 0) >= (room.get("max") or 0)
+        if full == "hide" and is_full:
+            continue
+        if full == "only" and not is_full:
+            continue
+        # 关键词搜索
+        if keyword:
+            kw = keyword.lower()
+            blob = " ".join([
+                str(room.get("name") or ""),
+                str(room.get("map") or ""),
+                str(room.get("desc") or ""),
+            ]).lower()
+            if kw not in blob:
+                continue
+        out.append(room)
+
+    # 排序: 真人房优先(有真实房主+地图), 官方 Auto Server 靠后;
+    # 同级内按 房间中 > 游戏中, 再按人数降序(人多更热闹)
+    def _sort_key(r):
+        src_rank = 0 if r.get("source") == "qroom" else 1
+        st_rank = 0 if (r.get("status") or "").lower() == "battleroom" else 1
+        return (src_rank, st_rank, -(r.get("players") or 0))
+    out.sort(key=_sort_key)
+    return out
+
+
+STATUS_CN = {"battleroom": "房间中", "ingame": "游戏中", "locked": "已锁定",
+             "chat": "聊天", "unknown": "-"}
+
+
+def _fmt_room_line(room: dict) -> str:
+    """单行房间展示: 房主 | 地图 | 人数 | 状态 | 模组"""
+    st = STATUS_CN.get((room.get("status") or "").lower(), room.get("status") or "-")
+    pl = room.get("players", 0)
+    mx = room.get("max", 0)
+    mod = "模组" if room.get("is_mod") else "原版"
+    desc = room.get("desc") or ""
+    line = (f"{str(room.get('name') or '?')[:14]:<16}"
+            f"{str(room.get('map') or '-')[:26]:<28}"
+            f"{pl}/{mx:<7}{st:<7}{mod:<5}")
+    if desc and desc != room.get("map"):
+        line += desc[:24]
+    return line
+
+
+def room_list(source: str = "all", include_all: bool = False,
+              only_joinable: bool = False, keyword: str = "",
+              status: str = "", mod_filter: str = "", full: str = "") -> list:
     if not QUIET:
-        print("-" * 104)
-        print(f"共 {len(rooms)} 个房间。直连: python3 room_info.py <IP>:<端口>")
+        print("[list] 获取房间列表...")
+    rooms = fetch_rooms(source=source, include_all=include_all,
+                        only_joinable=only_joinable, keyword=keyword,
+                        status=status, mod_filter=mod_filter, full=full)
+    if not QUIET:
+        conds = []
+        if only_joinable:
+            conds.append("仅可加入")
+        if status:
+            conds.append("状态=" + status)
+        if mod_filter:
+            conds.append("模组=" + mod_filter)
+        if full:
+            conds.append("人满=" + full)
+        if keyword:
+            conds.append("关键词=" + keyword)
+        print("筛选: " + (" / ".join(conds) if conds else "无"))
+        print("-" * 100)
+        print(f"{'房主':<16}{'地图':<28}{'人数':<7}{'状态':<7}{'类型':<5}描述")
+        print("-" * 100)
+        for room in rooms:
+            print(_fmt_room_line(room))
+        print("-" * 100)
+        print(f"共 {len(rooms)} 个房间")
     return rooms
 
 
@@ -1636,11 +2004,34 @@ def relay_host(rid: str) -> str:
     return rid[0].lower() + ".relay.corrodinggames.com"
 
 
-def relay_session(host, port, rid, depth=0):
+def relay_session(host, port, rid, depth=0, seen=None):
     tag = f"[{depth}]" if depth else ""
+    # 环检测: 防止 178 跳转在 中继<->节点 之间来回死循环
+    if seen is None:
+        seen = set()
+    node_key = (str(host).lower(), int(port), str(rid).lower())
+    if node_key in seen:
+        if not QUIET:
+            print(f"{tag}!! 检测到跳转环路 {host}:{port} rid={rid}，已中止")
+        return ("LOOP", f"跳转环路: {host}:{port}/{rid}")
+    seen.add(node_key)
+    if depth > 6:
+        if not QUIET:
+            print(f"{tag}!! 跳转层级过深({depth})，已中止")
+        return ("LOOP", "跳转层级过深")
     if not QUIET:
         print(f"{tag}=== 中继会话 {rid} @ {host}:{port} (depth={depth}) ===")
-    s, probe = connect_and_161(host, port, rid)
+    # 连接失败必须显式报告: 该首字母的中继未开通端口(c/g/j/v)时会在此抛出
+    try:
+        s, probe = connect_and_161(host, port, rid)
+    except OSError as e:
+        if not QUIET:
+            print(f"{tag}!! 连接中继失败: {e}")
+        return ("FAILED", f"无法连接中继 {host}:{port}（该首字母的中继未开放或网络不通）")
+    except Exception as e:
+        if not QUIET:
+            print(f"{tag}!! 握手异常: {e}")
+        return ("FAILED", f"中继握手异常: {type(e).__name__}")
     sid = probe.server_id
     if not QUIET:
         print(f"{tag}[1] 中继161: sid={sid!r} conn={probe.conn_id} chal={probe.challenge_y}")
@@ -1648,7 +2039,7 @@ def relay_session(host, port, rid, depth=0):
         if not QUIET:
             print(f"{tag}!! 握手失败，未收到房间服务器响应")
         s.close()
-        return None
+        return ("FAILED", f"中继 {host}:{port} 未响应握手（房间不存在或中继繁忙）")
 
     send_110(s, sid, CK, probe.conn_id, probe.challenge_y)
     if not QUIET:
@@ -1690,7 +2081,7 @@ def relay_session(host, port, rid, depth=0):
             if not addr:
                 if not QUIET:
                     print(f"{tag}!! 178地址为空")
-                return None
+                return ("FAILED", "中继跳转地址为空，房间可能刚关闭")
             addr = re.sub(r'^\[(TCP|UDP)\]\s*', '', addr.strip())
             if not QUIET:
                 print(f"{tag}[3] 清理后地址: {addr!r}")
@@ -1703,7 +2094,7 @@ def relay_session(host, port, rid, depth=0):
                     h2, p2 = hp, 5123
                 if not QUIET:
                     print(f"{tag}[3] 跳转到中继 {h2}:{p2} 房间 {rid2}")
-                return relay_session(h2, p2, rid2, depth + 1)
+                return relay_session(h2, p2, rid2, depth + 1, seen)
             else:
                 if ":" in addr:
                     h2, _, p2 = addr.rpartition(":")
@@ -1712,7 +2103,7 @@ def relay_session(host, port, rid, depth=0):
                     h2, p2 = addr, 5123
                 if not QUIET:
                     print(f"{tag}[3] 跳转到节点 {h2}:{p2}")
-                return node_session(h2, p2)
+                return node_session(h2, p2, rid)
         elif mtype == 106:
             got_106 = payload
             if not QUIET:
@@ -1733,6 +2124,19 @@ def relay_session(host, port, rid, depth=0):
             if not QUIET:
                 print(f"{tag}DISCONNECT")
             break
+        elif mtype == 117:
+            # 服务器提示消息: byte 1 + int32 类型 + utf(文本)
+            hint = ""
+            try:
+                _r = NetReader(payload)
+                _r.byte(); _r.int32()
+                hint = _r.utf()
+            except Exception:
+                hint = ""
+            if not QUIET:
+                print(f"{tag}[117] {hint!r}")
+            if hint:
+                return ("KICKED", hint)
         elif mtype == 141:
             sender, message = parse_141(payload)
             if not QUIET:
@@ -1752,22 +2156,25 @@ def relay_session(host, port, rid, depth=0):
         return ("KICKED", kick_reason)
     if got_106 is None and not QUIET:
         print(f"{tag}!! 未收到106（房间可能不存在/已关闭/需要密码）")
-    return None
+    # 静默模式也需要让调用方知道失败原因, 不能返回 None 让插件"无输出"
+    return ("FAILED", f"未收到房间信息（中继 {host}:{port} 无响应）")
 
 
-def node_session(host, port):
+def node_session(host, port, rid=None):
     if not QUIET:
-        print(f"[4] 连接节点: {host}:{port}")
+        print(f"[4] 连接节点: {host}:{port} (房间 {rid or '-'})")
     try:
         s2 = socket.create_connection((host, port), timeout=8)
         s2.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     except Exception as e:
         if not QUIET:
             print(f"!! 节点连接失败: {e}")
-        return None
+        return ("FAILED", f"无法连接游戏节点 {host}:{port}")
     w = NetWriter()
     w.utf(PROTO_MAGIC)
     w.int32(4); w.int32(CLIENT_VER); w.int32(1)
+    # 注意: 此处必须不带房间号。节点是按 178 分配到的专用节点,
+    # 带 room_id 会触发 "绕过ID分配中心" 拒绝, 并导致 178 环路。
     w.nullable_str(None)
     w.utf(NAME); w.utf(NID); w.utf('')
     s2.sendall(pack_frame(160, w.output()))
@@ -1781,7 +2188,7 @@ def node_session(host, port):
         if not QUIET:
             print("!! 节点握手失败")
         s2.close()
-        return None
+        return ("FAILED", f"游戏节点 {host}:{port} 未响应握手")
     send_110(s2, sid2, CK, probe2.conn_id, probe2.challenge_y)
     got_106 = None
     got_115 = None
@@ -1825,6 +2232,26 @@ def node_session(host, port):
             if not QUIET:
                 print("KICKED:", kick_reason)
             break
+        elif mtype == 117:
+            # 节点拒绝: byte 1 + int32 类型 + utf(文本)
+            hint = ""
+            try:
+                _r = NetReader(payload)
+                _r.byte(); _r.int32()
+                hint = _r.utf()
+            except Exception:
+                hint = ""
+            if not QUIET:
+                print(f"[7] 节点提示: {hint!r}")
+            if hint:
+                kick_reason = hint
+                break
+        elif mtype == 178:
+            addr = probe2._handle_178(payload)
+            if not QUIET:
+                print(f"[6] 节点再次178: {addr!r}（忽略，终止）")
+            kick_reason = f"节点拒绝接入({addr})"
+            break
         elif mtype == 141:
             sender, message = parse_141(payload)
             if not QUIET:
@@ -1844,15 +2271,22 @@ def node_session(host, port):
         return ("KICKED", kick_reason)
     if got_106 is None and not QUIET:
         print("!! 未收到106")
-    return None
+    return ("FAILED", f"游戏节点 {host}:{port} 未返回房间信息")
 
 
 def _handle_kicked(reason, sock=None):
     """统一处理被踢出房间的提示 (sock 非空时先关闭连接)"""
+    reason = (reason or "").strip()
     if "No free slots" in reason:
         print("[房间查询失败] 房间已满，无法加入")
     elif "游戏已经开始" in reason or "game already started" in reason.lower():
+        # RELAY-CN 走错房间(节点默认房)时也会返回这句, 需加提示
         print("[房间查询失败] 游戏已经开始，无法加入")
+    elif "绕过ID分配中心" in reason:
+        # 178 跳到节点后节点拒绝: 房间已迁移/需走分配中心, 探针无法直连
+        print("[房间查询失败] 该房间当前无法直接查询（RELAY-CN 节点限制，请稍后重试或联系房主）")
+    elif "找不到这个服务器" in reason or "cant find this server" in reason.lower():
+        print("[房间查询失败] 房间不存在或已关闭")
     else:
         print(f"[房间查询失败] {reason}")
     if sock is not None:
@@ -1863,13 +2297,29 @@ def relay_main():
     host = relay_host(RID)
     if not QUIET:
         print(f"=== 查询房间 {RID} (客户端 1.15) ===")
-        print(f"[0] 中继: {host}:5123 (DNS={socket.gethostbyname(host)})")
+        try:
+            print(f"[0] 中继: {host}:5123 (DNS={socket.gethostbyname(host)})")
+        except OSError as e:
+            print(f"[0] 中继: {host}:5123 (DNS解析失败: {e})")
+    # 中继服务器不可达: 该首字母的中继未开通 (如 c/g/j/v 有域名但端口关闭)
+    try:
+        socket.gethostbyname(host)
+    except OSError:
+        print(f"[房间查询失败] 房号 {RID.upper()} 所属中继({host})不存在，请检查房号首字母")
+        sys.exit(0)
     result = relay_session(host, 5123, RID)
     if isinstance(result, tuple) and result[0] == "KICKED":
         _handle_kicked(result[1])
-    if result is None:
+    if isinstance(result, tuple) and result[0] == "LOOP":
         if not QUIET:
-            print("未获取到房间信息（房间可能不存在/已关闭）")
+            print(f"!! {result[1]}")
+        print("[房间查询失败] 房间查询链路异常（跳转环路），该房间当前无法查询")
+        sys.exit(1)
+    if isinstance(result, tuple) and result[0] == "FAILED":
+        print(f"[房间查询失败] {result[1]}")
+        sys.exit(1)
+    if result is None:
+        print("[房间查询失败] 房间不存在或已关闭")
         sys.exit(1)
     got_106, got_115 = result
     finish_report(None, got_106, got_115, RID)
@@ -1877,11 +2327,20 @@ def relay_main():
 
 def main():
     cleanup_old_bin_files()
-    if not RID:
-        print(HELP_TEXT)
+    if LIST_JSON:
+        rooms = fetch_rooms(source=LIST_SOURCE, include_all=LIST_ALL,
+                            only_joinable=LIST_JOINABLE, keyword=LIST_KEYWORD,
+                            status=LIST_STATUS, mod_filter=LIST_MOD,
+                            full=LIST_FULL)
+        print(json.dumps(rooms, ensure_ascii=False, default=str))
         return
     if LIST_MODE:
-        room_list()
+        room_list(source=LIST_SOURCE, include_all=LIST_ALL,
+                  only_joinable=LIST_JOINABLE, keyword=LIST_KEYWORD,
+                  status=LIST_STATUS, mod_filter=LIST_MOD, full=LIST_FULL)
+        return
+    if not RID:
+        print(HELP_TEXT)
         return
     if DIRECT_TARGET:
         direct_main()
