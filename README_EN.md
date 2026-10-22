@@ -1,117 +1,154 @@
 # Rusted Warfare Room Lookup (astrbot_plugin_rwinfo)
 
-> AstrBot plugin · Auto-detect Rusted Warfare (铁锈战争) room IDs in group messages and dispatch probe bots to query and report room info
+> AstrBot plugin · Auto-detect Rusted Warfare room IDs in group messages and dispatch probe bots to query and report room info
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-plugin-blue)](https://github.com/Soulter/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-green)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
-[![GitHub](https://img.shields.io/badge/GitHub-wcnmamrs%2Fastrbot_plugin_rwinfo-black)](https://github.com/wcnmamrs/astrbot_plugin_rwinfo)
 
-Automatically detects Rusted Warfare room IDs in group messages and dispatches probe bots (`ABAB探针01~99`) to join rooms and report back: **version / map / credits / fog / no-nukes / multiplier / mode / unit cap / default unit / shared control / spectators / team lock / player count / Mod / player list**.
+Detects Rusted Warfare room IDs in messages and dispatches probe bots (`ABAB探针01~99`) to join rooms and report back: version / map / credits / fog / no-nukes / multiplier / mode / unit cap / default unit / shared control / spectators / team lock / player count / Mod / player list.
 
-> 📖 Protocol reverse-engineering notes in [PROTOCOL.md](PROTOCOL.md): frame format, message types, hash algorithms, 106 room-info parsing, 115 player-list parsing, 151 POW challenge, etc.
-
----
-
-## ✨ Features
-
-- **Auto room-ID detection** (try everything, send only on success):
-  - **CN relay rooms**: `r1234` / `s1234` (`r/s` + 3+ digits, no length cap)
-  - **International rooms**: `h/H` + English letters (e.g. `HLBIFZ`, `hhello`), length 3~10; `h` must **not** be preceded by a letter (space, colon, quote, digit, punctuation, line start all OK); greedy match (multiple `h` in one room ID are not split)
-  - Sends only when a valid room is found; silently drops on failure (room not found / English-word false positive) — no filter wordlist needed
-- **Localized failure reasons**: full room / game started / room locked etc. return clear Chinese hints (e.g. `[房间查询失败] 房间已满，无法加入`)
-- **Auto-retry on probe-name filter**: automatically renames and retries when the server blocks the probe name, sending progress `[房间查询] 重试中(1/3)`; retry count configurable (default 3)
-- **Unique retry names**: with multiple rooms per message, retry names use each probe's own index (`ABAB探针01_1`, `02_1`...) to avoid cross-room collisions
-- **Direct-connect default port**: `room_info.py 18.216.139.119` defaults to port 5123 when omitted
-- **Auto-recall room info**: successfully reported room info and retry progress are auto-recalled (error info & command replies not recalled); **per-group / per-private config**, off by default, toggle/set via `/铁锈撤回` (group requires admin, private open to everyone)
-- **Probe pool**: `ABAB探针01` ~ `ABAB探针99` concurrent reuse, queue waiting beyond 99; max 5 room IDs per message
-- **Room cooldown**: same room ID not re-parsed within 10s, anti-spam
-- **Permission control**: global switch + whitelist/blacklist modes, support per-**user** (`@userID`, private/group sender) and per-**group** (`#groupID`) control
-- **Player-list folding**: folds when over `max_players_display` (default 10) to avoid spam
-- **Special character support**: any UTF-8 player name (Chinese/symbols/whitespace)
-- **Fully self-contained**: built-in protocol probe `room_info.py`, no third-party deps, no hardcoded absolute paths, upload-and-go on any device
+Protocol notes in [PROTOCOL.md](PROTOCOL.md), version history in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
-## 📦 Install
+## Features
 
-Install from the AstrBot plugin store, or via the **WebUI**:
+- **Auto room-ID detection**, try everything and send only on success, silently drop on failure, no filter wordlist needed
+  - Relay rooms (any leading letter + digits): `r5132` `s1024` `a5132` `b5132` `h1234` `o9999`
+  - International rooms: `h` + English letters, e.g. `HLBIFZ`, `hytvvi`
+  - Direct connect: `IP` or `IP:port`, port defaults to 5123 when omitted
+- **Room list**: `/铁锈列表` paged browser with automatic ad filtering
+- **Localized failure reasons**: full room / game started / room locked return clear hints
+- **Auto-retry on probe-name filter**: configurable count (default 3), retry names carry each probe index to avoid collisions
+- **Auto-recall**: room info and retry progress can be auto-recalled, per-group / per-private config, off by default
+- **Probe pool**: `ABAB探针01`~`ABAB探针99` concurrent reuse, max 5 room IDs per message
+- **Room cooldown**: same room ID not re-parsed within 10 seconds
+- **Permission control**: global switch plus white/black lists, per-user (`@userID`) and per-group (`#groupID`)
+- **Fully self-contained**: built-in protocol probe, no third-party deps, no hardcoded absolute paths
 
-1. Open AstrBot admin panel → **Plugin Management**
-2. Option 1: paste the GitHub repo URL `https://github.com/wcnmamrs/astrbot_plugin_rwinfo` to auto-fetch and install
-3. Option 2: upload the zipped repo directly
-4. Enable the plugin after install — no command-line needed
+### Detection basis
 
-> Compatibility mode: if `room_info.py` is absent in the plugin dir, it auto-falls back to a `room_info.py` in the parent dir.
+The client (`ae.smali` lines 7107~7180) converts any room ID without `:` `.` `/` `\` into `<first letter>.relay.corrodinggames.com/<room ID>`, so the leading letter is not limited to r/s/h.
+
+Measured relay availability:
+
+| Letter | Relay | Status |
+|--------|-------|--------|
+| a / b / h | Official Relay US1 / US2 / ASIA2 | reachable |
+| o / q / r / s | RELAY-CN / Fancy-CN / Tiexiu.xyz | reachable |
+| c / g / j / v | DNS exists, port closed | connect fails |
+| others | no DNS record | resolve fails |
 
 ---
 
-## 🎮 Commands
+## Install
 
-> All commands except help default to **admin-only** (AstrBot `PermissionType.ADMIN`) to prevent abuse by ordinary members. Exception: `/铁锈撤回` is also available to everyone in **private chat** (per-session config).
+Install from the AstrBot plugin store, or via WebUI:
+
+1. Open the AstrBot admin panel and go to Plugin Management
+2. Paste `https://github.com/wcnmamrs/astrbot_plugin_rwinfo` to auto-fetch, or upload a zipped package
+3. Enable the plugin after install
+
+If `room_info.py` is absent in the plugin directory, it falls back to the parent directory.
+
+---
+
+## Commands
+
+All commands except help default to admin-only (`PermissionType.ADMIN`).
 
 | Command | Permission | Description |
 |---------|-----------|-------------|
-| `/铁锈查房帮助` | Everyone | Show all plugin commands and usage |
-| `/铁锈全局解析 开\|关` | 🔒 Admin | Global on/off switch (default on); no arg shows current state |
-| `/铁锈模式 白\|黑\|混合` | 🔒 Admin | List mode: white=only listed items pass; black=listed items disabled (default black); mixed=per-user override (`@` over `#`, name mutually exclusive); no arg shows mode |
-| `/铁锈玩家列表 开\|关` | 🔒 Admin | Whether to show player list (default off); no arg shows state |
-| `/铁锈白名 +@3245987504` | 🔒 Admin | Add user to whitelist (private chat) |
-| `/铁锈白名 +#123456` | 🔒 Admin | Add group to whitelist |
-| `/铁锈白名` | 🔒 Admin | Print whitelist |
-| `/铁锈黑名 +@3245987504` | 🔒 Admin | Add user to blacklist (private chat) |
-| `/铁锈黑名 +#123456` | 🔒 Admin | Add group to blacklist |
-| `/铁锈黑名` | 🔒 Admin | Print blacklist |
-| `/铁锈私聊策略 白\|黑` | 🔒 Admin | Mixed-mode private default policy: white=follow whitelist (block if not listed); black=follow blacklist (block if listed); no arg shows policy |
-| `/铁锈私聊开关 开\|关` | 🔒 Admin | Enable private-chat room lookup (default on); no arg shows state |
-| `/铁锈重试 [0-10]` | 🔒 Admin | Set auto-retry count when probe name is filtered; no arg shows config |
-| `/铁锈撤回 开\|关\|秒数(0-300) [*]` | 🔒 Group admin / private everyone | Auto-recall on/off / delay seconds, **saved per group / per private session**; in group, append `*` to apply to all groups (wildcard, **overridable by a specific group**); **wildcard not supported in private** (anti-abuse); group requires admin, private open to everyone; no arg shows current session config |
+| `/铁锈查房帮助` | Everyone | Show command menu. Aliases `/铁锈查房菜单` `/铁锈帮助` `/rwhelp` |
+| `/铁锈列表 [args]` | Admin | Paged room list. Aliases `/房间列表` `/铁锈房列表` `/rwlist` |
+| `/铁锈下一页` `/铁锈上一页` | Admin | Page navigation |
+| `/铁锈全局解析 开\|关` | Admin | Global parsing switch, default on |
+| `/铁锈模式 白\|黑\|混合` | Admin | List mode, default black. In mixed mode `@` takes precedence over `#`, same name is exclusive |
+| `/铁锈白名 +@userID` `/铁锈白名 +#groupID` | Admin | Whitelist add/remove, prints list with no args |
+| `/铁锈黑名 +@userID` `/铁锈黑名 +#groupID` | Admin | Blacklist add/remove, prints list with no args |
+| `/铁锈私聊策略 白\|黑` | Admin | Mixed-mode private default policy |
+| `/铁锈私聊开关 开\|关` | Admin | Enable private-chat lookup, default on |
+| `/铁锈玩家列表 开\|关` | Admin | Show player list, default off |
+| `/铁锈重试 [0-10]` | Admin | Retry count when probe name is filtered |
+| `/铁锈撤回 开\|关\|[seconds 0-300] [*]` | Group admin / everyone in private | Auto-recall config, saved per group / per private. Append `*` in group to apply to all groups, overridable by a specific group; wildcard not supported in private |
+
+Unrecognized `/铁锈xxx` commands automatically return the help menu.
+
+### Room list
+
+```
+/铁锈列表 [page]|[mod|vanilla]|[waiting|started]
+         |[full|notfull]|[player|official]|[search keyword]
+         |[all]|[refresh]
+/铁锈下一页 / 铁锈上一页
+e.g. /铁锈列表 模组 房间中 2
+```
+
+| Argument | Description |
+|----------|-------------|
+| page | Number, jump to that page |
+| `模组` / `原版` | Filter by Mod usage |
+| `房间中` / `游戏中` | Filter by room status |
+| `满` / `不满` | Filter by whether the room is full |
+| `真人` / `官方` | Filter by data source |
+| `搜索 keyword` | Fuzzy search by host name / map name |
+| `全部` | Clear filters |
+| `刷新` | Ignore cache and refetch |
+
+Display format (5 entries per page by default):
+
+```
+1. hostname  1/10  房间中  原版
+   map: Crossing Large (10p)
+```
+
+Two sources merged, player rooms first, then waiting rooms, then by player count descending:
+
+| Source | Description |
+|--------|-------------|
+| Q Room List | `https://www.rtsbox.cn/api/paiwei/room_last.php`, player-hosted rooms with host / map / players / status / mod flag |
+| Official | Auto Server rooms from the official `masterserver`, placed after player rooms |
+
+Room ID (internal QN protocol number) and host IP:port are not displayed: the former cannot be used to join, the latter is the host's real address and also cannot be used to join directly.
+
+Ad filtering uses structural criteria only, never player counts (counts are self-reported and can be forged):
+
+- `LINK` / `url:` entries
+- Control characters in name or description (injected by ad bots, humans cannot type them)
+- Invalid IPv4 / port
+- Duplicate `ip:port`
+
+Cache: room data is shared globally, paging and filter state are isolated per QQ number, both with a 60-second sliding expiry renewed on activity.
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
-Config is auto-persisted by the AstrBot framework, editable via WebUI or commands. Defaults:
-
-```json
-{
-  "global_enabled": true,
-  "mode": "black",
-  "白名单": [],
-  "黑名单": [],
-  "混合_白名单": [],
-  "混合_黑名单": [],
-  "混合_私聊策略": "white",
-  "私聊启用": true,
-  "debug": false,
-  "max_players_display": 10,
-  "show_players": false,
-  "retry_times": 3,
-  "群撤回": [],
-  "私聊撤回": []
-}
-```
+Auto-persisted by the AstrBot framework, editable via WebUI or commands.
 
 | Key | Description |
 |-----|-------------|
-| `global_enabled` | Global parsing switch |
-| `mode` | List mode (`white` / `black` / `mixed`) |
-| `白名单` / `黑名单` | White/black lists (user/group), used outside `mixed` mode |
-| `混合_白名单` / `混合_黑名单` | Mixed-mode independent white/black lists; white/black lists stay intact when switching back |
-| `混合_私聊策略` | Mixed-mode private default policy: `white`=block if not whitelisted / `black`=block if blacklisted |
-| `私聊启用` | Enable private-chat room lookup (default on) |
+| `global_enabled` | Global parsing switch, default true |
+| `mode` | List mode: `white` / `black` / `mixed`, default black |
+| `白名单` / `黑名单` | White/black lists (user/group) |
+| `混合_白名单` / `混合_黑名单` | Mixed-mode independent lists; the plain lists stay intact when switching back |
+| `混合_私聊策略` | Mixed-mode private policy: `white`=block if not whitelisted / `black`=block if blacklisted |
+| `私聊启用` | Enable private-chat lookup, default true |
 | `debug` | Enable debug logging |
-| `max_players_display` | Max players shown in list, fold beyond |
-| `show_players` | Show player list (default off) |
-| `retry_times` | Auto-retry count when probe name filtered (0-10, default 3) |
-| `群撤回` | Per-group auto-recall config, each entry `#groupID:on:delay` (on=1/0), e.g. `#123456:1:60` |
-| `私聊撤回` | Per-user auto-recall config, each entry `@userID:on:delay` (on=1/0), e.g. `@3856554669:1:60` |
+| `max_players_display` | Max players shown, folds beyond, default 10 |
+| `show_players` | Show player list, default false |
+| `retry_times` | Retry count when probe name filtered, 0-10, default 3 |
+| `list_page_size` | Room list page size, default 5 |
+| `list_default_full` | Default full-room filter, `hide` hides full rooms |
+| `群撤回` | Per-group auto-recall config, `#groupID:on:delay`, e.g. `#123456:1:60` |
+| `私聊撤回` | Per-user auto-recall config, `@userID:on:delay`, e.g. `@3856554669:1:60` |
 
 ---
 
-## 📝 Message Example
+## Message example
 
-Someone in the group posts:
+Someone posts:
 
 ```
 ADMIN: Other players can type HLBIFZ in 'direct join' to connect to this room.
@@ -139,16 +176,15 @@ ID：hlbifz
   B2 (AI): AI - Hard
 ```
 
-If the probe name is filtered, it replies progress then retries:
+If the probe name is filtered, progress is sent before each retry:
 
 ```
 [房间查询] 重试中(1/3)
 [房间查询] 重试中(2/3)
 [房间查询] 重试中(3/3)
-(room info returned when the 3rd attempt succeeds)
 ```
 
-If the room is full / game started / locked:
+When the room cannot be joined, the reason is translated:
 
 ```
 [房间查询失败] 房间已满，无法加入
@@ -158,58 +194,51 @@ If the room is full / game started / locked:
 
 ---
 
-## 🧪 Command-line Tool (room_info.py)
+## Command-line tool
 
-The built-in protocol probe also runs standalone:
+The built-in probe runs standalone, standard library only:
 
 ```bash
-python3 room_info.py R5132                # query relay room r5132
-python3 room_info.py HLBIFZ               # query international room hlbifz
-python3 room_info.py 18.216.139.119:5125  # direct-connect server query
-python3 room_info.py --list               # fetch official room list
-python3 room_info.py R5132 --show-players # show player list
+python3 room_info.py R5132                # query a relay room
+python3 room_info.py HLBIFZ               # query an international room
+python3 room_info.py 18.216.139.119:5125  # direct-connect query
+python3 room_info.py --list               # fetch the room list
+python3 room_info.py R5132 --show-players # show the player list
 python3 room_info.py R5132 --debug        # debug output
 ```
 
-Uses only the Python standard library (gzip/hashlib/io/os/re/socket/struct/sys/time/urllib/uuid/random/zlib), no third-party deps.
-
 ---
 
-## 📄 Protocol Reverse-engineering
-
-See [PROTOCOL.md](PROTOCOL.md): Rusted Warfare online protocol reverse-engineering notes (relay/direct architecture, frame format, message type table, 160/161 handshake, 151 POW challenge, 110 registration, 106 room-info parsing, 115 player-list parsing, 178 jump, etc.).
-
----
-
-## 📁 Directory Structure
+## Directory structure
 
 ```
 astrbot_plugin_rwinfo/
-├── main.py            # AstrBot plugin main logic (message listen / room-ID extract / query schedule / retry / translate)
+├── main.py            # plugin logic (message listen / room-ID extract / query schedule / retry / translate)
 ├── room_info.py       # protocol probe (room-info query core, runs standalone)
 ├── PROTOCOL.md        # protocol reverse-engineering notes
-├── README.md          # this doc (Chinese)
-├── README_EN.md       # this doc (English)
+├── CHANGELOG.md       # version history
+├── README.md          # Chinese doc
+├── README_EN.md       # this doc
 ├── metadata.yaml      # plugin metadata
 ├── _conf_schema.json  # config schema
-└── LICENSE            # MIT license
+├── LICENSE            # MIT license
+└── .gitignore
 ```
 
 ---
 
-## 📌 Notes
+## Notes
 
-- Queries run via subprocess calling `room_info.py`, isolated; auto-sends 111 to leave after query, never occupies a room slot
-- Same room ID has a 10s cooldown to avoid repeated parsing
-- Private messages: checked against `@userID` list; group messages check both `#groupID` and sender `@userID` (user blacklist also effective in groups)
-- Auto-recall config is saved per group (`#groupID`) and per private session (`@userID`); default off, group requires admin, private open to everyone
-- Player list shown by slot order, empty names shown as `(空)`
-- This plugin is for learning & entertainment; please do not use it to spam rooms or disturb other players
+- Queries run in a subprocess calling `room_info.py`, isolated; sends 111 to leave afterwards, never occupies a room slot
+- Private messages are checked against `@userID`; group messages check both `#groupID` and the sender's `@userID` (user blacklist also applies in groups)
+- Player list is shown by slot order, empty names shown as `(空)`
+- When a room is in the "returned to battleroom after start" state the server does not update its status; humans can still join but probes are rejected, this is game behaviour
+- This plugin is for learning and entertainment; do not use it to spam rooms or disturb other players
 
 ---
 
-## 📜 License
+## License
 
 [MIT](LICENSE)
 
-> **Disclaimer**: This plugin is independently developed and not affiliated with Corroding Games. If you object to the protocol reverse-engineering, please contact the author.
+This plugin is independently developed and not affiliated with Corroding Games. The protocol reverse engineering is for interoperability and learning only. If the game's developers object, please contact the author.
