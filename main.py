@@ -136,7 +136,7 @@ def normalize_gid(gid) -> str:
     return m.group(0) if m else s
 
 
-@register("rwinfo", "Operit", "铁锈战争房间查询: 自动识别房号并安排探针查房", "1.5.0")
+@register("rwinfo", "Operit", "铁锈战争房间查询: 自动识别房号并安排探针查房", "1.5.1")
 class RWInfoPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -255,13 +255,13 @@ class RWInfoPlugin(Star):
         for entry in self._recall_store(is_private):
             cfg = self._recall_parse(entry)
             if cfg["key"] == key:
-                return {"开": cfg["开"], "延迟": cfg["延迟"], "通配": False}
+                return {"开": cfg["开"], "延迟": cfg["延迟"]}
             # 通配符仅对群聊生效, 私聊忽略(防止普通用户设 '*' 越权影响他人)
             if cfg["key"] == "*" and not is_private:
-                wildcard = {"开": cfg["开"], "延迟": cfg["延迟"], "通配": True}
+                wildcard = {"开": cfg["开"], "延迟": cfg["延迟"]}
         if wildcard is not None:
             return wildcard
-        return {"开": False, "延迟": 60, "通配": False}
+        return {"开": False, "延迟": 60}
 
     def _set_recall_cfg(self, event, on=None, delay=None, wildcard=False):
         """写入撤回配置并持久化. wildcard=True 时写入 '*' (仅群聊生效).
@@ -304,9 +304,10 @@ class RWInfoPlugin(Star):
         except Exception:
             text = ""
         if text:
-            i = text.find("铁锈撤回")
-            if i >= 0:
-                rest = text[i + len("铁锈撤回"):].strip()
+            # 兼容 /铁锈撤回 与 /rwinfo撤回, 允许 @机器人 等前缀
+            m = re.search(r"(?:铁锈|rwinfo)\s*撤回", text, re.I)
+            if m:
+                rest = text[m.end():].strip()
                 if rest:
                     return rest
         return (arg or "").strip()
@@ -364,21 +365,27 @@ class RWInfoPlugin(Star):
             self.logger.debug("未获取到 message_id, 不安排撤回")
             return None
         delay = int(rcfg["延迟"])
-        if delay > 0:
-            task = asyncio.create_task(self._delayed_recall(event, mid, delay))
-            self.pending_recall_tasks.add(task)
-            task.add_done_callback(self.pending_recall_tasks.discard)
+        # delay=0 表示立即撤回; 其余为延迟秒数。两者都要安排任务, 否则设 0 会永不撤回。
+        task = asyncio.create_task(self._delayed_recall(event, mid, max(0, delay)))
+        self.pending_recall_tasks.add(task)
+        task.add_done_callback(self.pending_recall_tasks.discard)
+        self.logger.debug(f"[撤回] 已安排撤回 mid={mid} delay={delay}s")
         return mid
 
     async def _delayed_recall(self, event, message_id, delay: int):
         """延迟 delay 秒后撤回指定消息 (仅撤回房间解析信息/重试进度)."""
-        await asyncio.sleep(delay)
         try:
-            await event.bot.delete_msg(message_id=int(message_id))
-            self.logger.debug(f"已自动撤回消息: {message_id}")
+            if delay > 0:
+                await asyncio.sleep(delay)
+            # message_id 可能是 int 或 str (不同适配器不一致), 原样传入, 不要强转
+            await event.bot.delete_msg(message_id=message_id)
+            self.logger.debug(f"[撤回] 撤回成功 mid={message_id} delay={delay}s")
+        except asyncio.CancelledError:
+            # 插件卸载/任务清理时被取消, 属正常退出, 不向上抛
+            self.logger.debug(f"[撤回] 任务被取消 mid={message_id}")
         except Exception as e:
             # QQ 普通成员有时间窗口限制(约2分钟), 超时/无权限撤回失败属正常
-            self.logger.debug(f"撤回失败(可能超时间窗口或无权限): {e}")
+            self.logger.debug(f"[撤回] 失败(可能超时间窗口或无权限) mid={message_id}: {e}")
 
     def _acquire_probe(self) -> int:
         """分配一个探针编号 (同步). 无空闲探针时返回 None (调用方跳过该房号本轮查询).
@@ -601,6 +608,9 @@ class RWInfoPlugin(Star):
             "/铁锈撤回 开|关|[秒数0-300] [*]",
             "别名: /铁锈查房菜单 /铁锈帮助 /rwhelp",
             "",
+            "—— 其他 ——",
+            "/铁锈查房调试 - 查看运行时状态(撤回/探针/缓存)",
+            "",
             "—— 自动触发 ——",
             "群聊/私聊发房号自动查房",
             "房型: 首字母+数字(r5132 a5132 h1234 o9999)",
@@ -627,7 +637,7 @@ class RWInfoPlugin(Star):
             "铁锈下一页", "铁锈上一页",
             "铁锈全局解析", "铁锈模式", "铁锈白名", "铁锈黑名",
             "铁锈私聊策略", "铁锈私聊开关", "铁锈玩家列表",
-            "铁锈重试", "铁锈撤回",
+            "铁锈重试", "铁锈撤回", "铁锈查房调试",
         }
         if cmd in known:
             return
@@ -1081,7 +1091,6 @@ class RWInfoPlugin(Star):
         text = self._cmd_list_text(arg, key, label, opp, cmd_name="铁锈黑名")
         yield event.plain_result(text)
         self._save_config()
-
     @filter.command("铁锈重试")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_retry(self, event: AstrMessageEvent, arg: str = ""):
@@ -1097,13 +1106,137 @@ class RWInfoPlugin(Star):
         self._save_config()
         yield event.plain_result(f"重试次数已设置为：{self.config['retry_times']}")
 
+    def _diag_text(self, event) -> str:
+        """生成运行时诊断信息. 不修改任何状态, 只读取."""
+        L = ["【铁锈查房调试】"]
+
+        # ---- 1. 平台/会话识别 ----
+        def safe(fn, default="<异常>"):
+            try:
+                return fn()
+            except Exception as e:
+                return f"<{type(e).__name__}: {e}>"
+
+        gid_raw = safe(event.get_group_id)
+        uid_raw = safe(event.get_sender_id)
+        is_priv = safe(event.is_private_chat)
+        is_admin = safe(event.is_admin)
+        key, is_private = self._recall_session_key(event)
+
+        L.append("")
+        L.append("-- 会话 --")
+        L.append(f"群号原始: {gid_raw!r} -> 归一: {normalize_gid(gid_raw)!r}")
+        L.append(f"发送者原始: {uid_raw!r} -> 归一: {normalize_gid(uid_raw)!r}")
+        L.append(f"私聊: {is_priv}  管理员: {is_admin}")
+        L.append(f"撤回会话key: {key!r} (is_private={is_private})")
+
+        # ---- 2. 撤回配置 ----
+        L.append("")
+        L.append("-- 撤回配置 --")
+        cfg = self._get_recall_cfg(event)
+        L.append(f"生效配置: 开={cfg['开']} 延迟={cfg['延迟']}s")
+        grp = self._recall_store(False)
+        prv = self._recall_store(True)
+        L.append(f"群撤回条目({len(grp)}):")
+        if grp:
+            for e in grp:
+                p = self._recall_parse(e)
+                L.append(f"  {p['key']}: 开={p['开']} 延迟={p['延迟']}s")
+        else:
+            L.append("  (空)")
+        L.append(f"私聊撤回条目({len(prv)}):")
+        if prv:
+            for e in prv:
+                p = self._recall_parse(e)
+                L.append(f"  {p['key']}: 开={p['开']} 延迟={p['延迟']}s")
+        else:
+            L.append("  (空)")
+        L.append(f"待执行撤回任务: {len(self.pending_recall_tasks)}")
+
+        # ---- 3. 探针池 ----
+        L.append("")
+        L.append("-- 探针池 --")
+        L.append(
+            f"已用 {len(self.probe_used)} / 空闲队列 {len(self.probe_released)} / "
+            f"下一个编号 {self.probe_next} (范围 {PROBE_MIN}-{PROBE_MAX})"
+        )
+        if self.probe_used:
+            used = sorted(self.probe_used)
+            L.append("占用: " + ",".join(f"{i:02d}" for i in used[:20]) + ("..." if len(used) > 20 else ""))
+        L.append(f"在途任务: {len(self.pending_tasks)}")
+
+        # ---- 4. 房间列表缓存 + 状态 ----
+        L.append("")
+        L.append("-- 房间列表 --")
+        uid = self._list_uid(event)
+        cache = self._list_cache()
+        if cache.get("rooms"):
+            age = time.time() - cache.get("ts", 0)
+            flag = "" if age <= self.LIST_CACHE_TTL else " (已过期)"
+            L.append(
+                f"数据缓存: {len(cache['rooms'])} 条, 存活 {age:.1f}s / "
+                f"{self.LIST_CACHE_TTL}s{flag}"
+            )
+        else:
+            L.append("数据缓存: 空")
+        states = self._list_page_state()
+        L.append(f"列表状态条目: {len(states)}  (当前 QQ={uid})")
+        st = states.get(uid)
+        if st:
+            age = time.time() - st.get("ts", 0)
+            L.append(
+                f"  当前QQ状态: 第{st.get('page', 1)}页 模组={st.get('mod') or '-'} "
+                f"状态={st.get('status') or '-'} 满={st.get('full') or '-'} "
+                f"来源={st.get('source') or 'all'} 搜索={st.get('keyword') or '-'} "
+                f"存活 {age:.1f}s"
+            )
+        else:
+            L.append("  当前QQ状态: 无")
+        if len(states) > 1:
+            L.append("  其他QQ: " + ", ".join(k for k in list(states)[:5] if k != uid))
+
+        # ---- 5. 其他配置 ----
+        L.append("")
+        L.append("-- 主要配置 --")
+        L.append(f"全局解析: {self.config.get('global_enabled')}  模式: {self.config.get('mode')}")
+        L.append(
+            f"私聊启用: {self.config.get('私聊启用')}  显示玩家: {self.config.get('show_players')} "
+            f"重试次数: {self.config.get('retry_times')}"
+        )
+        L.append(
+            f"每页条数: {self.config.get('list_page_size', 5)}  "
+            f"默认满房筛选: {self.config.get('list_default_full') or '(空)'}  "
+            f"debug: {self.config.get('debug')}"
+        )
+        L.append(
+            f"白名单 {len(self.config.get('白名单', []))} / "
+            f"黑名单 {len(self.config.get('黑名单', []))} / "
+            f"混合白 {len(self.config.get('混合_白名单', []))} / "
+            f"混合黑 {len(self.config.get('混合_黑名单', []))}"
+        )
+        L.append(f"房号冷却记录: {len(self.room_cooldown)} 条")
+        return "\n".join(L)
+
+    @filter.command("铁锈查房调试")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_diag(self, event: AstrMessageEvent, arg: str = ""):
+        """打印运行时诊断信息(会话识别/撤回配置/探针池/列表缓存)."""
+        yield event.plain_result(self._diag_text(event))
+
+
     @filter.command("铁锈撤回")
     async def cmd_recall(self, event: AstrMessageEvent, arg: str = ""):
         """自动撤回开关/延迟(按会话独立): 群聊需管理员, 私聊任何人可用.
         群聊参数末尾加 '*' 表示对所有群生效(通配符, 可被具体群配置覆盖); 私聊不支持通配符."""
         arg = self._recall_full_args(event, arg)
         key, is_private = self._recall_session_key(event)
+        if self.config.get("debug", False):
+            self.logger.debug(
+                f"[撤回] 收到指令 raw_arg={arg!r} key={key!r} is_private={is_private} "
+                f"is_admin={event.is_admin()}"
+            )
         if not is_private and not event.is_admin():
+            self.logger.debug("[撤回] 群聊非管理员, 忽略")
             return
         # 解析末尾 '*' 通配符(仅群聊支持)
         wildcard = False
@@ -1117,21 +1250,26 @@ class RWInfoPlugin(Star):
             parts = parts[:-1]
             arg = " ".join(parts)
         if not key and not wildcard:
+            # 拿不到会话标识(平台差异): 明确告知, 不再静默吞掉
+            yield event.plain_result(
+                "无法识别当前会话，撤回配置未生效。\n"
+                "请在群聊或私聊中直接使用，或用 /铁锈查房调试 查看详情"
+            )
             return
         scope = ("全部群" if wildcard else (f"本群({key})" if not is_private else "本私聊"))
         if not arg:
             cfg = self._get_recall_cfg(event)
             state = "开启" if cfg["开"] else "关闭"
-            if cfg.get("通配") and not wildcard:
-                scope = f"{scope}（继承通配 *）"
             yield event.plain_result(f"{scope}自动撤回：{state}；延迟秒数：{cfg['延迟']} 秒")
             return
         if arg in ("开", "关"):
             self._set_recall_cfg(event, on=(arg == "开"), wildcard=wildcard)
+            self.logger.debug(f"[撤回] 写入 on={arg == '开'} wildcard={wildcard} key={key!r}")
             yield event.plain_result(f"{scope}自动撤回已{'开启' if arg == '开' else '关闭'}")
             return
         if arg.isdigit() and 0 <= int(arg) <= 300:
             self._set_recall_cfg(event, delay=int(arg), wildcard=wildcard)
+            self.logger.debug(f"[撤回] 写入 delay={int(arg)} wildcard={wildcard} key={key!r}")
             yield event.plain_result(f"{scope}自动撤回延迟已设置为：{int(arg)} 秒")
             return
         yield event.plain_result("用法: /铁锈撤回 开|关|[秒数0-300] [*]")
