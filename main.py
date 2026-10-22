@@ -4,6 +4,7 @@
 AstrBot 插件: 铁锈战争房间查询 (rwinfo)
 """
 import asyncio
+import json
 import logging
 import os
 import re
@@ -25,24 +26,64 @@ QUERY_TIMEOUT = 120
 COOLDOWN = 10
 PROBE_MIN, PROBE_MAX = 1, 99
 
-CN_RE = re.compile(r'(?<![A-Za-z0-9])[rRsS]\d{3,}(?![A-Za-z0-9])')
-INTL_RE = re.compile(r'(?<![A-Za-z])[hH][A-Za-z]{2,9}(?![A-Za-z])')
+# ================================================================ 房号识别
+# 铁锈客户端构造中继连接串的逻辑 (ae.smali line 7107-7180):
+#   若连接串不含 ':' '.' '/' '\' 且 != "localhost" 且长度>0
+#   → 视为纯房号, 转换成 "<首字母>.relay.corrodinggames.com/<房号>"
+# 因此"首字母+数字/字母"的任何组合都可能是一个中继房号。
+#
+# 实测可用的中继首字母 (5123 端口开放):
+#   a b h  → 官方中继 (Relay US1 / US2 / ASIA2)
+#   o q r s→ 第三方中继 (RELAY-CN / Fancy-CN / Tiexiu.xyz)
+#   c g j v→ 有 DNS 但端口未开放; 其余字母无 DNS
+# 注意: 不把首字母写死成白名单, 因为官方随时可能开通新中继;
+#       未开通的字母查询时会快速失败(连接错误), 不影响正常房间。
+RELAY_LETTERS = "abchoqrsjvgc"
+
+# 中继房号: 任意首字母 + 3~7 位数字 (r5132 / s1024 / a5132 / h1234 / c8888)
+RELAY_NUM_RE = re.compile(r'(?<![A-Za-z0-9])[A-Za-z]\d{3,7}(?![A-Za-z0-9])')
+# 国际房号(纯字母): 仅 h 开头, 如 hytvvi / hlbifz
+# 依据: h.relay.corrodinggames.com 是官方国际中继(Relay ASIA2),
+#       国际房号为纯字母; 其他字母的纯字母串极易与英文单词混淆, 故不识别。
+RELAY_ALPHA_RE = re.compile(r'(?<![A-Za-z0-9])[hH][A-Za-z]{2,9}(?![A-Za-z0-9])')
+# IP 直连地址: IP 或 IP:端口
+DIRECT_RE = re.compile(r'(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?(?![\d.])')
+
+# 纯字母房号的英文单词黑名单(兜底, 防止 h 开头的常见单词误报)
+_ROOM_STOPWORDS = {
+    'hello', 'help', 'here', 'host', 'hosting', 'hard', 'have', 'huge',
+    'human', 'http', 'https', 'header', 'hardcore',
+}
 
 
 def extract_room_ids(text: str):
+    """从文本中提取所有房间号, 按出现顺序去重返回(小写)。
+
+    支持的房号形式:
+      1. 中继房号(主力): 首字母+数字, 如 r5132 / s1024 / a5132 / h1234 / c8888
+         —— 客户端把任何"纯房号"转成 <首字母>.relay.corrodinggames.com/<房号>
+      2. 国际房号(纯字母): 仅 h 开头, 如 hytvvi / hlbifz
+      3. IP 直连: 由调用方用 DIRECT_RE 单独处理(不在此函数返回)
+    """
     ids = []
     seen = set()
-    for m in CN_RE.finditer(text):
+    rest = text
+    # 1) 优先匹配 首字母+数字 形式(最明确, 零误报)
+    for m in RELAY_NUM_RE.finditer(rest):
         rid = m.group(0).lower()
         if rid not in seen:
             seen.add(rid)
             ids.append(rid)
-    rest = CN_RE.sub(" ", text)
-    for m in INTL_RE.finditer(rest):
+    rest = RELAY_NUM_RE.sub(" ", rest)
+    # 2) 再匹配 纯字母 国际房号(仅 h 开头)
+    for m in RELAY_ALPHA_RE.finditer(rest):
         rid = m.group(0).lower()
-        if rid not in seen:
-            seen.add(rid)
-            ids.append(rid)
+        if rid in seen:
+            continue
+        if rid in _ROOM_STOPWORDS:
+            continue
+        seen.add(rid)
+        ids.append(rid)
     return ids
 
 
@@ -95,7 +136,7 @@ def normalize_gid(gid) -> str:
     return m.group(0) if m else s
 
 
-@register("rwinfo", "Operit", "铁锈战争房间查询: 自动识别房号并安排探针查房", "1.4.0")
+@register("rwinfo", "Operit", "铁锈战争房间查询: 自动识别房号并安排探针查房", "1.5.0")
 class RWInfoPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -520,23 +561,458 @@ class RWInfoPlugin(Star):
     @filter.command("铁锈查房帮助")
     async def cmd_help(self, event: AstrMessageEvent, arg: str = ""):
         """显示本插件所有指令及用法."""
-        lines = [
+        yield event.plain_result("\n".join(self._help_text_lines()))
+
+    # ---- 帮助别名 ----
+    @filter.command("铁锈查房菜单")
+    async def cmd_help_alias1(self, event: AstrMessageEvent, arg: str = ""):
+        yield event.plain_result("\n".join(self._help_text_lines()))
+
+    @filter.command("铁锈帮助")
+    async def cmd_help_alias2(self, event: AstrMessageEvent, arg: str = ""):
+        yield event.plain_result("\n".join(self._help_text_lines()))
+
+    @filter.command("rwhelp")
+    async def cmd_help_alias3(self, event: AstrMessageEvent, arg: str = ""):
+        yield event.plain_result("\n".join(self._help_text_lines()))
+
+    def _help_text_lines(self):
+        """帮助文本(供主指令与别名共用)."""
+        return [
             "【铁锈查房插件指令】",
-            "/铁锈查房帮助 - 显示本帮助",
+            "—— 房间列表 ——",
+            "/铁锈列表 - 房间列表第 1 页(真人房+官方房, 已过滤广告)",
+            "/铁锈列表 2 - 跳到第 2 页",
+            "/铁锈下一页 / /铁锈上一页 - 翻页",
+            "/铁锈列表 刷新 - 强制刷新缓存(默认缓存 60 秒)",
+            "/铁锈列表 模组|原版 - 按类型筛选",
+            "/铁锈列表 房间中|游戏中 - 按状态筛选",
+            "/铁锈列表 满|不满 - 按人数筛选",
+            "/铁锈列表 真人|官方 - 按数据源筛选",
+            "/铁锈列表 搜索 <关键词> - 按房主名/地图名搜索",
+            "/铁锈列表 全部 - 清空筛选",
+            "（别名: /房间列表 /铁锈房列表 /rwlist）",
+            "",
+            "—— 插件设置 ——",
             "/铁锈全局解析 开|关 - 全局解析总开关(无参查看)",
             "/铁锈模式 白|黑|混合 - 切换白/黑/混合模式(无参查看)",
-            "/铁锈白名 +@用户ID|+#群号 - 白名单管理(@用户私聊/#群聊, 无参列出)",
-            "/铁锈黑名 +@用户ID|+#群号 - 黑名单管理(@用户私聊/#群聊, 无参列出)",
+            "/铁锈白名 +@用户ID|+#群号 - 白名单管理(无参列出)",
+            "/铁锈黑名 +@用户ID|+#群号 - 黑名单管理(无参列出)",
             "/铁锈私聊策略 白|黑 - 混合模式私聊默认策略(无参查看)",
             "/铁锈私聊开关 开|关 - 是否启用私聊查房(无参查看)",
             "/铁锈玩家列表 开|关 - 是否显示玩家列表(无参查看)",
             "/铁锈重试 [0-10] - 探针名被过滤时自动重试次数(无参查看)",
-            "/铁锈撤回 开|关|秒数(0-300) [*] - 自动撤回(按群/私聊独立; 群聊加*对所有群生效且可被具体群覆盖; 群聊需管理员)",
+            "/铁锈撤回 开|关|秒数(0-300) [*] - 自动撤回(群聊需管理员, 加*对所有群生效)",
+            "（别名: /铁锈查房菜单 /铁锈帮助 /rwhelp）",
             "",
-            "【自动触发】",
-            "群聊/私聊发送房间号(如 r5132、HLBIFZ) 自动查询回传房间信息",
+            "—— 自动触发 ——",
+            "群聊/私聊发送房间号自动查询回传房间信息",
+            "支持房型: 首字母+数字 (r5132、a5132、h1234、c8888、o9999)",
+            "          国际房 纯字母 h 开头 (hytvvi、hlbifz)",
+            "          直连地址 IP 或 IP:端口",
         ]
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_unmatched(self, event: AstrMessageEvent):
+        """未识别的 /铁锈 指令自动路由到帮助菜单."""
+        text = ""
+        try:
+            text = (event.message_str or "").strip()
+        except Exception:
+            return
+        if not text.startswith("/"):
+            return
+        cmd = text[1:].split()[0] if len(text) > 1 else ""
+        # 只接管 "铁锈"/"rwinfo" 开头但非已知指令的情况
+        if not (cmd.startswith("铁锈") or cmd.startswith("rwinfo")):
+            return
+        known = {
+            "铁锈查房帮助", "铁锈查房菜单", "铁锈帮助", "rwhelp",
+            "铁锈列表", "房间列表", "铁锈房列表", "rwlist",
+            "铁锈下一页", "铁锈上一页",
+            "铁锈全局解析", "铁锈模式", "铁锈白名", "铁锈黑名",
+            "铁锈私聊策略", "铁锈私聊开关", "铁锈玩家列表",
+            "铁锈重试", "铁锈撤回",
+        }
+        if cmd in known:
+            return
+        yield event.plain_result(
+            f"未知指令：/{cmd}\n\n" + "\n".join(self._help_text_lines())
+        )
+
+    # ---- 房间列表 (分页 + 按 QQ 号缓存) ----
+    # 滑动过期: 每次"有动作"(翻页/切筛选/刷新)都会把过期时间往后推
+    LIST_CACHE_TTL = 60   # 秒: 房间数据缓存有效期(全局共享一份, 滑动续期)
+    LIST_STATE_TTL = 60   # 秒: 每个 QQ 的翻页/筛选状态有效期(滑动续期)
+
+    def _list_cache(self):
+        """房间数据缓存容器(全局共享一份, 所有 QQ/群共用)。"""
+        if not hasattr(self, "_room_list_cache"):
+            self._room_list_cache = {"ts": 0.0, "rooms": []}
+        return self._room_list_cache
+
+    def _list_page_state(self):
+        """按 QQ 号隔离的翻页/筛选状态。key=QQ号, value=状态字典。"""
+        if not hasattr(self, "_room_page_state"):
+            self._room_page_state = {}
+        return self._room_page_state
+
+    def _list_uid(self, event):
+        """取发送者 QQ 号(统一按 QQ 号隔离, 不区分群聊/私聊)。"""
+        try:
+            uid = normalize_gid(event.get_sender_id())
+            return uid or "unknown"
+        except Exception:
+            return "unknown"
+
+    def _state_get(self, event):
+        """取出该 QQ 的状态; 已过期则视为无状态(惰性清理)。"""
+        uid = self._list_uid(event)
+        states = self._list_page_state()
+        st = states.get(uid)
+        if not st:
+            return None
+        # 滑动过期: 超过 LIST_STATE_TTL 未动作则作废
+        if (time.time() - st.get("ts", 0)) > self.LIST_STATE_TTL:
+            states.pop(uid, None)
+            return None
+        return st
+
+    def _state_put(self, event, page, keyword, status, mod_filter, full, source):
+        """保存该 QQ 的状态并刷新过期时间(滑动续期)。"""
+        uid = self._list_uid(event)
+        self._list_page_state()[uid] = {
+            "page": page, "keyword": keyword, "status": status,
+            "mod": mod_filter, "full": full, "source": source,
+            "ts": time.time(),   # 每次动作都刷新 → 滑动过期
+        }
+
+    def _state_touch(self, event):
+        """仅刷新过期时间(命中缓存时也要续期)。"""
+        uid = self._list_uid(event)
+        st = self._list_page_state().get(uid)
+        if st:
+            st["ts"] = time.time()
+
+    def _cleanup_states(self):
+        """清理已过期的 QQ 状态, 避免字典无限增长。"""
+        now = time.time()
+        states = self._list_page_state()
+        dead = [k for k, v in states.items()
+                if (now - v.get("ts", 0)) > self.LIST_STATE_TTL]
+        for k in dead:
+            states.pop(k, None)
+
+    async def _list_fetch(self, force: bool = False):
+        """拉取房间列表(带滑动过期缓存)。force=True 强制刷新。"""
+        cache = self._list_cache()
+        now = time.time()
+        if not force and cache["rooms"] and (now - cache["ts"]) < self.LIST_CACHE_TTL:
+            cache["ts"] = now   # 滑动续期: 有人用就续命
+            return cache["rooms"], True   # 命中缓存
+
+        cmd_args = [sys.executable, "-u", ROOM_INFO_PY, "--list-json"]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=ROOM_INFO_DIR,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return None, False
+        except Exception as e:
+            self.logger.error(f"房间列表获取失败: {e}")
+            return None, False
+
+        out = (stdout or b"").decode("utf-8", "replace").strip()
+        rooms = []
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("["):
+                try:
+                    rooms = json.loads(line)
+                    break
+                except json.JSONDecodeError:
+                    continue
+        if rooms is None:
+            rooms = []
+        cache["rooms"] = rooms
+        cache["ts"] = time.time()
+        return rooms, False
+
+    @filter.command("铁锈列表")
+    async def cmd_list(self, event: AstrMessageEvent, arg: str = ""):
+        """房间列表(分页). 数据源为真人房(Q Room List) + 官方 Auto Server."""
+        async for _r in self._cmd_list_impl(event, arg):
+            yield _r
+
+    # ---- 列表指令别名 ----
+    @filter.command("房间列表")
+    async def cmd_list_alias1(self, event: AstrMessageEvent, arg: str = ""):
+        async for _r in self._cmd_list_impl(event, arg):
+            yield _r
+
+    @filter.command("铁锈房列表")
+    async def cmd_list_alias2(self, event: AstrMessageEvent, arg: str = ""):
+        async for _r in self._cmd_list_impl(event, arg):
+            yield _r
+
+    @filter.command("rwlist")
+    async def cmd_list_alias3(self, event: AstrMessageEvent, arg: str = ""):
+        async for _r in self._cmd_list_impl(event, arg):
+            yield _r
+
+    async def _cmd_list_impl(self, event: AstrMessageEvent, arg: str = ""):
+        arg = (arg or "").strip()
+        try:
+            is_private = bool(event.is_private_chat())
+        except Exception:
+            is_private = False
+        if not is_private and not event.is_admin():
+            return
+
+        # 取该 QQ 的历史状态(已过期则视为无)
+        st = self._state_get(event)
+        # 顺手清理其它已过期的 QQ 状态
+        if len(self._list_page_state()) > 50:
+            self._cleanup_states()
+
+        # 默认筛选条件(可由配置指定)
+        keyword = ""
+        status = ""
+        mod_filter = ""
+        full = self.config.get("list_default_full", "")  # ""/hide
+        source = "all"
+
+        page = 1
+        force = False
+        # 本次是否显式给了筛选条件(没给则沿用该 QQ 上次的)
+        has_filter_arg = False
+
+        # ---- 参数解析表: 单遍扫描, 支持 "模组 2" / "搜索 岛屿 2" / "刷新" ----
+        FILTER_WORDS = {
+            "模组": ("mod", "mod"), "mod": ("mod", "mod"),
+            "原版": ("mod", "vanilla"), "vanilla": ("mod", "vanilla"),
+            "房间中": ("status", "battleroom"), "可加入": ("status", "battleroom"),
+            "joinable": ("status", "battleroom"), "battleroom": ("status", "battleroom"),
+            "游戏中": ("status", "ingame"), "ingame": ("status", "ingame"),
+            "满": ("full", "only"), "人满": ("full", "only"), "full": ("full", "only"),
+            "不满": ("full", "hide"), "有空": ("full", "hide"), "notfull": ("full", "hide"),
+            "真人": ("source", "qroom"), "qroom": ("source", "qroom"), "q": ("source", "qroom"),
+            "官方": ("source", "official"), "official": ("source", "official"),
+            "auto": ("source", "official"),
+        }
+        RETAIN = ("搜索", "search")
+        RESET = ("全部", "所有", "all")
+        REFRESH = ("刷新", "重载", "refresh")
+
+        toks = arg.split()
+        idx = 0
+        bad = ""
+        while idx < len(toks):
+            t = toks[idx]
+            if t.isdigit():
+                page = max(1, int(t))
+            elif t in REFRESH:
+                force = True
+            elif t in RETAIN:
+                # "搜索 关键词" 或 "搜索关键词"
+                kw = ""
+                if idx + 1 < len(toks):
+                    idx += 1
+                    kw = toks[idx]
+                if not kw:
+                    yield event.plain_result("用法: /铁锈列表 搜索 <关键词>")
+                    return
+                keyword = kw
+                has_filter_arg = True
+            elif t.startswith("搜索"):
+                keyword = t[2:].strip()
+                has_filter_arg = True
+            elif t.startswith("search"):
+                keyword = t[6:].strip()
+                has_filter_arg = True
+            elif t in RESET:
+                keyword = ""; status = ""; mod_filter = ""
+                full = ""; source = "all"
+                has_filter_arg = True
+            elif t in FILTER_WORDS:
+                field, val = FILTER_WORDS[t]
+                if field == "mod":
+                    mod_filter = val
+                elif field == "status":
+                    status = val
+                elif field == "full":
+                    full = val
+                elif field == "source":
+                    source = val
+                has_filter_arg = True
+            else:
+                bad = t
+                break
+            idx += 1
+
+        if bad:
+            yield event.plain_result(
+                f"无法识别的参数：{bad}\n\n"
+                "【房间列表用法】\n"
+                "/铁锈列表 - 第 1 页(真人房+官方房)\n"
+                "/铁锈列表 2 - 第 2 页\n"
+                "/铁锈列表 刷新 - 强制刷新数据\n"
+                "/铁锈列表 模组|原版 - 按类型\n"
+                "/铁锈列表 房间中|游戏中 - 按状态\n"
+                "/铁锈列表 满|不满 - 按人数\n"
+                "/铁锈列表 真人|官方 - 按来源\n"
+                "/铁锈列表 搜索 <关键词> - 按房主/地图搜索\n"
+                "/铁锈列表 全部 - 清空筛选\n"
+                "/铁锈下一页 / /铁锈上一页 - 翻页\n"
+                "（筛选条件与页码按 QQ 号记住 60 秒，有操作就续期）"
+            )
+            return
+
+        # 本次没给筛选条件时, 沿用该 QQ 上次的条件(状态 60 秒过期)
+        if st and not has_filter_arg:
+            keyword = st.get("keyword", "")
+            status = st.get("status", "")
+            mod_filter = st.get("mod", "")
+            full = st.get("full", "")
+            source = st.get("source", "all")
+
+        rooms_all, cached = await self._list_fetch(force=force)
+        if rooms_all is None:
+            yield event.plain_result("[房间列表] 获取超时，请稍后重试")
+            return
+        if not rooms_all:
+            yield event.plain_result("[房间列表] 没有获取到房间数据")
+            return
+
+        # 本地筛选
+        def match(r):
+            rst = (r.get("status") or "").lower()
+            if status and rst != status:
+                return False
+            if mod_filter == "mod" and not r.get("is_mod"):
+                return False
+            if mod_filter == "vanilla" and r.get("is_mod"):
+                return False
+            isfull = (r.get("max") or 0) > 0 and (r.get("players") or 0) >= (r.get("max") or 0)
+            if full == "only" and not isfull:
+                return False
+            if full == "hide" and isfull:
+                return False
+            if source != "all" and (r.get("source") or "") != source:
+                return False
+            if keyword:
+                blob = " ".join([str(r.get("name") or ""), str(r.get("map") or ""),
+                                 str(r.get("desc") or "")]).lower()
+                if keyword.lower() not in blob:
+                    return False
+            return True
+
+        rooms = [r for r in rooms_all if match(r)]
+        if not rooms:
+            yield event.plain_result("[房间列表] 没有符合条件的房间，试试 /铁锈列表 全部")
+            return
+
+        page_size = 5
+        try:
+            page_size = max(1, int(self.config.get("list_page_size", 5)))
+        except (TypeError, ValueError):
+            page_size = 5
+        total_pages = max(1, (len(rooms) + page_size - 1) // page_size)
+        page = min(page, total_pages)
+        start = (page - 1) * page_size
+        page_rooms = rooms[start:start + page_size]
+
+        # 保存该 QQ 的翻页/筛选状态(滑动续期 60 秒)
+        self._state_put(event, page, keyword, status, mod_filter, full, source)
+
+        # ---- 组装消息 ----
+        conds = []
+        if source == "qroom":
+            conds.append("真人房")
+        elif source == "official":
+            conds.append("官方房")
+        if mod_filter == "mod":
+            conds.append("模组")
+        elif mod_filter == "vanilla":
+            conds.append("原版")
+        if status == "battleroom":
+            conds.append("房间中")
+        elif status == "ingame":
+            conds.append("游戏中")
+        if full == "only":
+            conds.append("人满")
+        elif full == "hide":
+            conds.append("未满")
+        if keyword:
+            conds.append(f"搜索「{keyword}」")
+
+        header = f"【房间列表】{len(rooms)} 个"
+        if conds:
+            header += f"（{'/'.join(conds)}）"
+        header += f"　第 {page}/{total_pages} 页"
+        if cached and not force:
+            header += "　[缓存]"
+
+        lines = [header, ""]
+        status_cn = {"battleroom": "房间中", "ingame": "游戏中",
+                     "locked": "已锁定", "chat": "聊天", "unknown": "-"}
+        for idx, rm in enumerate(page_rooms, start + 1):
+            host = str(rm.get("name") or "?")[:16]
+            mapname = str(rm.get("map") or "-")[:28]
+            pl = rm.get("players", 0)
+            mx = rm.get("max", 0)
+            sts = status_cn.get((rm.get("status") or "").lower(), "-")
+            mod = "模组" if rm.get("is_mod") else "原版"
+            lines.append(f"{idx}. {host}　{pl}/{mx}　{sts}　{mod}")
+            lines.append(f"   地图：{mapname}")
+            desc = (rm.get("desc") or "").strip()
+            if desc and desc != mapname and desc != "-":
+                lines.append(f"   备注：{desc[:30]}")
+            if rm.get("source") == "official":
+                lines.append("   （官方自动房）")
+
+        lines.append("")
+        nav = []
+        if page > 1:
+            nav.append("/铁锈上一页")
+        if page < total_pages:
+            nav.append("/铁锈下一页")
+        if nav:
+            lines.append("　".join(nav))
+        if total_pages > 1:
+            lines.append(f"/铁锈列表 <页码> 直达 1-{total_pages}")
+
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("铁锈下一页")
+    async def cmd_list_next(self, event: AstrMessageEvent, arg: str = ""):
+        """房间列表下一页"""
+        st = self._state_get(event)
+        if not st:
+            yield event.plain_result("请先发送 /铁锈列表（翻页状态按 QQ 号记住 60 秒）")
+            return
+        nxt = st.get("page", 1) + 1
+        async for r in self._cmd_list_impl(event, str(nxt)):
+            yield r
+
+    @filter.command("铁锈上一页")
+    async def cmd_list_prev(self, event: AstrMessageEvent, arg: str = ""):
+        """房间列表上一页"""
+        st = self._state_get(event)
+        if not st:
+            yield event.plain_result("请先发送 /铁锈列表（翻页状态按 QQ 号记住 60 秒）")
+            return
+        prv = max(1, st.get("page", 1) - 1)
+        async for r in self._cmd_list_impl(event, str(prv)):
+            yield r
 
     @filter.command("铁锈全局解析")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -770,6 +1246,11 @@ class RWInfoPlugin(Star):
                 return
 
             rids = extract_room_ids(text)
+            # IP / IP:端口 直连地址也算房号(room_info.py 会自动识别为直连目标)
+            for ipm in DIRECT_RE.finditer(text):
+                ipstr = ipm.group(0)
+                if ipstr not in rids:
+                    rids.append(ipstr)
             if not rids:
                 return
 
