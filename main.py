@@ -26,6 +26,9 @@ QUERY_TIMEOUT = 120
 COOLDOWN = 10
 PROBE_MIN, PROBE_MAX = 1, 99
 
+# 插件版本(菜单显示与 @register 共用, 避免两处不一致)
+PLUGIN_VERSION = "1.5.1"
+
 # ================================================================ 房号识别
 # 铁锈客户端构造中继连接串的逻辑 (ae.smali line 7107-7180):
 #   若连接串不含 ':' '.' '/' '\' 且 != "localhost" 且长度>0
@@ -136,7 +139,7 @@ def normalize_gid(gid) -> str:
     return m.group(0) if m else s
 
 
-@register("rwinfo", "Operit", "铁锈战争房间查询: 自动识别房号并安排探针查房", "1.5.1")
+@register("rwinfo", "Operit", "铁锈战争房间查询: 自动识别房号并安排探针查房", PLUGIN_VERSION)
 class RWInfoPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -296,21 +299,35 @@ class RWInfoPlugin(Star):
             store[idx] = new_entry
         self._save_config()
 
-    def _recall_full_args(self, event, arg: str) -> str:
-        """AstrBot 仅将第一个空格分隔参数传给 arg, 后续参数会丢失.
-        这里从原始消息文本补全完整参数, 以支持末尾通配符 '*'. 取不到时回退 arg."""
+    def _raw_args(self, event, arg: str, *cmd_names: str) -> str:
+        """从原始消息中取出完整参数.
+
+        AstrBot 只把第一个空格分隔的参数传给 arg, 后续会丢失
+        (如 "/铁锈列表 搜索 无常人" 的 arg 只有 "搜索")。
+        因此这里按命令名在原始文本里定位，取其后全部内容。取不到时回退 arg。
+        """
         try:
             text = (event.get_message_str() or "").strip()
         except Exception:
             text = ""
         if text:
-            # 兼容 /铁锈撤回 与 /rwinfo撤回, 允许 @机器人 等前缀
-            m = re.search(r"(?:铁锈|rwinfo)\s*撤回", text, re.I)
-            if m:
-                rest = text[m.end():].strip()
-                if rest:
-                    return rest
+            for name in cmd_names:
+                if not name:
+                    continue
+                # 允许 /铁锈列表、>铁锈列表、@机器人 /铁锈列表 等前缀
+                m = re.search(re.escape(name), text)
+                if m:
+                    rest = text[m.end():].strip()
+                    # 去掉可能残留的前导分隔符
+                    rest = rest.lstrip(":：,，")
+                    if rest:
+                        return rest.strip()
+            # 命令名后没有参数, 但 arg 有值(少见), 回退
         return (arg or "").strip()
+
+    def _recall_full_args(self, event, arg: str) -> str:
+        """撤回指令的完整参数 (兼容 /铁锈撤回 与 /rwinfo撤回)."""
+        return self._raw_args(event, arg, "铁锈撤回", "rwinfo撤回", "撤回")
 
     async def _send_room_result(self, event, result: str):
         """发送房间查询结果(可撤回). 处理超长截断."""
@@ -586,15 +603,22 @@ class RWInfoPlugin(Star):
     def _help_text_lines(self):
         """帮助文本(供主指令与别名共用)."""
         return [
-            "【铁锈查房插件指令】",
+            f"【铁锈查房插件指令】v{PLUGIN_VERSION}",
             "",
             "—— 房间列表 ——",
-            "/铁锈列表 [页码]|[模组|原版]|[房间中|游戏中]",
-            "         |[满|不满]|[真人|官方]|[搜索 关键词]",
+            "/铁锈列表 [页码]|[筛选]|[搜索 关键词]",
             "         |[全部]|[刷新]",
-            "/铁锈下一页 / 铁锈上一页",
-            "例: /铁锈列表 模组 房间中 2",
+            "",
+            "筛选:",
+            "  模组|原版        是否使用 Mod",
+            "  房间中|游戏中    房间状态",
+            "  满|不满          人数是否已满",
+            "  真人|官方        数据来源",
+            "",
+            "页码: 纯数字, 如 2 表示第 2 页",
+            "组合: /铁锈列表 模组 房间中 2",
             "别名: /房间列表 /铁锈房列表 /rwlist",
+            "/铁锈下一页 / 铁锈上一页",
             "",
             "—— 插件设置 ——",
             "/铁锈全局解析 开|关",
@@ -774,7 +798,10 @@ class RWInfoPlugin(Star):
             yield _r
 
     async def _cmd_list_impl(self, event: AstrMessageEvent, arg: str = ""):
-        arg = (arg or "").strip()
+        # AstrBot 只把第一个空格参数传给 arg, 这里从原始消息补全全部参数
+        arg = self._raw_args(
+            event, arg, "铁锈房列表", "房间列表", "铁锈列表", "rwlist"
+        )
         try:
             is_private = bool(event.is_private_chat())
         except Exception:
