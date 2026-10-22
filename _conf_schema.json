@@ -63,6 +63,26 @@
         "min": 0,
         "max": 10
     },
+    "list_max_display": {
+        "description": "房间列表指令最多显示的房间数（默认20，避免消息过长）",
+        "type": "int",
+        "default": 20,
+        "min": 1,
+        "max": 100
+    },
+    "list_page_size": {
+        "description": "房间列表每页显示数量（默认5）",
+        "type": "int",
+        "default": 5,
+        "min": 1,
+        "max": 30
+    },
+    "list_default_full": {
+        "description": "房间列表默认人数筛选: 空=全部 / hide=隐藏人满房间",
+        "type": "string",
+        "default": "",
+        "options": ["", "hide"]
+    },
     "群撤回": {
         "description": "每个群独立的撤回配置，格式 \"#群号:开:延迟\"（开=1/0），例 \"#123456:1:60\"",
         "type": "list",
