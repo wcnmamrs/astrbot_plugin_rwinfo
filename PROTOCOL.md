@@ -284,6 +284,25 @@ int32 seed
 
 **输出格式化**（format_room）：版本/地图/资金+倍率/禁核/迷雾/模式/默认单位/单位上限/共享控制/旁观/队伍锁定/人数/Mod/ID + 可选玩家列表（折叠超过 max_players_display）。
 
+### 11.1 从列表序号进入查询（两条入口）
+
+从 `/铁锈列表` 的序号发起 `/铁锈查房 N` 时，按 `A` 字段分流：
+
+```
+A == 0  →  direct_main(ip:port)          列表里的地址就是真实地址，直接连
+A != 0  →  resolve_official_addr()       先换取真实地址，再直连
+             ↓  action=get&game_id=<UUID>&c=<挑战码>
+             ↓  响应第 4 行取 ip / port
+           direct_main(ip:port)
+```
+
+`resolve_official_addr` 不会走中继，它是向 masterserver 换取地址的 HTTP 请求，
+因此比 `relay_session` 快很多，也不会占用探针编号。
+
+**中继入口地址不可直连**（实测）：`18.216.139.119:5158` 等入口只做 UPList 注册，
+带任何 room_id 都只回 161 握手，不给房间信息；直连则被踢
+`Your client is newer then the server`。
+
 ---
 
 ## 12. 错误与状态字符串
@@ -300,14 +319,123 @@ int32 seed
 
 ## 13. 官方房间列表（masterserver）
 
+### 13.1 拉取列表
+
 ```
 GET http://gs1.corrodinggames.com/masterserver/1.4/interface
     ?action=list&game_version=176&game_version_beta=false
 Headers: User-Agent: rw android 176 en, Language: en
 ```
 
-响应：首行表头 + 每行逗号分隔 CSV：
-`id,name,ver,ip,?,port,?,?,?,desc,mode,status,?,?,?,players,max,...`
+备用：`http://gs4.corrodinggames.net/masterserver/1.4/interface`（参数相同）。
+两个服务器返回的列表**内容不同**，客户端会并行请求；插件只用第一个成功的。
+
+响应：首行表头 `CORRODINGGAMES[1.0]` + 每行 22 列逗号分隔 CSV。
+
+### 13.2 CSV 字段（逐列核实）
+
+按客户端 `gameFramework/j/r.smali` 的赋值顺序反推，实测 340 行样本验证：
+
+| 列 | 字段 | 说明 |
+|---|---|---|
+| 0 | `id` | 房间 UUID，`u_...` 形式；中继房也用它 |
+| 1 | `name` | 房名，绝大多数是 `Unnamed` |
+| 2 | `ver` | 版本号 int（176 / 174） |
+| 3 | `ip` | 对外 IP；LINK 条目为 `url:...` |
+| 4 | `lan_ip` | 内网 IP；中继房常见 `127.0.0.1` / `10.0.0.1` |
+| 5 | `port` | 端口 |
+| 6 | ? | bool |
+| 7 | **`host`** | **房主名**（`created_by`）。真正的标识在这里，不在第 1 列 |
+| 8 | ? | bool |
+| 9 | `desc` | 描述 / 地图名 |
+| 10 | `mode` | `skirmishMap` / `customMap` / `LINK` |
+| 11 | `status` | `battleroom` / `ingame` / `LINK` |
+| 12 | `game_ver` | 版本字符串（`1.15` / `1.15-RN` / `ANY`） |
+| 13 | ? | bool |
+| 14 | `desc2` | 描述备用列 |
+| 15 | `players` | 当前人数（**房主自报，可伪造**） |
+| 16 | `max` | 人数上限（同上） |
+| 17 | ? | bool |
+| 18 | `uuid2` | UUID 副本 |
+| 19 | ? | bool |
+| 20 | ? | 常为空 |
+| 21 | **`A`** | **加入方式字段**，见 13.3 |
+
+> ⚠ 早期文档把第 7 列标成 `SERVER/CLIENT`，是错的。它是房主名，
+> 中继入口标识 `RELAY-CN 入口` 就出现在这一列。
+
+### 13.3 A 字段与中继房真实地址
+
+客户端 `MultiplayerLobbyActivity/gl.java` 决定如何加入：
+
+```java
+if (fVar2.A == 0) str = fVar2.c + ":" + fVar2.g;                    // 直接连 ip:port
+else              str = "get|" + fVar2.b + "|" + fVar2.A + "|" + fVar2.m + "|" + fVar2.g;
+```
+
+`A != 0` 时不能直连。**RELAY-CN 等中继通过 UPList 把真人房开放到列表时，
+所有房间都挂在同一个入口 IP:Port 上**（实测 `18.216.139.119:5158`，260 条），
+直连会被踢：
+
+```
+KICKED: Your client is newer then the server
+```
+
+真实地址需要向 masterserver 请求 `action=get`，参数 `c` 是挑战码：
+
+```
+GET .../interface?action=get&game_id=<UUID>&c=<挑战码>
+```
+
+挑战码由 `A` 推导（`gameFramework/j/m.java` 的 `a(int i)`）：
+
+| A 范围 | 挑战码 |
+|---|---|
+| `0` | 空串（此时走直连，不需要 get） |
+| `< 100000` | `MD5("x" + A)` 前 10 位 |
+| `< 200000` | `MD5("y" + A)` 前 11 位 |
+| `< 300000` | `MD5("z" + A)` 前 12 位 |
+| `< 1000000` | `MD5("xx" + A)` 前 13 位 + `-` + 另一段 |
+| `< 2000000` | `MD5("yy" + A)` 前 14 位 + `-` + 另一段 |
+| 其它 | `NA` |
+
+实测 `A=10605 → c=da7821ccf7`，请求返回：
+
+```
+CORRODINGGAMES[1.0]
+OK
+0d50353605e90e
+u_c587d747-...,Unnamed,176,1.94.184.91,127.0.0.1,5125,true,\x01测试房,...,2,10,...,,10605
+                                              ↑ 真实地址 1.94.184.91:5125
+```
+
+响应格式：第 1 行表头，第 2 行 `OK` 或 `[FAILED]`，第 3 行哈希，第 4 行才是房间 CSV。
+失败状态：`ERROR_MISSING_C` / `ERROR_WRONG_C` / `GAME NOT FOUND` / `ERROR_MISSING_PASSWORD`。
+
+> 中继房实测可解析率：`5158` 入口下抽样 8 条全部成功，真实地址形如
+> `36.138.100.120:5523`、`124.222.3.44:5127`，可直接用直连模式查询。
+
+### 13.4 广告过滤
+
+列表里混有大量第三方推广房。**只用文本内容判据**：
+
+| 判据 | 实现 |
+|---|---|
+| 链接条目 | `mode`/`status` 为 `LINK`，或 `ip` 以 `url:` 开头 |
+| 字段无效 | `ip` 非 IPv4 / `port` 非数字 |
+| 中继入口占位 | 第 7 列或描述匹配 `RELAY`/`中继`/`入口`/`节点`，**且 `players == 0`** |
+| 拉群推广 | 第 1/7/9/14 列匹配 `群号\d{6,}`、`加群`、`QQ群`、`直播服务器` 等 |
+| 重复 UUID | 同一 `id` 重复上报 |
+
+**不能用这三类特征**（实测都会误杀真人房）：
+
+| 特征 | 误杀原因 |
+|---|---|
+| `players` / `max` | 房主自报，可伪造（实测 `6360/64921`、`943438591/10`） |
+| `ip:port` | 中继房共用同一入口，按 `ip:port` 聚合会删掉全部中继真人房 |
+| 控制字符 | RELAY-CN 给每个开放到列表的真人房都加 `\x01` 前缀（房主名 `\x01测试房`） |
+
+实测 343 行：保留 298 条，剔除 41 条拉群广告 + 3 条空置入口 + 1 条链接。
 
 ---
 
@@ -315,6 +443,9 @@ Headers: User-Agent: rw android 176 en, Language: en
 
 - 目标格式：`IP:port` 或 `IP`（默认 5123）
 - 流程：connect(160, 无room_id变体) → 161 → 110 注册 → 收 106/115 → 111 退出
+- 连接失败必须输出 `[房间查询失败]`，不能抛 traceback：
+  直连地址未必是游戏服务器（可能是 Web / 其他服务），连接失败属正常情况，
+  而插件要靠 `[房间查询失败]` 前缀归类失败原因。
 
 ---
 
@@ -325,4 +456,9 @@ Headers: User-Agent: rw android 176 en, Language: en
 - 被踢 150 的 utf 是**原因字符串**，插件靠关键词翻译
 - 版本号：176=1.15 正式版，174=1.15p11 测试版
 - 中继挑战 v8=5/6 的 POW 穷举上限 v10 可能很大，30s 超时兜底
+- 客户端判定房号只看 6 个条件（非空、不含 `:` `.` `/` `\`、非 `localhost`），
+  然后取**首字符**拼 `<首字母>.relay.corrodinggames.com/<房号>`。
+  实测形态由**中继服务端**决定：`o` `q` `r` `s` 只收数字房，其他字母只收纯字母房
+- 中继入口（`18.216.139.119:5158` 等）只接受 UPList 注册，不接受加入请求；
+  带任何 room_id 握手都只返回 161，不会给房间信息
 - **探针行为**：查询完立即发 111 离开，不占房间位置、不影响房间人数

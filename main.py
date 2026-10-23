@@ -27,63 +27,75 @@ COOLDOWN = 10
 PROBE_MIN, PROBE_MAX = 1, 99
 
 # 插件版本(菜单显示与 @register 共用, 避免两处不一致)
-PLUGIN_VERSION = "1.5.1"
+PLUGIN_VERSION = "1.5.5"
 
 # ================================================================ 房号识别
 # 铁锈客户端构造中继连接串的逻辑 (ae.smali line 7107-7180):
 #   若连接串不含 ':' '.' '/' '\' 且 != "localhost" 且长度>0
 #   → 视为纯房号, 转换成 "<首字母>.relay.corrodinggames.com/<房号>"
-# 因此"首字母+数字/字母"的任何组合都可能是一个中继房号。
+#   即客户端只取首字符当主机名, 对房号字符本身无限制。
 #
 # 实测可用的中继首字母 (5123 端口开放):
 #   a b h  → 官方中继 (Relay US1 / US2 / ASIA2)
-#   o q r s→ 第三方中继 (RELAY-CN / Fancy-CN / Tiexiu.xyz)
+#   o q r s→ 第三方中继 (RELAY-CN / Tiexiu.xyz / Fancy-CN)
 #   c g j v→ 有 DNS 但端口未开放; 其余字母无 DNS
+#
+# 房号形态按中继区分(实测):
+#   o q r s   → 数字房, 如 r5132 / s1024 / o9999 / q7777
+#   其他字母   → 字母房, 如 hytvvi / aabcde / babc
+# 两种形态统一限制: 整串长度 >= 3。其他形式(纯数字 / 混合 / IP)一律不识别。
 # 注意: 不把首字母写死成白名单, 因为官方随时可能开通新中继;
 #       未开通的字母查询时会快速失败(连接错误), 不影响正常房间。
-RELAY_LETTERS = "abchoqrsjvgc"
+NUM_RELAY_LETTERS = "oqrs"
 
-# 中继房号: 任意首字母 + 3~7 位数字 (r5132 / s1024 / a5132 / h1234 / c8888)
-RELAY_NUM_RE = re.compile(r'(?<![A-Za-z0-9])[A-Za-z]\d{3,7}(?![A-Za-z0-9])')
-# 国际房号(纯字母): 仅 h 开头, 如 hytvvi / hlbifz
-# 依据: h.relay.corrodinggames.com 是官方国际中继(Relay ASIA2),
-#       国际房号为纯字母; 其他字母的纯字母串极易与英文单词混淆, 故不识别。
-RELAY_ALPHA_RE = re.compile(r'(?<![A-Za-z0-9])[hH][A-Za-z]{2,9}(?![A-Za-z0-9])')
-# IP 直连地址: IP 或 IP:端口
-DIRECT_RE = re.compile(r'(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?(?![\d.])')
+# 数字房号: oqrs 开头 + 2 位以上数字 (整串 >= 3 字符)
+#   o12 / q99 / r5132 / s1024
+RELAY_NUM_RE = re.compile(r'(?<![A-Za-z0-9])[oqrsOQRS]\d{2,}(?![A-Za-z0-9])')
+# 字母房号: 非 oqrs 的字母开头 + 纯字母 (整串 >= 3 字符)
+#   hab / abc / hytvvi / aabcde
+# 额外排除 URL / 域名片段: 紧邻 . / : @ = 的纯字母串不是房号
+#   如 https://example.com 里的 https / example / com 都不匹配
+RELAY_ALPHA_RE = re.compile(
+    r'(?<![A-Za-z0-9._:/@=])(?![oqrsOQRS])[A-Za-z]{3,}(?![A-Za-z0-9._:/@=])')
 
-# 纯字母房号的英文单词黑名单(兜底, 防止 h 开头的常见单词误报)
-_ROOM_STOPWORDS = {
-    'hello', 'help', 'here', 'host', 'hosting', 'hard', 'have', 'huge',
-    'human', 'http', 'https', 'header', 'hardcore',
-}
+# 不识别纯数字房号(如 5232): 首字符为数字的中继主机无 DNS, 无法查询。
+# 不识别混合格式(如 a1b2c3): 不在实测的两种形态内, 排除以防误报。
+# 不识别 IP 直连: 自动触发时不连 IP(无法判断是 Web 还是游戏服务器);
+#   仅 /铁锈查房 显式指定 IP 时才允许, 由 IP_QUERY_RE 匹配。
+# 不设英文单词黑名单: 字母房号随机, 可能恰好是 "hello" / "game";
+#   黑名单会误杀真实房间, 合法性判定交给探针(查不到自然失败)。
+
+# 显式查房时允许的 IP / IP:端口 形式(自动触发不使用)
+IP_QUERY_RE = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?$')
 
 
 def extract_room_ids(text: str):
     """从文本中提取所有房间号, 按出现顺序去重返回(小写)。
 
-    支持的房号形式:
-      1. 中继房号(主力): 首字母+数字, 如 r5132 / s1024 / a5132 / h1234 / c8888
-         —— 客户端把任何"纯房号"转成 <首字母>.relay.corrodinggames.com/<房号>
-      2. 国际房号(纯字母): 仅 h 开头, 如 hytvvi / hlbifz
-      3. IP 直连: 由调用方用 DIRECT_RE 单独处理(不在此函数返回)
+    支持的房号形式(按中继区分, 实测):
+      1. 数字房: o/q/r/s + 2 位以上数字, 整串 >= 3 字符
+         如 r5132 / s1024 / o9999 / q7777
+      2. 字母房: 非 o/q/r/s 的字母开头 + 纯字母, 整串 >= 3 字符
+         如 hytvvi / aabcde / babc / cabcde
+
+    不识别: 纯数字 / 混合格式(a1b2c3) / IP / u_ 前缀 / URL 片段。
+    不做英文单词过滤: 字母房号随机, 可能恰好是 hello/game,
+    合法性由探针验证(查不到即失败, 不影响正常房间)。
     """
     ids = []
     seen = set()
     rest = text
-    # 1) 优先匹配 首字母+数字 形式(最明确, 零误报)
+    # 1) 先匹配数字房(oqrs + 数字, 结构最明确)
     for m in RELAY_NUM_RE.finditer(rest):
         rid = m.group(0).lower()
         if rid not in seen:
             seen.add(rid)
             ids.append(rid)
     rest = RELAY_NUM_RE.sub(" ", rest)
-    # 2) 再匹配 纯字母 国际房号(仅 h 开头)
+    # 2) 再匹配字母房(非 oqrs 开头的纯字母)
     for m in RELAY_ALPHA_RE.finditer(rest):
         rid = m.group(0).lower()
         if rid in seen:
-            continue
-        if rid in _ROOM_STOPWORDS:
             continue
         seen.add(rid)
         ids.append(rid)
@@ -129,6 +141,22 @@ def translate_error(text: str) -> str:
 def is_name_check_error(text: str) -> bool:
     """判断是否为探针名字被过滤错误 (可重试)"""
     return "Name Check" in text or "前置过滤" in text or "名字被" in text
+
+
+# 只有"房间确实存在、用户会关心"的失败原因才回传;
+# 其余(房间不存在 / 中继未响应 / 握手失败 / 节点限制 等)一律静默。
+# 设计核心: 自动触发时房号可能是英文单词误报, 大量失败绝不能刷屏。
+REPORTABLE_ERRORS = (
+    "房间已满", "房间已锁定", "游戏已经开始",
+    "已被封禁", "被移出房间",
+)
+
+def is_reportable_error(text: str) -> bool:
+    """该失败原因是否值得回传到群里(仅房间确实存在时)。"""
+    if not is_error_info(text):
+        return False
+    msg = translate_error(text)
+    return any(k in msg for k in REPORTABLE_ERRORS)
 
 
 def normalize_gid(gid) -> str:
@@ -453,6 +481,85 @@ class RWInfoPlugin(Star):
         month = v + 1
         return month, day, hour, minute, sec
 
+    @staticmethod
+    def _relay_challenge(a) -> str:
+        """由列表第 21 列(A 字段)推导 masterserver get 的挑战码。
+
+        反推自客户端 gameFramework/j/m.java 的 a(int i):
+            i < 100000  -> MD5("x"  + i)[:10]
+            i < 200000  -> MD5("y"  + i)[:11]
+            i < 300000  -> MD5("z"  + i)[:12]
+            i < 1000000 -> MD5("xx" + i)[:13]
+            i < 2000000 -> MD5("yy" + i)[:14]
+        实测 A=10605 -> "da7821ccf7"
+        """
+        try:
+            a = int(a)
+        except (TypeError, ValueError):
+            return "NA"
+        if a <= 0:
+            return ""
+        if a < 100000:
+            pre, n = "x", 10
+        elif a < 200000:
+            pre, n = "y", 11
+        elif a < 300000:
+            pre, n = "z", 12
+        elif a < 1000000:
+            pre, n = "xx", 13
+        elif a < 2000000:
+            pre, n = "yy", 14
+        else:
+            return "NA"
+        try:
+            import hashlib
+            return hashlib.md5((pre + str(a)).encode("utf-8")).hexdigest()[:n]
+        except Exception:
+            return ""
+
+    def _resolve_relay_addr(self, room_uuid: str, join_a) -> str:
+        """把中继房在列表里的入口地址解析成真实游戏地址(同步, 供 to_thread 调用)。
+
+        中继房(RELAY-CN 等通过 UPList 开放到官方列表)在列表里的 ip:port 全是
+        同一个入口(如 18.216.139.119:5158), 直连会被踢
+        "Your client is newer then the server"。
+        真实地址需向 masterserver 发 action=get, 参数 c 由 A 字段推导。
+        """
+        c = self._relay_challenge(join_a)
+        if not c or c == "NA":
+            return ""
+        import urllib.parse
+        import urllib.request
+        import gzip as _gzip
+        for base in ("http://gs1.corrodinggames.com/masterserver/1.4",
+                     "http://gs4.corrodinggames.net/masterserver/1.4"):
+            url = base + "/interface?" + urllib.parse.urlencode(
+                {"action": "get", "game_id": room_uuid, "c": c})
+            try:
+                req = urllib.request.Request(url, headers={
+                    "User-Agent": "rw android 176 en", "Language": "en"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = resp.read()
+                    if resp.headers.get("Content-Encoding") == "gzip":
+                        try:
+                            data = _gzip.decompress(data)
+                        except OSError:
+                            pass
+                text = data.decode("utf-8", "replace")
+            except Exception as e:
+                self.logger.debug(f"[查房] get 请求失败 {base}: {e}")
+                continue
+            rows = [x for x in text.splitlines() if x.strip()]
+            if len(rows) < 4 or rows[1].strip().upper() != "OK":
+                self.logger.debug(f"[查房] get 响应异常: {rows[:2]}")
+                continue
+            f = rows[3].split(",")
+            if len(f) > 5:
+                ip, port = f[3].strip(), f[5].strip()
+                if ip and port.isdigit():
+                    return f"{ip}:{port}"
+        return ""
+
     async def _query_room(self, rid: str, probe_name: str) -> str:
         if not os.path.exists(ROOM_INFO_PY):
             return f"[rwinfo] 找不到探针脚本: {ROOM_INFO_PY}"
@@ -606,7 +713,7 @@ class RWInfoPlugin(Star):
             f"【铁锈查房插件指令】v{PLUGIN_VERSION}",
             "",
             "—— 房间列表 ——",
-            "/铁锈列表 [页码]|[筛选]|[搜索 关键词]|[全部]|[刷新]",
+            "/铁锈列表 [页码]|[筛选]|[搜索 关键词]|[刷新]",
             "",
             "筛选:",
             "  模组|原版        是否使用 Mod",
@@ -615,9 +722,15 @@ class RWInfoPlugin(Star):
             "  真人|官方        数据来源",
             "",
             "页码: 纯数字, 如 2 表示第 2 页",
+            "刷新: 忽略缓存重新抓取",
             "组合: /铁锈列表 模组 房间中 2",
             "别名: /房间列表 /铁锈房列表 /rwlist",
             "/铁锈下一页 / 铁锈上一页",
+            "/铁锈查房 <序号|房号|IP:端口>",
+            "  序号来自列表, 房号如 r5132 / hytvvi",
+            "",
+            "给筛选词就整体替换旧筛选; 只给页码或翻页则沿用;",
+            "只发 /铁锈列表 (不带任何参数) 则重新查全部。",
             "",
             "—— 插件设置 ——",
             "/铁锈全局解析 开|关",
@@ -636,8 +749,9 @@ class RWInfoPlugin(Star):
             "",
             "—— 自动触发 ——",
             "群聊/私聊发房号自动查房",
-            "房型: 首字母+数字(r5132 a5132 h1234 o9999)",
-            "      h开头纯字母(hytvvi) | IP[:端口]",
+            "数字房: oqrs+数字(r5132 s1024 o9999 q7777)",
+            "字母房: 其他字母+纯字母(hytvvi aabcde babc)",
+            "两种房号均需 3 位以上",
         ]
 
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -657,7 +771,7 @@ class RWInfoPlugin(Star):
         known = {
             "铁锈查房帮助", "铁锈查房菜单", "铁锈帮助", "rwhelp",
             "铁锈列表", "房间列表", "铁锈房列表", "rwlist",
-            "铁锈下一页", "铁锈上一页",
+            "铁锈下一页", "铁锈上一页", "铁锈查房",
             "铁锈全局解析", "铁锈模式", "铁锈白名", "铁锈黑名",
             "铁锈私聊策略", "铁锈私聊开关", "铁锈玩家列表",
             "铁锈重试", "铁锈撤回", "铁锈查房调试",
@@ -706,12 +820,16 @@ class RWInfoPlugin(Star):
             return None
         return st
 
-    def _state_put(self, event, page, keyword, status, mod_filter, full, source):
+    def _state_put(self, event, page, keyword, status, mod_filter, full, source,
+                   total=0, addrs=None):
         """保存该 QQ 的状态并刷新过期时间(滑动续期)。"""
         uid = self._list_uid(event)
         self._list_page_state()[uid] = {
             "page": page, "keyword": keyword, "status": status,
             "mod": mod_filter, "full": full, "source": source,
+            "total": total,      # 总页数, 供翻页指令判断边界
+            # 本次筛选结果的直连地址(顺序与列表序号一致), 供 /铁锈查房 <序号> 使用
+            "addrs": list(addrs or []),
             "ts": time.time(),   # 每次动作都刷新 → 滑动过期
         }
 
@@ -823,7 +941,9 @@ class RWInfoPlugin(Star):
 
         page = 1
         force = False
-        # 本次是否显式给了筛选条件(没给则沿用该 QQ 上次的)
+        # 本次是否显式给了筛选条件:
+        #   给了 -> 整体丢弃旧筛选, 只用本次的
+        #   没给 -> 沿用该 QQ 上次的条件
         has_filter_arg = False
 
         # ---- 参数解析表: 单遍扫描, 支持 "模组 2" / "搜索 岛屿 2" / "刷新" ----
@@ -840,7 +960,7 @@ class RWInfoPlugin(Star):
             "auto": ("source", "official"),
         }
         RETAIN = ("搜索", "search")
-        RESET = ("全部", "所有", "all")
+        RESET_STATE = ("清空", "重置", "清除", "reset", "clear")
         REFRESH = ("刷新", "重载", "refresh")
 
         toks = arg.split()
@@ -869,10 +989,6 @@ class RWInfoPlugin(Star):
             elif t.startswith("search"):
                 keyword = t[6:].strip()
                 has_filter_arg = True
-            elif t in RESET:
-                keyword = ""; status = ""; mod_filter = ""
-                full = ""; source = "all"
-                has_filter_arg = True
             elif t in FILTER_WORDS:
                 field, val = FILTER_WORDS[t]
                 if field == "mod":
@@ -884,6 +1000,15 @@ class RWInfoPlugin(Star):
                 elif field == "source":
                     source = val
                 has_filter_arg = True
+            elif t in RESET_STATE:
+                # 彻底清空该 QQ 的筛选/翻页状态, 立即生效
+                uid = self._list_uid(event)
+                self._list_page_state().pop(uid, None)
+                yield event.plain_result(
+                    "已清空本账号的房间列表筛选状态\n"
+                    "下一条 /铁锈列表 将从全部房间重新开始"
+                )
+                return
             else:
                 bad = t
                 break
@@ -893,17 +1018,20 @@ class RWInfoPlugin(Star):
             yield event.plain_result(
                 f"无法识别的参数：{bad}\n\n"
                 "【房间列表用法】\n"
-                "/铁锈列表 [页码]|[筛选]|[搜索 关键词]|[全部]|[刷新]\n"
+                "/铁锈列表 [页码]|[筛选]|[搜索 关键词]|[刷新]\n"
                 "\n"
                 "筛选: 模组|原版  房间中|游戏中  满|不满  真人|官方\n"
                 "页码: 纯数字, 如 2 表示第 2 页\n"
+                "刷新: 忽略缓存重新抓取\n"
+                "给筛选词就整体替换旧筛选\n"
                 "组合: /铁锈列表 模组 房间中 2\n"
                 "/铁锈下一页 / 铁锈上一页"
             )
             return
 
-        # 本次没给筛选条件时, 沿用该 QQ 上次的条件(状态 60 秒过期)
-        if st and not has_filter_arg:
+        # 无参数 = 全新查询, 不继承任何筛选
+        # 只在「给了参数但没给筛选词」时沿用该 QQ 上次的条件(如 /铁锈列表 2、/铁锈下一页)
+        if st and toks and not has_filter_arg:
             keyword = st.get("keyword", "")
             status = st.get("status", "")
             mod_filter = st.get("mod", "")
@@ -943,7 +1071,7 @@ class RWInfoPlugin(Star):
 
         rooms = [r for r in rooms_all if match(r)]
         if not rooms:
-            yield event.plain_result("[房间列表] 没有符合条件的房间，试试 /铁锈列表 全部")
+            yield event.plain_result("[房间列表] 没有符合条件的房间，试试 /铁锈列表（不带参数）")
             return
 
         page_size = 5
@@ -957,7 +1085,16 @@ class RWInfoPlugin(Star):
         page_rooms = rooms[start:start + page_size]
 
         # 保存该 QQ 的翻页/筛选状态(滑动续期 60 秒)
-        self._state_put(event, page, keyword, status, mod_filter, full, source)
+        # addrs 只存当前页, 与列表展示的序号一一对应;
+        # 每项带 id/join_a, 供 /铁锈查房 <序号> 解析中继房的真实地址
+        self._state_put(event, page, keyword, status, mod_filter, full, source,
+                        total_pages,
+                        [{
+                            "addr": str(r.get("addr") or ""),
+                            "id": str(r.get("id") or ""),
+                            "name": str(r.get("name") or ""),
+                            "join_a": str(r.get("join_a") or "0"),
+                        } for r in page_rooms])
 
         # ---- 组装消息 ----
         conds = []
@@ -999,13 +1136,22 @@ class RWInfoPlugin(Star):
             mod = "模组" if rm.get("is_mod") else "原版"
             lines.append(f"{idx}. {host}　{pl}/{mx}　{sts}　{mod}")
             lines.append(f"   地图：{mapname}")
-            desc = (rm.get("desc") or "").strip()
-            if desc and desc != mapname and desc != "-":
-                lines.append(f"   备注：{desc[:30]}")
+            addr = str(rm.get("addr") or "").strip()
+            if addr:
+                # 中继入口地址(如 RELAY-CN 的 18.216.139.119:5158)只用于展示,
+                # 端口不是游戏端口, 填进 /铁锈查房 查不到; 真人房地址才可直连。
+                if rm.get("addr_direct", True):
+                    lines.append(f"   地址：{addr}")
+                else:
+                    lines.append(f"   入口：{addr}（中继房，用 /铁锈查房 房号 查询）")
+            hostname = str(rm.get("host") or "").strip()
+            if hostname and hostname not in host:
+                lines.append(f"   房主：{hostname[:24]}")
             if rm.get("source") == "official":
                 lines.append("   （官方自动房）")
 
         lines.append("")
+        lines.append("查房: /铁锈查房 <序号> 或 /铁锈查房 <房号|IP:端口>")
         nav = []
         if page > 1:
             nav.append("/铁锈上一页")
@@ -1025,7 +1171,12 @@ class RWInfoPlugin(Star):
         if not st:
             yield event.plain_result("请先发送 /铁锈列表（翻页状态按 QQ 号记住 60 秒）")
             return
-        nxt = st.get("page", 1) + 1
+        cur = st.get("page", 1)
+        total = st.get("total", 0)
+        if total and cur >= total:
+            yield event.plain_result(f"已经是最后一页了（第 {cur}/{total} 页）")
+            return
+        nxt = cur + 1
         async for r in self._cmd_list_impl(event, str(nxt)):
             yield r
 
@@ -1036,9 +1187,157 @@ class RWInfoPlugin(Star):
         if not st:
             yield event.plain_result("请先发送 /铁锈列表（翻页状态按 QQ 号记住 60 秒）")
             return
-        prv = max(1, st.get("page", 1) - 1)
+        cur = st.get("page", 1)
+        if cur <= 1:
+            yield event.plain_result("已经是第一页了")
+            return
+        prv = max(1, cur - 1)
         async for r in self._cmd_list_impl(event, str(prv)):
             yield r
+
+    @filter.command("铁锈查房")
+    async def cmd_query_room(self, event: AstrMessageEvent, arg: str = ""):
+        """显式查房: 按列表序号 / 房号 / IP:端口 查询.
+
+        与自动识别不同, 这里是用户明确指定目标, 因此失败原因必须回传(不静默)。
+        """
+        # AstrBot 只把第一个空格参数传给 arg, 这里从原始消息补全
+        arg = self._raw_args(event, arg, "铁锈查房")
+        arg = (arg or "").strip()
+        try:
+            is_private = bool(event.is_private_chat())
+        except Exception:
+            is_private = False
+        if not is_private and not event.is_admin():
+            return
+
+        USAGE = (
+            "用法: /铁锈查房 <序号|房号|IP:端口>\n"
+            "  序号: 先发 /铁锈列表, 再填列表里的序号, 如 /铁锈查房 2\n"
+            "  房号: r5132 / s1024 / hytvvi\n"
+            "  直连: 1.2.3.4 或 1.2.3.4:5123"
+        )
+        if not arg:
+            yield event.plain_result(USAGE)
+            return
+
+        # ---- 解析目标 ----
+        target = ""
+        desc = ""
+        if IP_QUERY_RE.match(arg):
+            # IP / IP:端口 原样交给 room_info.py (其内部识别为直连目标)
+            target = arg
+            desc = arg
+        elif arg.isdigit():
+            # 纯数字 = 列表序号(纯数字本身不是房号)
+            st = self._state_get(event)
+            addrs = (st or {}).get("addrs") or []
+            if not addrs:
+                yield event.plain_result(
+                    "请先发送 /铁锈列表（序号取自最近一次列表结果，60 秒内有效）"
+                )
+                return
+            n = int(arg)
+            if n < 1 or n > len(addrs):
+                yield event.plain_result(
+                    f"序号超出范围：当前页共 {len(addrs)} 条"
+                )
+                return
+            item = addrs[n - 1]
+            if isinstance(item, dict):
+                target = str(item.get("addr") or "").strip()
+                room_uuid = str(item.get("id") or "").strip()
+                join_a = str(item.get("join_a") or "0").strip()
+                label = str(item.get("name") or "").strip()
+            else:
+                target = str(item or "").strip()
+                room_uuid = join_a = label = ""
+            if not target:
+                yield event.plain_result(
+                    f"第 {n} 条没有可用的直连地址，无法查询"
+                )
+                return
+            # 中继入口地址(UPList)不能直连, 先向 masterserver 换取真实地址
+            if join_a and join_a != "0" and room_uuid:
+                yield event.plain_result(
+                    f"第 {n} 条是中继房，正在解析真实地址…"
+                )
+                real = await asyncio.to_thread(
+                    self._resolve_relay_addr, room_uuid, join_a
+                )
+                if real:
+                    target = real
+                else:
+                    yield event.plain_result(
+                        f"第 {n} 条的中继地址解析失败（房间可能已关闭或已下架）"
+                    )
+                    return
+            desc = f"第 {n} 条 {target}"
+            if label:
+                desc = f"第 {n} 条 {label} {target}"
+        else:
+            rids = extract_room_ids(arg)
+            if not rids:
+                yield event.plain_result(
+                    f"无法识别的房号：{arg}\n\n" + USAGE
+                )
+                return
+            target = rids[0]
+            desc = target
+
+        # ---- 分配探针并查询 ----
+        idx = self._acquire_probe()
+        if idx is None:
+            yield event.plain_result("探针全部被占用，请稍后再试")
+            return
+
+        result = ""
+        try:
+            max_retry = 1
+            try:
+                max_retry = max(1, int(self.config.get("retry_times", 3)))
+            except (TypeError, ValueError):
+                max_retry = 1
+            attempt = 0
+            while attempt < max_retry:
+                attempt += 1
+                # 第一次带时间后缀; 后续缩短名字, 降低被过滤概率
+                if attempt == 1:
+                    probe_name = f"ABAB探针{idx:02d}_{self._short_ts()}"
+                else:
+                    probe_name = f"ABAB探针{idx:02d}_{attempt}"
+                try:
+                    result = await asyncio.wait_for(
+                        self._query_room(target, probe_name),
+                        timeout=QUERY_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    result = ""
+                except Exception as e:
+                    self.logger.error(f"[查房] {target} 查询异常: {e}")
+                    result = ""
+                if is_room_info(result):
+                    break
+                if not is_name_check_error(result):
+                    break
+                self.logger.debug(
+                    f"[查房] {target} 探针名被过滤, 重试({attempt}/{max_retry})"
+                )
+        finally:
+            self._release_probe(idx)
+
+        # ---- 回传(显式查房不静默, 必须给出原因) ----
+        if is_room_info(result):
+            await self._send_room_result(event, result)
+            return
+        if not result:
+            yield event.plain_result(
+                f"[查房] {desc} 无响应（房间不存在 / 中继繁忙 / 地址不可达）"
+            )
+        elif is_error_info(result):
+            yield event.plain_result(translate_error(result))
+        else:
+            yield event.plain_result(f"[查房] {desc}\n{result[:800]}")
 
     @filter.command("铁锈全局解析")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1400,11 +1699,6 @@ class RWInfoPlugin(Star):
                 return
 
             rids = extract_room_ids(text)
-            # IP / IP:端口 直连地址也算房号(room_info.py 会自动识别为直连目标)
-            for ipm in DIRECT_RE.finditer(text):
-                ipstr = ipm.group(0)
-                if ipstr not in rids:
-                    rids.append(ipstr)
             if not rids:
                 return
 
@@ -1428,12 +1722,16 @@ class RWInfoPlugin(Star):
                     del self.room_cooldown[rid]
                 self._last_cleanup = now
             to_query = []
+            try:
+                max_per_msg = max(1, int(self.config.get("probe_max_per_msg", 5)))
+            except (TypeError, ValueError):
+                max_per_msg = 5
             for rid in rids:
                 last = self.room_cooldown.get(rid, 0)
                 if now - last >= COOLDOWN:
                     self.room_cooldown[rid] = now
                     to_query.append(rid)
-                if len(to_query) >= 5:
+                if len(to_query) >= max_per_msg:
                     break
             if not to_query:
                 self.logger.debug("所有房号均在冷却中")
@@ -1482,7 +1780,10 @@ class RWInfoPlugin(Star):
                                 retried = 0
                                 while retried < max_retry:
                                     retried += 1
-                                    await self._send_recallable(event, f"[房间查询] 重试中({retried}/{max_retry})")
+                                    # 重试过程静默, 只在 debug 日志留痕(避免刷屏)
+                                    self.logger.debug(
+                                        f"房间 {rid} 探针名被过滤, "
+                                        f"重试({retried}/{max_retry})")
                                     # 重试时去掉时间后缀, 直接 _序号 最短, 最不容易被过滤
                                     # 用当前任务的 idx 构造, 避免 for 循环残留的 base_name 串号
                                     new_name = f"ABAB探针{idx:02d}_{retried}"
@@ -1507,14 +1808,34 @@ class RWInfoPlugin(Star):
                                         await self._send_room_result(event, retry_result)
                                         break
                                     if not is_name_check_error(retry_result):
-                                        if is_error_info(retry_result):
-                                            yield event.plain_result(translate_error(retry_result))
+                                        if is_reportable_error(retry_result):
+                                            yield event.plain_result(
+                                                translate_error(retry_result))
+                                        else:
+                                            self.logger.debug(
+                                                f"房间 {rid} 重试失败(静默): "
+                                                f"{retry_result[:120]}")
                                         break
                                 else:
-                                    yield event.plain_result(translate_error(result))
+                                    # 重试次数用尽: 仅当失败原因值得回传才发
+                                    if is_reportable_error(result):
+                                        yield event.plain_result(
+                                            translate_error(result))
+                                    else:
+                                        self.logger.debug(
+                                            f"房间 {rid} 重试耗尽(静默): "
+                                            f"{result[:120]}")
                             elif is_error_info(result):
-                                self.logger.info(f"房间 {rid} 查询失败，回传原因")
-                                yield event.plain_result(translate_error(result))
+                                # 仅"房间确实存在"类错误回传, 其余静默
+                                if is_reportable_error(result):
+                                    self.logger.info(
+                                        f"房间 {rid} 查询失败，回传原因")
+                                    yield event.plain_result(
+                                        translate_error(result))
+                                else:
+                                    self.logger.debug(
+                                        f"房间 {rid} 查询失败(静默): "
+                                        f"{result[:120]}")
                             else:
                                 self.logger.debug(f"房间 {rid} 无有效信息, 静默丢弃")
                             released.add(idx)  # 先标记再释放, 确保 finally 不重复释放

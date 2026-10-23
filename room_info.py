@@ -825,7 +825,8 @@ def fetch_qroom_list(timeout=None) -> list:
 
     统一结构:
       source      "qroom"
-      id          房号(internal_id, 纯数字, 不展示给用户)
+      id          平台内部编号(internal_id, 纯数字, 不能用于查房)
+      addr        直连地址 ip:port, 可直接用于查房(可能为空)
       name        房主名
       map         地图名(已去掉 .tmx 后缀)
       players     当前人数
@@ -877,9 +878,16 @@ def fetch_qroom_list(timeout=None) -> list:
         if mapname.lower().endswith(".tmx"):
             mapname = mapname[:-4]
         started = _as_int(r.get("is_started"), 0)
+        # 直连地址: 接口自带 host_ip / host_port, 是唯一能用来查房的入口
+        host_ip = str(r.get("host_ip") or "").strip()
+        host_port = str(r.get("host_port") or "").strip()
+        addr = ""
+        if host_ip:
+            addr = f"{host_ip}:{host_port}" if host_port else host_ip
         rooms.append({
             "source": "qroom",
             "id": str(r.get("internal_id") or "").strip(),
+            "addr": addr,
             "name": str(r.get("host_name") or "").strip() or "?",
             "map": mapname or "?",
             "players": _as_int(r.get("current_players"), 0),
@@ -910,25 +918,24 @@ def _clean(s):
 
 
 # ================================================================ 房间列表 / 广告过滤
-# 官方 masterserver 返回的列表里混有大量第三方(RW-HPS 等)刷出来的广告房。
+# 官方 masterserver 返回的列表里混有大量第三方刷出来的推广房, 需要过滤。
 #
-# 【只用结构性判据, 不使用人数】—— 人数由服务器自行上报, 可随意伪造(实测有
-# 6360/64921、9720、89842 等), 用它判断必然误杀真百人房。
+# 【两条铁律】
+#   1. 不使用人数: 人数由服务器自行上报, 可随意伪造(实测 6360/64921、9720、
+#      89842、943438591 等), 用它判断必然误杀真百人房。
+#   2. 不使用 ip:port、不使用控制字符: RELAY-CN 等中继把真人房开放到列表
+#      (UPList)时, 所有房间共用同一个入口 ip:port(18.216.139.119:5158),
+#      且房名/房主名/描述都被加上 \x01 前缀(如房主名 "\x01测试房")。
+#      这两类特征对真人房与广告房完全一样, 据此判断会误杀全部中继真人房。
 #
-# 实测 349 条样本归纳出的可靠结构特征:
-#   ┌ LINK / url: 条目 ──────── 官方列表里的 Discord / QQ 群链接, 不是房间
-#   ├ 含控制字符(\x01 等) ───── 广告机注入的排版符, 真人无法输入
-#   │                          实测 167 条, 端口 100% 是 5158, 同一广告农场
-#   ├ ip 非合法 IPv4 ────────── 无效条目
-#   ├ port 非数字 ───────────── 无效条目
-#   └ 同 ip:port 重复 ───────── 同一台服务器的重复上报
+# 【实际判据, 全部是文本内容层面】
+#   a. 链接条目(mode/status=LINK 或 ip 以 url: 开头)      —— classify_room
+#   b. 字段无效(ip 非 IPv4 / port 非数字)                 —— classify_room
+#   c. 房主名或描述是中继自身入口, 且房间空置(0 人)        —— _is_relay_entry
+#   d. 房名/房主名/描述带拉群推广话术(群号/加群/直播等)    —— _is_group_ad
+#   e. 同一房间 UUID 重复上报                             —— fetch_official_rooms
 #
-# 真房特征(NORMAL): port 分散在 5123~5181, 名字/描述为正常文本。
-
-def _has_ctrl(s: str) -> bool:
-    """是否含控制字符。广告机用 \\x01 等做排版, 真人聊天/房名不可能包含。"""
-    return any(ord(c) < 32 and c not in "\t\n\r" for c in (s or ""))
-
+# 实测 340 行样本: 保留 295 条真人房, 剔除 41 条拉群广告 + 3 条空置入口 + 1 条链接。
 
 _IPV4_RE = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
 
@@ -938,17 +945,18 @@ def classify_room(room: dict) -> tuple:
 
     类别:
       "link"    —— 链接条目(Discord/QQ 群), 不是房间
-      "ad"      —— 广告房(含控制字符)
       "invalid" —— 字段无效(ip/port 不合法)
       "ok"      —— 结构正常的房间(仍需按 status 判断是否可加入)
+
+    注意: 这里**不再**把"含控制字符"判为广告。
+    原因: RELAY-CN 给所有开放到列表的真人房都加 \\x01 前缀
+    (如房主名 "\\x01测试房"), 按控制字符删会误杀真人房。
+    广告改为在 fetch_official_rooms 里按内容特征判断。
     """
     ip = (room.get("ip") or "").strip()
     port = (room.get("port") or "").strip()
     mode = (room.get("mode") or "").strip()
     status = (room.get("status") or "").strip()
-    # 广告判定必须用未清洗的原始字段(否则 \x01 已被 _clean 删掉, 永远检测不到)
-    name = room.get("name_raw", room.get("name") or "")
-    desc = room.get("desc_raw", room.get("desc") or "")
 
     # 1. 链接条目: mode/status 为 LINK, 或 ip 形如 url:xxx
     if mode.upper() == "LINK" or status.upper() == "LINK":
@@ -956,11 +964,7 @@ def classify_room(room: dict) -> tuple:
     if ip.lower().startswith("url:"):
         return "link", "网页链接"
 
-    # 2. 广告房: 房名/描述含控制字符(广告机排版符)
-    if _has_ctrl(name) or _has_ctrl(desc):
-        return "ad", "含控制字符"
-
-    # 3. 字段无效
+    # 2. 字段无效
     if not ip:
         return "invalid", "缺少IP"
     if not _IPV4_RE.fullmatch(ip):
@@ -987,13 +991,16 @@ def _parse_room_line(line: str, index: int) -> dict:
         return _clean(f[i]) if len(f) > i and f[i] else d
     def raw(i):
         return f[i] if len(f) > i else ""
-    # 22 字段含义(实测 351 条样本):
-    #   0 房间UUID  1 房名        2 版本号      3 对外IP
-    #   4 内网IP    5 端口        6 ?          7 SERVER/CLIENT
-    #   8 ?         9 描述        10 模式       11 状态
-    #   12 游戏版本 13 ?           14 描述(备用) 15 当前人数
-    #   16 人数上限 17 ?           18 UUID副本   19 ?
-    #   20 ?        21 端口(辅助)
+    # 22 字段含义(按客户端 j/r.smali 反编译逐列核实):
+    #   0  房间UUID        1  房名            2  版本号
+    #   3  对外IP          4  内网IP          5  端口
+    #   6  ?               7  房主名(created_by)
+    #   8  ?               9  描述
+    #   10 模式(skirmishMap/customMap/LINK)   11 状态(battleroom/ingame/LINK)
+    #   12 游戏版本        13 ?               14 描述(备用)
+    #   15 当前人数        16 人数上限        17 ?
+    #   18 UUID副本        19 ?               20 ?
+    #   21 A 字段(客户端 gl.java: 非0 时用 get|UUID|A|.. 方式加入)
     return {
         "idx": index,
         "id": g(0),
@@ -1002,59 +1009,267 @@ def _parse_room_line(line: str, index: int) -> dict:
         "ip": g(3),
         "lan_ip": g(4),
         "port": g(5),
-        "type": g(7),
+        "host": g(7),          # 房主名 created_by
+        "type": g(7),          # 兼容旧字段名
         "mode": g(10),
         "status": g(11),
         "game_ver": g(12),
         "desc": g(9) or g(14, ""),
         "players": g(15, "0"),
         "max": g(16, "?"),
+        "join_a": g(21),
         # 原始未清洗字段: 仅用于广告判定, 不对外展示
         "name_raw": raw(1),
+        "host_raw": raw(7),
         "desc_raw": raw(9) or raw(14),
         "raw": line,
     }
 
+# 广告判定原则: 只看内容, 且必须同时检查"房名(1) / 房主名(7) / 描述(9/14)"。
+#
+# 踩过的坑(全部实测纠正):
+#   1. 曾按"同一 ip:port 上报 >= 8 条即广告农场"聚合剔除 → 把 RELAY-CN 入口下
+#      所有真人房(含用户的"测试房")全删了。中继房注册进列表时 ip:port 必然
+#      是入口地址, 聚合判据必然误杀。
+#   2. 曾把"含控制字符"当广告特征 → RELAY-CN 给每个开放到列表的真人房都加
+#      \x01 前缀(房主名形如 "\x01测试房"), 按控制字符删同样误杀真人房。
+#   3. 曾只检查描述列 → 中继入口标识 "RELAY-CN 入口" 实际在房主名列(第7列)。
+#
+# 正确的判据(纯内容层面):
+#   a. 链接条目(url: / LINK)                    —— classify_room
+#   b. 房主名/描述是"中继自身入口"且房间空置      —— _is_relay_entry
+#   c. 房主名/描述是拉群推广话术                  —— _is_group_ad
+
+# 中继自身入口: 房主名或描述含 RELAY / 中继 / 入口 等字样。
+# 这类条目是 0/1000~0/10 的入口占位, 不是可玩的房间。
+_RELAY_ENTRY_RE = re.compile(
+    r"(?:^|[^A-Za-z])(?:RELAY|Relay)(?:[^A-Za-z]|$)"
+    r"|中继|入口|节[点點]",
+    re.IGNORECASE,
+)
+
+
+def _is_relay_entry(host: str, desc: str) -> bool:
+    """房主名或描述是否为中继自身的入口占位条目。
+
+    只判断标识本身; 房间是否为空置由调用方结合人数决定(空置入口才剔除,
+    有人的入口可能正是用户自己的房)。
+    """
+    blob = f"{host or ''} {desc or ''}"
+    return bool(_RELAY_ENTRY_RE.search(blob))
+
+
+# 拉群广告: 描述里带 QQ 群号 / 群 / 加群 / 进群 / 关注 / 直播 等推广话术。
+# 这类条目房名可能是正常文本, 但描述必然是推广; 真人开房不会在描述里写群号。
+_GROUP_AD_RE = re.compile(
+    r"群号\s*\d{6,}"          # 群号1092595121
+    r"|\d{6,}\s*群"           # 762601886群
+    r"|加群|进群|入群|进裙|加裙"
+    r"|QQ\s*群|企鹅群|交流群|官方群|玩家群|开黑群"
+    r"|直播间|直播服务器"
+    r"|一键加群|点击加群|扫码加",
+    re.IGNORECASE,
+)
+
+
+def _is_group_ad(name: str, host: str, desc: str) -> bool:
+    """房名/房主名/描述是否为拉群推广。
+
+    只按文本内容判断, 与 ip:port、人数、房名是否正常无关。
+    """
+    blob = f"{name or ''} {host or ''} {desc or ''}"
+    return bool(_GROUP_AD_RE.search(blob))
+
 
 def _normalize_official(room: dict) -> dict:
     """把 Official Room List 的一条记录转成统一结构。"""
-    mapname = room.get("desc") or "?"
+    oip = str(room.get("ip") or "").strip()
+    oport = str(room.get("port") or "").strip()
+    oaddr = f"{oip}:{oport}" if oip and oport else oip
+
+    # 房名(第1列)常是 "Unnamed", 真正的标识在房主名(第7列)。
+    # 客户端列表也同时展示这两列(gi.java: fVar.n 与 fVar.t\fVar.u),
+    # 因此这里两者都保留, 展示时优先用房主名。
+    name = (room.get("name") or "").strip()
+    host = (room.get("host") or "").strip()
+    if not name or name.lower() == "unnamed":
+        display = host or name or "?"
+    else:
+        display = name if not host or host == name else f"{name}（{host}）"
+
+    # 地图名: 描述列常见 "Crossing Large (10p)" / "Auto Server 4+ [US-E #3]"
+    desc = (room.get("desc") or "").strip()
+    status = (room.get("status") or "").strip().lower() or "unknown"
+
+    # 该地址能否直接查房:
+    # 中继房(RELAY-CN 等把真人房开放到列表时)统一挂在入口 ip:5158 上,
+    # 那只是注册入口, 不是游戏端口, 直连查不到; 必须用房号走中继查询。
+    # 判据: 中继入口地址(5158/RELAY 相关) 或 内网IP 为 127.0.0.1 的转发房。
+    lan_ip = str(room.get("lan_ip") or "").strip()
+    addr_direct = True
+    if oport == "5158" or lan_ip in ("127.0.0.1", "10.0.0.1"):
+        addr_direct = False
+
     return {
         "source": "official",
         "id": room.get("id", ""),
-        "name": room.get("name") or "?",
-        "map": "-",                       # Official 列表不带地图名
+        "addr": oaddr,
+        "addr_direct": addr_direct,
+        "join_a": str(room.get("join_a") or "0").strip(),
+        "name": display,
+        "host": host,
+        "map": desc or "-",
         "players": _as_int(room.get("players"), 0),
         "max": _as_int(room.get("max"), 0),
-        "status": (room.get("status") or "").strip().lower() or "unknown",
+        "status": status,
         "is_mod": False,
-        "is_started": 1 if (room.get("status") or "").strip().lower() == "ingame" else 0,
-        "desc": mapname,                  # Auto Server 的标识放描述
+        "is_started": 1 if status == "ingame" else 0,
+        "desc": desc,
         "raw": room,
     }
 
 
+def _challenge_code(a: int) -> str:
+    """根据列表第 21 列(A 字段)生成 masterserver get 的挑战码。
+
+    反推自客户端 gameFramework/j/m.java 的 a(int i):
+        i == 0        -> ""
+        i < 100000    -> MD5("x"  + i)[:10]
+        i < 200000    -> MD5("y"  + i)[:11]
+        i < 300000    -> MD5("z"  + i)[:12]
+        i < 1000000   -> MD5("xx" + i)[:13] (+ "-" + 另一段)
+        i < 2000000   -> MD5("yy" + i)[:14] (+ "-" + 另一段)
+        其它          -> "NA"
+
+    实测 A=10605 -> "da7821ccf7", action=get 返回 OK。
+    """
+    try:
+        a = int(a)
+    except (TypeError, ValueError):
+        return "NA"
+    if a <= 0:
+        return ""
+    if a < 100000:
+        pre, n = "x", 10
+    elif a < 200000:
+        pre, n = "y", 11
+    elif a < 300000:
+        pre, n = "z", 12
+    elif a < 1000000:
+        pre, n = "xx", 13
+    elif a < 2000000:
+        pre, n = "yy", 14
+    else:
+        return "NA"
+    return hashlib.md5((pre + str(a)).encode("utf-8")).hexdigest()[:n]
+
+
+def resolve_official_addr(room: dict, timeout: int = 15) -> str:
+    """把中继房在列表里的入口地址解析成真实游戏地址。
+
+    背景: RELAY-CN 等中继把真人房开放到官方列表(UPList)时, 所有房间的
+    ip/port 都是同一个入口(如 18.216.139.119:5158), 直接连会被踢
+    ("Your client is newer then the server")。真实地址需要向 masterserver
+    发 action=get 查询, 而 get 需要一个由 A 字段推导出的挑战码 c。
+
+    返回 "ip:port", 失败返回空串。
+    """
+    uuid_ = (room.get("id") or "").strip()
+    raw = room.get("raw") or {}
+    a = room.get("join_a") or raw.get("join_a") or "0"
+    # 不必解析的地址: A 为 0 说明列表里的 ip:port 就是真实地址
+    try:
+        if int(str(a).strip() or "0") == 0:
+            return ""
+    except ValueError:
+        return ""
+    c = _challenge_code(a)
+    if not c or c == "NA":
+        return ""
+    for base in MASTERSERVERS:
+        params = {"action": "get", "game_id": uuid_, "c": c}
+        url = base + "/interface?" + urllib.parse.urlencode(params)
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": f"rw android {CLIENT_VER} en", "Language": "en"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read()
+                if resp.headers.get("Content-Encoding") == "gzip":
+                    try:
+                        data = gzip.decompress(data)
+                    except OSError:
+                        pass
+            text = data.decode("utf-8", "replace")
+        except Exception:
+            continue
+        rows = [x for x in text.splitlines() if x.strip()]
+        # 响应: CORRODINGGAMES[1.0] / OK / <哈希> / <房间CSV>
+        if len(rows) < 4 or rows[1].strip().upper() != "OK":
+            continue
+        f = rows[3].split(",")
+        if len(f) > 5:
+            ip, port = f[3].strip(), f[5].strip()
+            if ip and port.isdigit():
+                return f"{ip}:{port}"
+    return ""
+
+
 def fetch_official_rooms(include_all: bool = False) -> list:
-    """拉取 Official Room List (官方 masterserver), 过滤广告后返回统一结构。"""
+    """拉取 Official Room List (官方 masterserver), 过滤广告后返回统一结构。
+
+    ⚠ 广告判定只用内容特征, 不做 ip:port 聚合, 也不按控制字符判定。
+    RELAY-CN 把真人房开放到列表(UPList)时:
+      · 所有房间共用同一个入口 ip:port (18.216.139.119:5158)
+      · 所有房间的房名/房主名/描述都带 \\x01 前缀
+    这两种特征对真人房与广告房完全一样, 因此都不能作为判据。
+
+    真正的区别在文本内容:
+      1. classify_room   —— 链接条目 / 字段非法
+      2. _is_relay_entry —— 房主名或描述是中继自身入口(且房间空置)
+      3. _is_group_ad    —— 房主名或描述带群号/加群/直播等推广话术
+    """
     lines = masterserver_request({"action": "list", "game_version": str(CLIENT_VER),
                                   "game_version_beta": "false"})
     if not lines:
         return []
+
     rooms = []
-    seen_ep = set()
+    seen_id = set()
     for i, line in enumerate(lines[1:]):
         if not line.strip():
             continue
         room = _parse_room_line(line, i)
         kind, why = classify_room(room)
+        if not include_all and kind != "ok":
+            continue
+
+        name = room.get("name") or ""
+        host = room.get("host") or ""
+        desc = (room.get("desc") or "").strip()
+        try:
+            players = int(str(room.get("players") or "0").strip() or "0")
+        except ValueError:
+            players = 0
+
+        # 中继自身入口占位: "RELAY-CN 入口" / "Relay ASIA2" 之类, 且没人
+        # (有人的入口条目不排除 —— 那可能就是某个玩家自己的房间)
+        if _is_relay_entry(host, desc) and players <= 0:
+            kind, why = "ad", "中继入口占位"
+        # 拉群推广
+        if kind == "ok" and _is_group_ad(name, host, desc):
+            kind, why = "ad", "拉群广告"
+
         room["kind"] = kind
         room["kind_reason"] = why
         if not include_all and kind != "ok":
             continue
-        ep = (room.get("ip", ""), room.get("port", ""))
-        if ep in seen_ep:
+
+        # 按房间 UUID 去重(真房 UUID 唯一; 广告机会重复上报同一 UUID)
+        rid = room.get("id") or ""
+        if rid and rid in seen_id:
             continue
-        seen_ep.add(ep)
+        if rid:
+            seen_id.add(rid)
         rooms.append(_normalize_official(room))
     return rooms
 
@@ -1954,12 +2169,29 @@ def direct_main():
     # 无端口时直接默认 5123, 避免 rpartition 把整个地址当端口
     if ":" in DIRECT_TARGET:
         ip, _, port = DIRECT_TARGET.rpartition(":")
-        port = int(port or 5123)
+        try:
+            port = int(port or 5123)
+        except ValueError:
+            print(f"[房间查询失败] 端口无效: {DIRECT_TARGET}")
+            sys.exit(0)
     else:
         ip, port = DIRECT_TARGET, 5123
     if not QUIET:
         print(f"=== 直连 {ip}:{port} (客户端 1.15) ===")
-    s, probe = connect_and_161(ip, port)
+    # 直连地址不一定是游戏服务器(可能是 Web/其他服务), 连接失败属正常情况,
+    # 必须输出 [房间查询失败] 而非抛 traceback, 否则插件无法归类失败原因。
+    try:
+        s, probe = connect_and_161(ip, port)
+    except (socket.timeout, TimeoutError):
+        print(f"[房间查询失败] 连接 {ip}:{port} 超时（地址不可达或非游戏服务器）")
+        sys.exit(0)
+    except (OSError, ConnectionError) as e:
+        print(f"[房间查询失败] 连接 {ip}:{port} 失败（{type(e).__name__}，"
+              f"地址不可达或非游戏服务器）")
+        sys.exit(0)
+    except Exception as e:
+        print(f"[房间查询失败] 连接 {ip}:{port} 失败（{type(e).__name__}）")
+        sys.exit(0)
     sid = probe.server_id
     if not QUIET:
         print(f"[1] 已连, sid={sid!r} conn={probe.conn_id}")
