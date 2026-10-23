@@ -1042,6 +1042,9 @@ def _parse_room_line(line: str, index: int) -> dict:
         "desc": g(9) or g(14, ""),
         "players": g(15, "0"),
         "max": g(16, "?"),
+        # 第 21 列: 加入方式。0 = 列表里的 ip:port 就是真实地址;
+        # 非 0 = 中继房, 需要向 masterserver 发 action=get 换真实地址。
+        "join_a": g(21),
         # 原始未清洗字段: 仅用于内容判定, 不对外展示
         "name_raw": raw(1),
         "host_raw": raw(7),
@@ -1149,6 +1152,92 @@ def _is_group_ad(name: str, host: str, desc: str) -> bool:
     return True
 
 
+def _challenge_code(a) -> str:
+    """根据列表第 21 列(A 字段)生成 masterserver get 的挑战码。
+
+    反推自客户端 gameFramework/j/m.java 的 a(int i):
+        i == 0        -> ""
+        i < 100000    -> MD5("x"  + i)[:10]
+        i < 200000    -> MD5("y"  + i)[:11]
+        i < 300000    -> MD5("z"  + i)[:12]
+        i < 1000000   -> MD5("xx" + i)[:13]
+        i < 2000000   -> MD5("yy" + i)[:14]
+        其它          -> "NA"
+
+    实测 A=10605 -> "da7821ccf7", action=get 返回 OK。
+    """
+    try:
+        a = int(a)
+    except (TypeError, ValueError):
+        return "NA"
+    if a <= 0:
+        return ""
+    if a < 100000:
+        pre, n = "x", 10
+    elif a < 200000:
+        pre, n = "y", 11
+    elif a < 300000:
+        pre, n = "z", 12
+    elif a < 1000000:
+        pre, n = "xx", 13
+    elif a < 2000000:
+        pre, n = "yy", 14
+    else:
+        return "NA"
+    return hashlib.md5((pre + str(a)).encode("utf-8")).hexdigest()[:n]
+
+
+def resolve_official_addr(room: dict, timeout: int = 15) -> str:
+    """把中继房在列表里的入口地址解析成真实游戏地址。
+
+    中继房(RELAY-CN 等通过 UPList 开放到官方列表)在列表里的 ip:port 全是
+    同一个入口(如 18.216.139.119:5158), 直连会被踢
+    "Your client is newer then the server"。真实地址需向 masterserver 发
+    action=get, 参数 c 由 A 字段推导。
+
+    仅内部使用; 结果只用于连接, 不对外展示。
+    返回 "ip:port", 失败返回空串。
+    """
+    uuid_ = (room.get("id") or "").strip()
+    raw = room.get("raw") or {}
+    a = room.get("join_a") or raw.get("join_a") or "0"
+    # A == 0 说明列表里的 ip:port 就是真实地址, 无需解析
+    try:
+        if int(str(a).strip() or "0") == 0:
+            return ""
+    except ValueError:
+        return ""
+    c = _challenge_code(a)
+    if not c or c == "NA":
+        return ""
+    for base in MASTERSERVERS:
+        params = {"action": "get", "game_id": uuid_, "c": c}
+        url = base + "/interface?" + urllib.parse.urlencode(params)
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": f"rw android {CLIENT_VER} en", "Language": "en"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read()
+                if resp.headers.get("Content-Encoding") == "gzip":
+                    try:
+                        data = gzip.decompress(data)
+                    except OSError:
+                        pass
+            text = data.decode("utf-8", "replace")
+        except Exception:
+            continue
+        rows = [x for x in text.splitlines() if x.strip()]
+        # 响应: CORRODINGGAMES[1.0] / OK / <哈希> / <房间CSV>
+        if len(rows) < 4 or rows[1].strip().upper() != "OK":
+            continue
+        f = rows[3].split(",")
+        if len(f) > 5:
+            ip, port = f[3].strip(), f[5].strip()
+            if ip and port.isdigit():
+                return f"{ip}:{port}"
+    return ""
+
+
 def _normalize_official(room: dict) -> dict:
     """把 Official Room List 的一条记录转成统一结构。"""
     oip = str(room.get("ip") or "").strip()
@@ -1182,6 +1271,8 @@ def _normalize_official(room: dict) -> dict:
         "is_mod": False,
         "is_started": 1 if status == "ingame" else 0,
         "desc": desc,
+        # 中继房判定所需(仅内部使用, 不展示): 非 0 表示列表地址是注册入口
+        "join_a": str(room.get("join_a") or "0").strip(),
         # 筛选结果(只在 include_all=True 时有意义, 便于调试)
         "kind": room.get("kind") or "ok",
         "kind_reason": room.get("kind_reason") or "",
@@ -1748,7 +1839,10 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
     else:
         lines.append(f"使用Mod：原版（{unit_count} 内置单位）")
 
-    lines.append(f"ID：{rid}")
+    # 只展示房号类标识(Q57390 / r5132 / u_xxx), 不展示 IP 形式的目标地址
+    _rid_s = str(rid or "").strip()
+    if _rid_s and not re.fullmatch(r"[\d.]+:\d+", _rid_s):
+        lines.append(f"ID：{_rid_s}")
 
     if show_players:
         if players_detail:

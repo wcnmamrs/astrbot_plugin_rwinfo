@@ -4,6 +4,7 @@
 AstrBot 插件: 铁锈战争房间查询 (rwinfo)
 """
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -609,6 +610,82 @@ class RWInfoPlugin(Star):
         month = v + 1
         return month, day, hour, minute, sec
 
+    @staticmethod
+    def _relay_challenge(a) -> str:
+        """由列表第 21 列(A 字段)推导 masterserver get 的挑战码。
+
+        反推自客户端 gameFramework/j/m.java 的 a(int i):
+            i < 100000  -> MD5("x"  + i)[:10]
+            i < 200000  -> MD5("y"  + i)[:11]
+            i < 300000  -> MD5("z"  + i)[:12]
+            i < 1000000 -> MD5("xx" + i)[:13]
+            i < 2000000 -> MD5("yy" + i)[:14]
+        实测 A=10605 -> "da7821ccf7"
+        """
+        try:
+            a = int(a)
+        except (TypeError, ValueError):
+            return "NA"
+        if a <= 0:
+            return ""
+        if a < 100000:
+            pre, n = "x", 10
+        elif a < 200000:
+            pre, n = "y", 11
+        elif a < 300000:
+            pre, n = "z", 12
+        elif a < 1000000:
+            pre, n = "xx", 13
+        elif a < 2000000:
+            pre, n = "yy", 14
+        else:
+            return "NA"
+        return hashlib.md5((pre + str(a)).encode("utf-8")).hexdigest()[:n]
+
+    def _resolve_relay_addr(self, room_uuid: str, join_a) -> str:
+        """把中继房在列表里的入口地址解析成真实游戏地址(同步, 供 to_thread 调用)。
+
+        中继房在列表里的 ip:port 全是同一个注册入口(如 18.216.139.119:5158),
+        直连会被踢 "Your client is newer then the server"。真实地址需向
+        masterserver 发 action=get, 参数 c 由 A 字段推导。
+
+        仅内部连接使用, 结果不对外展示。
+        """
+        c = self._relay_challenge(join_a)
+        if not c or c == "NA":
+            return ""
+        import urllib.parse
+        import urllib.request
+        import gzip as _gzip
+        for base in ("http://gs1.corrodinggames.com/masterserver/1.4",
+                     "http://gs4.corrodinggames.net/masterserver/1.4"):
+            url = base + "/interface?" + urllib.parse.urlencode(
+                {"action": "get", "game_id": room_uuid, "c": c})
+            try:
+                req = urllib.request.Request(url, headers={
+                    "User-Agent": "rw android 176 en", "Language": "en"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = resp.read()
+                    if resp.headers.get("Content-Encoding") == "gzip":
+                        try:
+                            data = _gzip.decompress(data)
+                        except OSError:
+                            pass
+                text = data.decode("utf-8", "replace")
+            except Exception as e:
+                self.logger.debug(f"[查房] get 请求失败 {base}: {e}")
+                continue
+            rows = [x for x in text.splitlines() if x.strip()]
+            if len(rows) < 4 or rows[1].strip().upper() != "OK":
+                self.logger.debug(f"[查房] get 响应异常: {rows[:2]}")
+                continue
+            f = rows[3].split(",")
+            if len(f) > 5:
+                ip, port = f[3].strip(), f[5].strip()
+                if ip and port.isdigit():
+                    return f"{ip}:{port}"
+        return ""
+
     async def _query_room(self, rid: str, probe_name: str) -> str:
         if not os.path.exists(ROOM_INFO_PY):
             return f"[rwinfo] 找不到探针脚本: {ROOM_INFO_PY}"
@@ -1156,12 +1233,15 @@ class RWInfoPlugin(Star):
 
         # 保存该 QQ 的翻页/筛选状态(滑动续期 60 秒)
         # items 只存当前页, 与列表展示的序号一一对应; 查房时直接用 addr 或 room_id
+        # join_a 非 0 表示该条是中继房, 地址需另行解析(仅内部使用, 不展示)
         self._state_put(event, page, keyword, status, mod_filter, full, source,
                         total_pages,
                         [{
                             "addr": str(r.get("addr") or ""),
                             "room_id": str(r.get("room_id") or ""),
                             "name": str(r.get("name") or ""),
+                            "uuid": str(r.get("id") or ""),
+                            "join_a": str(r.get("join_a") or "0"),
                         } for r in page_rooms])
 
         # ---- 组装消息 ----
@@ -1317,6 +1397,18 @@ class RWInfoPlugin(Star):
                 # qroom 房只有房号, official 房只有地址
                 target = (str(item.get("addr") or "").strip()
                           or str(item.get("room_id") or "").strip())
+                # 中继房: 列表里是注册入口地址, 直连会被踢。这里静默换成真实
+                # 地址再连。解析过程不产生任何面向用户的消息。
+                try:
+                    join_a = int(str(item.get("join_a") or "0"))
+                except ValueError:
+                    join_a = 0
+                uuid_ = str(item.get("uuid") or "").strip()
+                if join_a and uuid_ and not str(item.get("room_id") or "").strip():
+                    real = await asyncio.to_thread(
+                        self._resolve_relay_addr, uuid_, join_a)
+                    if real:
+                        target = real
             else:
                 label = ""
                 target = str(item or "").strip()
