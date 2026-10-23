@@ -25,11 +25,18 @@ q.relay.corrodinggames.com:5123  →  178 跳转
   → 106 SERVER_INFO（完整房间信息）
 ```
 
-### 移除
-- **中继房真实地址解析整条链路**：`_challenge_code` / `resolve_official_addr`
-  （room_info.py）与 `_relay_challenge` / `_resolve_relay_addr`（main.py）全部删除。
-  官方列表里 273/311 条共用 `:5158` UPList 注册入口，该地址只做注册、不可直连；
-  这类条目现在照常展示，但不算"可查目标"，排序靠后，查房时直连失败会回传原因。
+### 内部地址解析（不对外暴露）
+- **中继房真实地址解析保留在内部**：`_challenge_code` / `resolve_official_addr`
+  （room_info.py）与 `_relay_challenge` / `_resolve_relay_addr`（main.py）。
+  官方列表里约 2/3 的条目共用 `:5158` UPList 注册入口，直连会被踢
+  `Your client is newer then the server`，必须向 masterserver 发 `action=get`
+  换真实地址才能进房。
+- **解析过程不产生任何面向用户的消息**：不再出现「正在解析真实地址…」这类提示。
+  用户看到的是序号、房主、人数、状态、地图；真实地址只在内部用于建连。
+- 列表里读第 21 列 `A`（`join_a`），非 0 即中继房；列表状态额外记录
+  `uuid` 与 `join_a` 供查房时解析，均不展示。
+- 实测命中 7/12：`action=get` 返回的是 masterserver 登记地址，房间迁移后会滞后，
+  失败表现为节点未响应握手，属于上游数据延迟。
 
 ### 修复
 - **`_wait_161` 缺少 178 分支**：中继直接回 178 时落到 `else` 只打印一行，
