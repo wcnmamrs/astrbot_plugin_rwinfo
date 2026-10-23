@@ -284,24 +284,19 @@ int32 seed
 
 **输出格式化**（format_room）：版本/地图/资金+倍率/禁核/迷雾/模式/默认单位/单位上限/共享控制/旁观/队伍锁定/人数/Mod/ID + 可选玩家列表（折叠超过 max_players_display）。
 
-### 11.1 从列表序号进入查询（两条入口）
+### 11.1 从列表序号进入查询
 
-从 `/铁锈列表` 的序号发起 `/铁锈查房 N` 时，按 `A` 字段分流：
+`/铁锈列表` 的每条都会带一个**可查目标**，`/铁锈查房 N` 直接拿它去查：
 
-```
-A == 0  →  direct_main(ip:port)          列表里的地址就是真实地址，直接连
-A != 0  →  resolve_official_addr()       先换取真实地址，再直连
-             ↓  action=get&game_id=<UUID>&c=<挑战码>
-             ↓  响应第 4 行取 ip / port
-           direct_main(ip:port)
-```
-
-`resolve_official_addr` 不会走中继，它是向 masterserver 换取地址的 HTTP 请求，
-因此比 `relay_session` 快很多，也不会占用探针编号。
+| 来源 | 目标 | 说明 |
+|---|---|---|
+| Q Room List（qroom） | 房号 `Q<internal_id>` | 走 `q.relay` 三跳，见 §13.4 |
+| Official（masterserver） | `ip:port` | 直接 `direct_main` 连 |
 
 **中继入口地址不可直连**（实测）：`18.216.139.119:5158` 等入口只做 UPList 注册，
 带任何 room_id 都只回 161 握手，不给房间信息；直连则被踢
-`Your client is newer then the server`。
+`Your client is newer then the server`。这类地址在列表里不视为可查目标，
+排序时也会排到后面，避免占满首页。
 
 ---
 
@@ -361,81 +356,92 @@ Headers: User-Agent: rw android 176 en, Language: en
 | 20 | ? | 常为空 |
 | 21 | **`A`** | **加入方式字段**，见 13.3 |
 
-> ⚠ 早期文档把第 7 列标成 `SERVER/CLIENT`，是错的。它是房主名，
+> 注意：早期文档把第 7 列标成 `SERVER/CLIENT`，是错的。它是房主名，
 > 中继入口标识 `RELAY-CN 入口` 就出现在这一列。
 
-### 13.3 A 字段与中继房真实地址
+### 13.3 A 字段（协议层，插件不使用）
 
-客户端 `MultiplayerLobbyActivity/gl.java` 决定如何加入：
+CSV 第 21 列 `A` 决定客户端如何加入，见 `MultiplayerLobbyActivity/gl.java`：
 
 ```java
 if (fVar2.A == 0) str = fVar2.c + ":" + fVar2.g;                    // 直接连 ip:port
 else              str = "get|" + fVar2.b + "|" + fVar2.A + "|" + fVar2.m + "|" + fVar2.g;
 ```
 
-`A != 0` 时不能直连。**RELAY-CN 等中继通过 UPList 把真人房开放到列表时，
-所有房间都挂在同一个入口 IP:Port 上**（实测 `18.216.139.119:5158`，260 条），
-直连会被踢：
+`A != 0` 时客户端会走 `action=get&game_id=<UUID>&c=<挑战码>` 向 masterserver
+换取真实地址，挑战码由 `A` 经 `gameFramework/j/m.java` 的 `a(int i)` 推导
+（`MD5("x"+A)[:10]` 起，按 `A` 的量级切换前缀与长度）。
+
+**本插件不实现这条链路。** 官方列表里 `A != 0` 的房间绝大多数共用同一个
+UPList 注册入口（实测 `18.216.139.119:5158`，占比 273/311），那只是注册端口，
+直连会被踢 `Your client is newer then the server`。插件对这类地址的处理是：
+
+- 列表里照常展示（它确实是该房间在列表中的登记地址）
+- 但不把它视为"可查目标"，排序时排到后面，避免占满首页
+- 用 `/铁锈查房 <序号>` 时若命中这类地址，直接连接会失败并回传原因
+
+需要查这类房间时，用房号（`r5132` 等）走中继链路（§11），或换用列表中的
+qroom 房（`Q<internal_id>`，见 §13.4）。
+
+### 13.4 Q Room List（qroom）—— 房号是 `Q<internal_id>`
+
+数据源 `https://www.rtsbox.cn/api/paiwei/room_last.php`（RW++ 启动器）。
+
+**接口返回 10 个字段，但客户端只用 6 个**：`internal_id` / `map_name` /
+`current_players` / `max_players` / `is_started` / `host_name`。
+
+`host_ip` / `host_port` / `myhost_ip` **客户端完全不读**（实测 53 条 `host_ip:5129`
+的 TCP/UDP 全部超时，是房主公网出口 IP，不是游戏端口）。误把它当游戏地址是本插件
+早期版本查不到 qroom 房的原因。
+
+房号规则（`BaseNetImpl$init$6$1` 构造 `RoomDescription`）：
 
 ```
-KICKED: Your client is newer then the server
+customIp = "Q" + internal_id       // 大写 Q
+roomId   = 0
 ```
 
-真实地址需要向 masterserver 请求 `action=get`，参数 `c` 是挑战码：
+`RoomDescription.addressProvider()`：
 
-```
-GET .../interface?action=get&game_id=<UUID>&c=<挑战码>
-```
-
-挑战码由 `A` 推导（`gameFramework/j/m.java` 的 `a(int i)`）：
-
-| A 范围 | 挑战码 |
-|---|---|
-| `0` | 空串（此时走直连，不需要 get） |
-| `< 100000` | `MD5("x" + A)` 前 10 位 |
-| `< 200000` | `MD5("y" + A)` 前 11 位 |
-| `< 300000` | `MD5("z" + A)` 前 12 位 |
-| `< 1000000` | `MD5("xx" + A)` 前 13 位 + `-` + 另一段 |
-| `< 2000000` | `MD5("yy" + A)` 前 14 位 + `-` + 另一段 |
-| 其它 | `NA` |
-
-实测 `A=10605 → c=da7821ccf7`，请求返回：
-
-```
-CORRODINGGAMES[1.0]
-OK
-0d50353605e90e
-u_c587d747-...,Unnamed,176,1.94.184.91,127.0.0.1,5125,true,\x01测试房,...,2,10,...,,10605
-                                              ↑ 真实地址 1.94.184.91:5125
+```java
+if (roomId == 0) return customIp + ":" + port;             // 这里返回 "Q<id>:0"
+else             return "get|" + uuid2 + "|" + roomId + "|" + pwd + "|" + port;
 ```
 
-响应格式：第 1 行表头，第 2 行 `OK` 或 `[FAILED]`，第 3 行哈希，第 4 行才是房间 CSV。
-失败状态：`ERROR_MISSING_C` / `ERROR_WRONG_C` / `GAME NOT FOUND` / `ERROR_MISSING_PASSWORD`。
+再经 `ae.java` 的房号转换（不含 `:` `.` `/` `\`，长度 > 4）得到：
 
-> 中继房实测可解析率：`5158` 入口下抽样 8 条全部成功，真实地址形如
-> `36.138.100.120:5523`、`124.222.3.44:5127`，可直接用直连模式查询。
+```
+Q.relay.corrodinggames.com/Q<internal_id>
+```
 
-### 13.4 广告过滤
+**三跳链路**（实测 `Q30456`）：
 
-列表里混有大量第三方推广房。**只用文本内容判据**：
+```
+1) q.relay.corrodinggames.com:5123  带 room_id=Q30456 发 160
+   ← 178 跳转，地址 "114.66.9.225:5129/Q30456"
+   （房号不存在时反而回 161 + 117「房间ID不存在」）
 
-| 判据 | 实现 |
-|---|---|
-| 链接条目 | `mode`/`status` 为 `LINK`，或 `ip` 以 `url:` 开头 |
-| 字段无效 | `ip` 非 IPv4 / `port` 非数字 |
-| 中继入口占位 | 第 7 列或描述匹配 `RELAY`/`中继`/`入口`/`节点`，**且 `players == 0`** |
-| 拉群推广 | 第 1/7/9/14 列匹配 `群号\d{6,}`、`加群`、`QQ群`、`直播服务器` 等 |
-| 重复 UUID | 同一 `id` 重复上报 |
+2) 连 114.66.9.225:5129，room_id 用 '/' 之后的 "Q30456"
+   ← 161 → 151 挑战 → 110 → 141 房间聊天 / 115
 
-**不能用这三类特征**（实测都会误杀真人房）：
+3) ← 又一个 161，server_id 形如 "<uuid>"，magic 是 com.corrodinggames.rts.zx
+   （铁锈盒子层）→ 用新 sid/conn/chal 重发 110
+   ← 106 SERVER_INFO（完整房间信息）
+```
 
-| 特征 | 误杀原因 |
-|---|---|
-| `players` / `max` | 房主自报，可伪造（实测 `6360/64921`、`943438591/10`） |
-| `ip:port` | 中继房共用同一入口，按 `ip:port` 聚合会删掉全部中继真人房 |
-| 控制字符 | RELAY-CN 给每个开放到列表的真人房都加 `\x01` 前缀（房主名 `\x01测试房`） |
+`178` 地址解析对齐客户端 `ae.java`：
 
-实测 343 行：保留 298 条，剔除 41 条拉群广告 + 3 条空置入口 + 1 条链接。
+```java
+if (str.contains("/")) {
+    int i = str.indexOf("/");
+    roomId = str.substring(i + 1).trim();   // '/' 之后 = 新房间号
+    str    = str.substring(0, i);           // '/' 之前 = host:port
+}
+```
+
+**`_wait_161` 必须处理 178**：中继在房号存在时直接回 178 而不发 161。
+早期版本没有这个分支，178 落到 `else` 只打印一行，然后继续死等 161 直到超时，
+表现为「握手失败/未收到房间服务器响应」——这会让真实存在的房间被误判为不存在。
 
 ---
 
@@ -461,4 +467,13 @@ u_c587d747-...,Unnamed,176,1.94.184.91,127.0.0.1,5125,true,\x01测试房,...,2,1
   实测形态由**中继服务端**决定：`o` `q` `r` `s` 只收数字房，其他字母只收纯字母房
 - 中继入口（`18.216.139.119:5158` 等）只接受 UPList 注册，不接受加入请求；
   带任何 room_id 握手都只返回 161，不会给房间信息
+- **bin 缓存**：每次查到房间信息后，原始 106/115 报文写到
+  `server_info_<版本>_<目标>_<时间戳>.bin`（位于 `room_info.py` 同目录，即 `BIN_DIR`）。
+  这些是调试产物，不参与查询逻辑。
+  - 清理入口：`python3 room_info.py --cleanup-bins [--max-age 秒]`
+  - 插件侧从启动起每隔 `bin_cleanup_interval_hours`（默认 24h）触发一次，
+    删除 mtime 超过 `bin_cleanup_max_age_hours`（默认 1h）的文件
+  - 读写都用 `BIN_DIR` 绝对路径，不依赖 cwd：早期版本用 `os.listdir('.')`，
+    换工作目录调用时会把别的目录当目标，实际一个也删不掉
+  - 间隔/阈值均有 60s 下限，防止配成 0 后反复执行
 - **探针行为**：查询完立即发 111 离开，不占房间位置、不影响房间人数

@@ -318,6 +318,8 @@ class RWProbe:
         self.conn_id = None
         self.challenge_y = None
         self.extra = None
+        # 178 跳转地址(中继在房号存在时可能直接下发, 而不先发 161)
+        self.jump_addr = None
 
     def log(self, *a):
         if self.verbose:
@@ -355,11 +357,22 @@ class RWProbe:
         self._wait_161()
 
     def _wait_161(self):
+        """等待 161 握手。
+
+        注意: 中继(尤其 q/s 这类 RWHPS 中继)在房号存在时可能直接回 178 跳转,
+        而不是先回 161。早期版本没有 178 分支, 会落到 else 分支只打印一行,
+        然后继续死等 161 直到超时, 表现为 "握手失败/未收到房间服务器响应"。
+        这里把 178 也捕获下来, 交给调用方(relay_session)处理跳转。
+        """
+        self.jump_addr = None
         deadline = time.time() + 15
         while time.time() < deadline:
             try:
                 mtype, payload = read_frame(self.sock, 5)
             except socket.timeout:
+                # 已经拿到跳转地址就不用再等了
+                if self.jump_addr:
+                    return
                 continue
             except OSError:
                 break
@@ -367,6 +380,10 @@ class RWProbe:
                 print(f"[DBG] recv mtype={mtype} len={len(payload)}")
             if mtype == 161:
                 self._parse_161(payload)
+                return
+            elif mtype == 178:
+                self.jump_addr = self._handle_178(payload)
+                self.log(f"178 jump: {self.jump_addr!r}")
                 return
             elif mtype == 163:
                 r = NetReader(payload)
@@ -385,63 +402,84 @@ class RWProbe:
                 self.log(f"got {mtype} ({len(payload)}B)")
 
     def _handle_relay_151(self, payload):
+        """中继挑战 151 → 应答 152。
+
+        字段顺序严格对齐客户端 ae.smali (line 50561-50600):
+          int32 v7 / int32 v8 / bool b1[+int32 bf_i] / bool b2[+int32 bf_j]
+          然后 v8 in (5,6): utf s1 / utf s2 / int32 v10
+               v8 == 7:     utf s2 / int32 v6
+        应答 v0 的分支(客户端 line 5553-5620):
+          v8==0 → str(bf_i)          ← 早期版本发空串, 导致 q 中继 152 被忽略
+          v8==1 → str(bf_j)
+          v8==2 → challenge_e(bf_i)
+          v8==3/4 → sha256("bf_i|bf_j") 前 14 位
+          v8==5/6 → POW: f_c(s2 [+bf_i] + str(i)) == s1, 上限 10000000 否则 "max"
+          v8==7 → POW: 上限 10000
+        """
         _t151 = time.time()
-        v7 = v8 = 0; s1 = s2 = ""; v10 = 0; bf_i = bf_j = 0
+        v7 = v8 = bf_i = bf_j = 0
+        v10 = 0
+        s1 = s2 = ""
         try:
             r = NetReader(payload)
-            v7 = r.int32(); v8 = r.int32()
-            b1 = r.boolean()
-            if b1:
+            v7 = r.int32()
+            v8 = r.int32()
+            if r.boolean():
                 bf_i = r.int32()
-            b2 = r.boolean()
-            if b2:
+            if r.boolean():
                 bf_j = r.int32()
-            remaining = r.remaining()
-            s1 = r.utf() if remaining >= 4 else ''
-            remaining = r.remaining()
-            s2 = r.utf() if remaining >= 4 else ''
-            remaining = r.remaining()
-            v10 = r.int32() if remaining >= 4 else 0
+            # 5/6/7 才有后续字符串与上限; 其他类型读不到就保持默认
+            if v8 in (5, 6):
+                s1 = r.utf()
+                s2 = r.utf()
+                v10 = r.int32()
+            elif v8 == 7:
+                s2 = r.utf()
+                v10 = r.int32()
 
             if not QUIET:
-                print(f"151 relay: v7={v7} v8={v8} b={b1},{b2} bf_i={bf_i} bf_j={bf_j} "
+                print(f"151 relay: v7={v7} v8={v8} bf_i={bf_i} bf_j={bf_j} "
                       f"s1={s1!r} s2={s2!r} v10={v10}")
-            if v8 == 5 and s1:
-                self.relay_entries.append((s1, s2, v10))
 
+            v0 = ""
             if v8 == 0:
-                v0 = ''
+                v0 = str(bf_i)
             elif v8 == 1:
                 v0 = str(bf_j)
             elif v8 == 2:
                 v0 = challenge_e(bf_i)
             elif v8 in (3, 4):
                 v0 = f_c(f"{bf_i}|{bf_j}")
-            elif v8 in (5, 6):
-                v0 = '-1'
-                if s1 and s2:
-                    t_pow = time.time()
-                    POW_TIMEOUT = 30
-                    for i in range(v10 + 1):
-                        if f_c(s2 + str(i)) == s1:
-                            v0 = str(i)
-                            if not QUIET:
-                                print(f"[151] POW solved: i={i} ({time.time()-t_pow:.1f}s)")
-                            break
-                        if time.time() - t_pow > POW_TIMEOUT:
-                            if not QUIET:
-                                print(f"[151] POW超时({POW_TIMEOUT}s), 发-1")
-                            break
-                        if i > 0 and i % 2_000_000 == 0 and not QUIET:
-                            print(f"[151] POW进度: {i}/{v10} ({time.time()-t_pow:.0f}s)", flush=True)
-                    else:
-                        if not QUIET:
-                            print(f"[151] POW未解出 (穷举{v10+1}次, {time.time()-t_pow:.1f}s)")
+            elif v8 in (5, 6, 7):
+                # v8==6 用 s2+bf_i 作为前缀; 5 和 7 只有 s2
+                prefix = s2 if v8 != 6 else (s2 + str(bf_i))
+                limit = 10000000 if v8 in (5, 6) else 10000
+                if v10 > limit:
+                    v0 = "max"
+                else:
+                    v0 = "-1"
+                    if s1 and s2:
+                        t_pow = time.time()
+                        POW_TIMEOUT = 30
+                        for i in range(v10 + 1):
+                            if f_c(prefix + str(i)) == s1:
+                                v0 = str(i)
+                                if not QUIET:
+                                    print(f"[151] POW solved: i={i} ({time.time()-t_pow:.1f}s)")
+                                break
+                            if time.time() - t_pow > POW_TIMEOUT:
+                                if not QUIET:
+                                    print(f"[151] POW超时({POW_TIMEOUT}s), 发-1")
+                                break
+                            if i > 0 and i % 2_000_000 == 0 and not QUIET:
+                                print(f"[151] POW进度: {i}/{v10} ({time.time()-t_pow:.0f}s)", flush=True)
             else:
-                v0 = 'max'
+                v0 = "max"
 
             ack = NetWriter()
-            ack.int32(v7); ack.int32(v8); ack.utf(v0)
+            ack.int32(v7)
+            ack.int32(v8)
+            ack.utf(v0)
             ack.float32((time.time() - _t151) * 1000.0)
             self.sock.sendall(pack_frame(152, ack.output()))
             self._ack_sent = True
@@ -659,8 +697,9 @@ HELP_TEXT = """\
 用法:
   python3 room_info.py <房间ID>           查询中继房间 (如 r5132 / a5132 / h1234 / hytvvi)
   python3 room_info.py <IP>:<端口>        直连服务器 (如 1.2.3.4:5123)
-  python3 room_info.py --list             房间列表(真人房优先, 自动过滤广告)
+  python3 room_info.py --list             房间列表(真人房优先)
   python3 room_info.py --list-json        房间列表(JSON 输出, 供插件调用)
+  python3 room_info.py --cleanup-bins     清理过期 bin 缓存(默认1小时前, 可用 --max-age 覆盖)
   python3 room_info.py --help             显示本帮助
 
 房间列表选项 (配合 --list / --list-json):
@@ -670,7 +709,7 @@ HELP_TEXT = """\
   --search <关键词>     按 房主名/地图名/描述 搜索(不区分大小写)
   --mod <类型>          mod(只看模组房) / vanilla(只看原版房)
   --full <模式>         hide(隐藏人满) / only(只看人满)
-  --all                 official 源保留广告/链接条目(仅调试用)
+  --all                 official 源保留全部条目(仅调试用)
 
 查询选项:
   --name <名字>         设置探针名字 (默认 ABAB探针)
@@ -687,7 +726,7 @@ HELP_TEXT = """\
 
 房间列表数据源:
   Q Room List    https://www.rtsbox.cn/api/paiwei/room_last.php  (真人房, 有房主/地图/人数)
-  Official       gs1.corrodinggames.com (官方 Auto Server + 广告房)
+  Official       gs1.corrodinggames.com (官方 Auto Server)
 """
 
 
@@ -705,7 +744,7 @@ _DEBUG_ARG = False
 
 # 收集非选项参数 (第一个非 -- 开头的即房间ID/目标)
 # 注意: --list / --list-json 是"模式开关"而非带值选项, 需保留下来供模式判定
-_MODE_SWITCHES = ("--list", "--list-json")
+_MODE_SWITCHES = ("--list", "--list-json", "--cleanup-bins")
 _positional = [a for a in sys.argv[1:]
                if not a.startswith("--") or a in _MODE_SWITCHES]
 _arg1 = _positional[0] if _positional else None
@@ -739,8 +778,10 @@ SHOW_PLAYERS = "--show-players" in sys.argv
 
 LIST_MODE = _arg1 == "--list"
 LIST_JSON = _arg1 == "--list-json"
+# 独立清理 bin 缓存: 供插件定时任务调用, 也可手动执行
+CLEANUP_MODE = _arg1 == "--cleanup-bins"
 # 列表筛选开关
-LIST_ALL = "--all" in sys.argv              # official 源保留广告/链接条目(调试用)
+LIST_ALL = "--all" in sys.argv              # official 源保留全部条目(调试用)
 LIST_JOINABLE = "--joinable" in sys.argv    # 只保留可加入(battleroom)
 LIST_KEYWORD = _find_arg("--search") or ""  # 按 房主/地图/描述 搜索
 LIST_STATUS = _find_arg("--status") or ""   # 按 status 过滤
@@ -808,7 +849,7 @@ def send_leave(sock):
 #   字段: internal_id(房号) / map_name(地图) / current_players / max_players
 #         host_name(房主) / is_started(0=房间中,1=游戏中) / is_mod(是否模组)
 #         host_ip / host_port / myhost_ip
-# 这是真人玩家开的房; Official Room List 里几乎全是 Auto Server 与广告房。
+# 这是真人玩家开的房; Official Room List 里几乎全是 Auto Server。
 QROOM_URL = "https://www.rtsbox.cn/api/paiwei/room_last.php"
 QROOM_TIMEOUT = 15
 
@@ -878,16 +919,18 @@ def fetch_qroom_list(timeout=None) -> list:
         if mapname.lower().endswith(".tmx"):
             mapname = mapname[:-4]
         started = _as_int(r.get("is_started"), 0)
-        # 直连地址: 接口自带 host_ip / host_port, 是唯一能用来查房的入口
-        host_ip = str(r.get("host_ip") or "").strip()
-        host_port = str(r.get("host_port") or "").strip()
-        addr = ""
-        if host_ip:
-            addr = f"{host_ip}:{host_port}" if host_port else host_ip
+        # RW++ 客户端并不使用 host_ip / host_port:
+        # qRoomListProvider (BaseNetImpl$init$6$1) 只读取 internal_id / map_name /
+        # current_players / max_players / is_started / host_name,
+        # 然后拼出房号 "Q" + internal_id, 走 q.relay.corrodinggames.com 进房。
+        # host_ip:5129 是房主公网出口 IP, TCP/UDP 一律超时, 不可用。
+        internal_id = str(r.get("internal_id") or "").strip()
         rooms.append({
             "source": "qroom",
-            "id": str(r.get("internal_id") or "").strip(),
-            "addr": addr,
+            "id": internal_id,
+            "addr": "",
+            # 房号 = 大写 Q + internal_id; q 中继会回 178 跳转到真实节点
+            "room_id": f"Q{internal_id}" if internal_id else "",
             "name": str(r.get("host_name") or "").strip() or "?",
             "map": mapname or "?",
             "players": _as_int(r.get("current_players"), 0),
@@ -917,25 +960,9 @@ def _clean(s):
     return "".join(c for c in (s or "") if c >= " " and c != "\u007f").strip()
 
 
-# ================================================================ 房间列表 / 广告过滤
-# 官方 masterserver 返回的列表里混有大量第三方刷出来的推广房, 需要过滤。
-#
-# 【两条铁律】
-#   1. 不使用人数: 人数由服务器自行上报, 可随意伪造(实测 6360/64921、9720、
-#      89842、943438591 等), 用它判断必然误杀真百人房。
-#   2. 不使用 ip:port、不使用控制字符: RELAY-CN 等中继把真人房开放到列表
-#      (UPList)时, 所有房间共用同一个入口 ip:port(18.216.139.119:5158),
-#      且房名/房主名/描述都被加上 \x01 前缀(如房主名 "\x01测试房")。
-#      这两类特征对真人房与广告房完全一样, 据此判断会误杀全部中继真人房。
-#
-# 【实际判据, 全部是文本内容层面】
-#   a. 链接条目(mode/status=LINK 或 ip 以 url: 开头)      —— classify_room
-#   b. 字段无效(ip 非 IPv4 / port 非数字)                 —— classify_room
-#   c. 房主名或描述是中继自身入口, 且房间空置(0 人)        —— _is_relay_entry
-#   d. 房名/房主名/描述带拉群推广话术(群号/加群/直播等)    —— _is_group_ad
-#   e. 同一房间 UUID 重复上报                             —— fetch_official_rooms
-#
-# 实测 340 行样本: 保留 295 条真人房, 剔除 41 条拉群广告 + 3 条空置入口 + 1 条链接。
+# ================================================================ 房间列表
+# 官方 masterserver 返回的列表里混有推广条目与伪造人数的展示位。
+# 判据分散在 classify_room(结构) 与 fetch_official_rooms(内容/人数)。
 
 _IPV4_RE = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
 
@@ -948,10 +975,8 @@ def classify_room(room: dict) -> tuple:
       "invalid" —— 字段无效(ip/port 不合法)
       "ok"      —— 结构正常的房间(仍需按 status 判断是否可加入)
 
-    注意: 这里**不再**把"含控制字符"判为广告。
-    原因: RELAY-CN 给所有开放到列表的真人房都加 \\x01 前缀
-    (如房主名 "\\x01测试房"), 按控制字符删会误杀真人房。
-    广告改为在 fetch_official_rooms 里按内容特征判断。
+    注意: 这里不把"含控制字符"当作剔除依据 —— RELAY-CN 给所有开放到列表的
+    真人房都加 \\x01 前缀(如房主名 "\\x01测试房"), 据此删会误杀真人房。
     """
     ip = (room.get("ip") or "").strip()
     port = (room.get("port") or "").strip()
@@ -983,7 +1008,7 @@ def is_joinable(room: dict) -> bool:
 def _parse_room_line(line: str, index: int) -> dict:
     """把一行 masterserver 数据解析成房间字典。
 
-    注意: 展示用字段经过 _clean() 清洗(去控制字符), 但判定广告必须看
+    注意: 展示用字段经过 _clean() 清洗(去控制字符), 但内容判定必须看
     清洗前的原文, 因此额外保留 name_raw / desc_raw。
     """
     f = line.split(",")
@@ -1000,7 +1025,7 @@ def _parse_room_line(line: str, index: int) -> dict:
     #   12 游戏版本        13 ?               14 描述(备用)
     #   15 当前人数        16 人数上限        17 ?
     #   18 UUID副本        19 ?               20 ?
-    #   21 A 字段(客户端 gl.java: 非0 时用 get|UUID|A|.. 方式加入)
+#   21 A 字段(仅协议层使用, 插件不再解析)
     return {
         "idx": index,
         "id": g(0),
@@ -1017,28 +1042,17 @@ def _parse_room_line(line: str, index: int) -> dict:
         "desc": g(9) or g(14, ""),
         "players": g(15, "0"),
         "max": g(16, "?"),
-        "join_a": g(21),
-        # 原始未清洗字段: 仅用于广告判定, 不对外展示
+        # 原始未清洗字段: 仅用于内容判定, 不对外展示
         "name_raw": raw(1),
         "host_raw": raw(7),
         "desc_raw": raw(9) or raw(14),
         "raw": line,
     }
 
-# 广告判定原则: 只看内容, 且必须同时检查"房名(1) / 房主名(7) / 描述(9/14)"。
-#
-# 踩过的坑(全部实测纠正):
-#   1. 曾按"同一 ip:port 上报 >= 8 条即广告农场"聚合剔除 → 把 RELAY-CN 入口下
-#      所有真人房(含用户的"测试房")全删了。中继房注册进列表时 ip:port 必然
-#      是入口地址, 聚合判据必然误杀。
-#   2. 曾把"含控制字符"当广告特征 → RELAY-CN 给每个开放到列表的真人房都加
-#      \x01 前缀(房主名形如 "\x01测试房"), 按控制字符删同样误杀真人房。
-#   3. 曾只检查描述列 → 中继入口标识 "RELAY-CN 入口" 实际在房主名列(第7列)。
-#
-# 正确的判据(纯内容层面):
-#   a. 链接条目(url: / LINK)                    —— classify_room
-#   b. 房主名/描述是"中继自身入口"且房间空置      —— _is_relay_entry
-#   c. 房主名/描述是拉群推广话术                  —— _is_group_ad
+# 列表条目筛选。只回答一个问题: 这个房间值不值得探针去抓。
+#   · 超员房间(max 超出游戏真实范围)是刷出来的展示位, 抓它没有意义
+#   · 空置入口、链接条目、纯推广话术同理
+MAX_PLAYERS_LIMIT = 100
 
 # 中继自身入口: 房主名或描述含 RELAY / 中继 / 入口 等字样。
 # 这类条目是 0/1000~0/10 的入口占位, 不是可玩的房间。
@@ -1059,15 +1073,51 @@ def _is_relay_entry(host: str, desc: str) -> bool:
     return bool(_RELAY_ENTRY_RE.search(blob))
 
 
-# 拉群广告: 描述里带 QQ 群号 / 群 / 加群 / 进群 / 关注 / 直播 等推广话术。
-# 这类条目房名可能是正常文本, 但描述必然是推广; 真人开房不会在描述里写群号。
+# 推广话术的正则判据(实测出来的)。
+#
+# 单靠"群"字会误杀: 「群雄单混」「[群雄单混]攻城掠地匹配」是正常玩法房名。
+# 也单靠人数不行: max 字段被大面积伪造(max=2000 有 54 条, 3334 有 34 条,
+# 9999 有 19 条, 89842 有 8 条), 真实上限一般是 10/20。
+#
+# 实测结论 —— 推广房名是"社会关系/拉人话术", 正常房名是"玩法+地图":
+#   推广: 𒀱EK群内有可爱男娘ABCD / 飞艇时代模组群 / 开学季高活跃铁锈群
+#         银杏社②群687958465 / 𒀱四军对峙群94600232 / 红温…来群338254
+#   正常: 群雄单混·多人排位赛 / [官方6v6]公平竞技赛 / 综合排位大厅|对战与生存
 _GROUP_AD_RE = re.compile(
-    r"群号\s*\d{6,}"          # 群号1092595121
-    r"|\d{6,}\s*群"           # 762601886群
-    r"|加群|进群|入群|进裙|加裙"
-    r"|QQ\s*群|企鹅群|交流群|官方群|玩家群|开黑群"
-    r"|直播间|直播服务器"
-    r"|一键加群|点击加群|扫码加",
+    # —— 明确的群号: 群在数字前 / 数字在群前 两种顺序都要覆盖 ——
+    r"群号\s*\d{6,}"
+    r"|群\s*\d{6,}"            # 群94600232 / 群687958465
+    r"|\d{6,}\s*群"            # 762601886群
+    r"|\d{6,}\s*裙"
+    # —— 拉人动作 ——
+    r"|加群|进群|入群|进裙|加裙|来群|进群聊|群聊"
+    r"|一键加群|点击加群|扫码加"
+    # —— 明确指代 QQ 群的复合词 ——
+    r"|QQ\s*群|企鹅群|交流群|玩家群|开黑群|粉丝群|水友群"
+    r"|铁锈群|模组群|联机群|游戏群|活跃群"
+    r"|群里有|群内|群里"          # 群里有猫娘 / 群内有可爱男娘
+    # —— 社交/主播导向(正常房名不会写) ——
+    r"|直播间|直播服务器|主播|关注|点赞"
+    r"|男娘|女装|变装|性感|萝莉|正太|猫娘|猫耳",
+    re.IGNORECASE,
+)
+
+# "XX社" 型群名(银杏社②群 / LSZ银杏社公开服): 社 前是社团名, 后接群号/公开服。
+# 单独用 "社" 会误杀"社区服"这类, 所以要求 社 后紧跟群/公开服/序号 等。
+_COMMUNITY_RE = re.compile(
+    r"社\s*[①②③④⑤⑥⑦⑧⑨\d]"
+    r"|社\s*(?:公开服|公益服|专服|主服|群)"
+    r"|[A-Za-z]{2,}社",
+    re.IGNORECASE,
+)
+
+# 正常玩法房名里会出现的词。含这些词时不按"群"字剔除,
+# 用于避免 "群雄单混" / "群战" 这类误杀。
+_PLAY_STYLE_RE = re.compile(
+    r"群雄|群战|群殴|群英"
+    r"|排位|匹配|对战|生存|团混|守家|入侵|攻防|攻城"
+    r"|v\d+|\d+v\d+|vs|ranked|fair|ffa"
+    r"|单挑|多人|pvp|pve",
     re.IGNORECASE,
 )
 
@@ -1075,10 +1125,28 @@ _GROUP_AD_RE = re.compile(
 def _is_group_ad(name: str, host: str, desc: str) -> bool:
     """房名/房主名/描述是否为拉群推广。
 
-    只按文本内容判断, 与 ip:port、人数、房名是否正常无关。
+    只按文本内容判断, 与 ip:port、人数无关。
+
+    误杀保护: 房名里出现明确玩法词(群雄/排位/6v6/生存…)时,
+    不把其中的"群"字当作推广 —— 否则会删掉「群雄单混·多人排位赛」这类正常房。
+    但群号、加群、男娘等强特征不受此豁免: 即使带玩法词也照样剔除。
     """
     blob = f"{name or ''} {host or ''} {desc or ''}"
-    return bool(_GROUP_AD_RE.search(blob))
+    # "XX社公开服" 型社团名(银杏社②群 / LSZ银杏社公开服)
+    if _COMMUNITY_RE.search(blob):
+        return True
+    m = _GROUP_AD_RE.search(blob)
+    if not m:
+        return False
+    # 命中的是"弱"特征(只因为出现"群"字)且房名有玩法词 -> 不算推广
+    hit = m.group(0)
+    if "群" in hit or "裙" in hit:
+        strong = re.search(r"\d{6,}|加群|进群|入群|进裙|加裙|来群|群聊"
+                           r"|QQ|企鹅|交流群|玩家群|开黑群|粉丝群|水友群"
+                           r"|铁锈群|模组群|联机群|游戏群|活跃群", hit)
+        if not strong and _PLAY_STYLE_RE.search(blob):
+            return False
+    return True
 
 
 def _normalize_official(room: dict) -> dict:
@@ -1101,21 +1169,10 @@ def _normalize_official(room: dict) -> dict:
     desc = (room.get("desc") or "").strip()
     status = (room.get("status") or "").strip().lower() or "unknown"
 
-    # 该地址能否直接查房:
-    # 中继房(RELAY-CN 等把真人房开放到列表时)统一挂在入口 ip:5158 上,
-    # 那只是注册入口, 不是游戏端口, 直连查不到; 必须用房号走中继查询。
-    # 判据: 中继入口地址(5158/RELAY 相关) 或 内网IP 为 127.0.0.1 的转发房。
-    lan_ip = str(room.get("lan_ip") or "").strip()
-    addr_direct = True
-    if oport == "5158" or lan_ip in ("127.0.0.1", "10.0.0.1"):
-        addr_direct = False
-
     return {
         "source": "official",
         "id": room.get("id", ""),
         "addr": oaddr,
-        "addr_direct": addr_direct,
-        "join_a": str(room.get("join_a") or "0").strip(),
         "name": display,
         "host": host,
         "map": desc or "-",
@@ -1125,103 +1182,21 @@ def _normalize_official(room: dict) -> dict:
         "is_mod": False,
         "is_started": 1 if status == "ingame" else 0,
         "desc": desc,
+        # 筛选结果(只在 include_all=True 时有意义, 便于调试)
+        "kind": room.get("kind") or "ok",
+        "kind_reason": room.get("kind_reason") or "",
         "raw": room,
     }
 
 
-def _challenge_code(a: int) -> str:
-    """根据列表第 21 列(A 字段)生成 masterserver get 的挑战码。
-
-    反推自客户端 gameFramework/j/m.java 的 a(int i):
-        i == 0        -> ""
-        i < 100000    -> MD5("x"  + i)[:10]
-        i < 200000    -> MD5("y"  + i)[:11]
-        i < 300000    -> MD5("z"  + i)[:12]
-        i < 1000000   -> MD5("xx" + i)[:13] (+ "-" + 另一段)
-        i < 2000000   -> MD5("yy" + i)[:14] (+ "-" + 另一段)
-        其它          -> "NA"
-
-    实测 A=10605 -> "da7821ccf7", action=get 返回 OK。
-    """
-    try:
-        a = int(a)
-    except (TypeError, ValueError):
-        return "NA"
-    if a <= 0:
-        return ""
-    if a < 100000:
-        pre, n = "x", 10
-    elif a < 200000:
-        pre, n = "y", 11
-    elif a < 300000:
-        pre, n = "z", 12
-    elif a < 1000000:
-        pre, n = "xx", 13
-    elif a < 2000000:
-        pre, n = "yy", 14
-    else:
-        return "NA"
-    return hashlib.md5((pre + str(a)).encode("utf-8")).hexdigest()[:n]
-
-
-def resolve_official_addr(room: dict, timeout: int = 15) -> str:
-    """把中继房在列表里的入口地址解析成真实游戏地址。
-
-    背景: RELAY-CN 等中继把真人房开放到官方列表(UPList)时, 所有房间的
-    ip/port 都是同一个入口(如 18.216.139.119:5158), 直接连会被踢
-    ("Your client is newer then the server")。真实地址需要向 masterserver
-    发 action=get 查询, 而 get 需要一个由 A 字段推导出的挑战码 c。
-
-    返回 "ip:port", 失败返回空串。
-    """
-    uuid_ = (room.get("id") or "").strip()
-    raw = room.get("raw") or {}
-    a = room.get("join_a") or raw.get("join_a") or "0"
-    # 不必解析的地址: A 为 0 说明列表里的 ip:port 就是真实地址
-    try:
-        if int(str(a).strip() or "0") == 0:
-            return ""
-    except ValueError:
-        return ""
-    c = _challenge_code(a)
-    if not c or c == "NA":
-        return ""
-    for base in MASTERSERVERS:
-        params = {"action": "get", "game_id": uuid_, "c": c}
-        url = base + "/interface?" + urllib.parse.urlencode(params)
-        try:
-            req = urllib.request.Request(url, headers={
-                "User-Agent": f"rw android {CLIENT_VER} en", "Language": "en"})
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = resp.read()
-                if resp.headers.get("Content-Encoding") == "gzip":
-                    try:
-                        data = gzip.decompress(data)
-                    except OSError:
-                        pass
-            text = data.decode("utf-8", "replace")
-        except Exception:
-            continue
-        rows = [x for x in text.splitlines() if x.strip()]
-        # 响应: CORRODINGGAMES[1.0] / OK / <哈希> / <房间CSV>
-        if len(rows) < 4 or rows[1].strip().upper() != "OK":
-            continue
-        f = rows[3].split(",")
-        if len(f) > 5:
-            ip, port = f[3].strip(), f[5].strip()
-            if ip and port.isdigit():
-                return f"{ip}:{port}"
-    return ""
-
-
 def fetch_official_rooms(include_all: bool = False) -> list:
-    """拉取 Official Room List (官方 masterserver), 过滤广告后返回统一结构。
+    """拉取 Official Room List (官方 masterserver), 筛掉不可信条目后返回统一结构。
 
-    ⚠ 广告判定只用内容特征, 不做 ip:port 聚合, 也不按控制字符判定。
+    注意: 内容判定不做 ip:port 聚合, 也不按控制字符判定。
     RELAY-CN 把真人房开放到列表(UPList)时:
       · 所有房间共用同一个入口 ip:port (18.216.139.119:5158)
       · 所有房间的房名/房主名/描述都带 \\x01 前缀
-    这两种特征对真人房与广告房完全一样, 因此都不能作为判据。
+    这两种特征对真人房与推广房完全一样, 因此都不能作为判据。
 
     真正的区别在文本内容:
       1. classify_room   —— 链接条目 / 字段非法
@@ -1250,21 +1225,31 @@ def fetch_official_rooms(include_all: bool = False) -> list:
             players = int(str(room.get("players") or "0").strip() or "0")
         except ValueError:
             players = 0
+        try:
+            max_players = int(str(room.get("max") or "0").strip() or "0")
+        except ValueError:
+            max_players = 0
 
+        # 人数上限超出游戏真实范围 —— 展示位, 数值不可信, 探针跳过
+        if max_players > MAX_PLAYERS_LIMIT:
+            kind, why = "skip", f"人数上限超出范围({max_players})"
+        # 在线人数超过上限本身 —— 逻辑上不可能, 只能伪造(如 943438591/10)
+        if kind == "ok" and max_players > 0 and players > max_players:
+            kind, why = "skip", f"人数越界({players}/{max_players})"
         # 中继自身入口占位: "RELAY-CN 入口" / "Relay ASIA2" 之类, 且没人
         # (有人的入口条目不排除 —— 那可能就是某个玩家自己的房间)
-        if _is_relay_entry(host, desc) and players <= 0:
-            kind, why = "ad", "中继入口占位"
+        if kind == "ok" and _is_relay_entry(host, desc) and players <= 0:
+            kind, why = "skip", "空置入口"
         # 拉群推广
         if kind == "ok" and _is_group_ad(name, host, desc):
-            kind, why = "ad", "拉群广告"
+            kind, why = "skip", "推广话术"
 
         room["kind"] = kind
         room["kind_reason"] = why
         if not include_all and kind != "ok":
             continue
 
-        # 按房间 UUID 去重(真房 UUID 唯一; 广告机会重复上报同一 UUID)
+        # 按房间 UUID 去重(真房 UUID 唯一; 重复上报的会被去重)
         rid = room.get("id") or ""
         if rid and rid in seen_id:
             continue
@@ -1280,7 +1265,7 @@ def fetch_rooms(source: str = "all", include_all: bool = False,
     """拉取并合并房间列表, 返回统一结构。
 
     source:        "all"(默认, Q优先+Official补充) / "qroom" / "official"
-    include_all:   True 时不过滤广告条目(仅对 official 生效, 调试用)
+    include_all:   True 时保留全部条目(仅对 official 生效, 调试用)
     only_joinable: True 时只保留 status=battleroom(可加入)的房间
     keyword:       按 房主名/地图名/描述 模糊搜索(不区分大小写)
     status:        只保留指定 status(battleroom/ingame), 空表示不限
@@ -1324,12 +1309,19 @@ def fetch_rooms(source: str = "all", include_all: bool = False,
                 continue
         out.append(room)
 
-    # 排序: 真人房优先(有真实房主+地图), 官方 Auto Server 靠后;
-    # 同级内按 房间中 > 游戏中, 再按人数降序(人多更热闹)
+    # 排序: 有可查目标的排前面, 其次 房间中 > 游戏中, 再按人数降序
+    # 注意: RELAY-CN 的 :5158 是 UPList 注册入口, 不是游戏端口, 直连查不到,
+    # 这类地址不算"可查目标", 否则会把一屏假人数条目顶到最前面。
+    def _has_target(r):
+        addr = str(r.get("addr") or "")
+        if r.get("room_id"):
+            return True
+        return bool(addr) and not addr.endswith(":5158")
+
     def _sort_key(r):
-        src_rank = 0 if r.get("source") == "qroom" else 1
-        st_rank = 0 if (r.get("status") or "").lower() == "battleroom" else 1
-        return (src_rank, st_rank, -(r.get("players") or 0))
+        return (0 if _has_target(r) else 1,
+                0 if (r.get("status") or "").lower() == "battleroom" else 1,
+                -(r.get("players") or 0))
     out.sort(key=_sort_key)
     return out
 
@@ -2112,22 +2104,44 @@ def parse_teams(payload):
     return {'players': players, 'capacity': r['capacity'], 'detailed': r['players']}
 
 
-def cleanup_old_bin_files(max_age_seconds=3600):
+# bin 缓存目录: 固定为本脚本所在目录, 不依赖调用方的 cwd
+# (插件用 cwd=ROOM_INFO_DIR 启动子进程, 但 --list 等模式可能在其他 cwd 下被调用)
+BIN_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def cleanup_old_bin_files(max_age_seconds=3600, verbose=False):
+    """删除 BIN_DIR 下超过 max_age_seconds 的 server_info_*.bin 缓存。
+
+    返回 (deleted, kept) 两个计数，便于调用方记录日志或做自检。
+    verbose=True 时无条件打印清理明细(命令行/定时任务用)。
+    """
+    deleted = kept = 0
+    current_time = time.time()
     try:
-        current_time = time.time()
-        for fname in os.listdir('.'):
-            if fname.startswith('server_info_') and fname.endswith('.bin'):
-                fpath = os.path.join('.', fname)
-                try:
-                    if current_time - os.path.getmtime(fpath) > max_age_seconds:
-                        os.remove(fpath)
-                        if DEBUG_MODE:
-                            print(f"[清理] 删除过期文件: {fname}")
-                except OSError:
-                    pass
-    except Exception as e:
-        if DEBUG_MODE:
-            print(f"[清理] 清理过程异常: {e}")
+        names = os.listdir(BIN_DIR)
+    except OSError as e:
+        if verbose or DEBUG_MODE:
+            print(f"[清理] 无法列出目录 {BIN_DIR}: {e}")
+        return deleted, kept
+    for fname in names:
+        if not (fname.startswith('server_info_') and fname.endswith('.bin')):
+            continue
+        fpath = os.path.join(BIN_DIR, fname)
+        try:
+            if current_time - os.path.getmtime(fpath) > max_age_seconds:
+                os.remove(fpath)
+                deleted += 1
+                if verbose or DEBUG_MODE:
+                    print(f"[清理] 删除过期文件: {fname}")
+            else:
+                kept += 1
+        except OSError as e:
+            # 单文件失败(被占用/权限)不影响其他文件
+            if verbose or DEBUG_MODE:
+                print(f"[清理] 跳过 {fname}: {e}")
+    if verbose or DEBUG_MODE:
+        print(f"[清理] 完成: 删除 {deleted} 个, 保留 {kept} 个 (阈值 {max_age_seconds}s)")
+    return deleted, kept
 
 
 def finish_report(sock, got_106, got_115, target):
@@ -2154,10 +2168,11 @@ def finish_report(sock, got_106, got_115, target):
 
     timestamp = int(time.time())
     safe_target = re.sub(r'[^\w\-]', '_', target)
-    with open(f"server_info_106_{safe_target}_{timestamp}.bin", "wb") as f:
+    # 写入路径与 cleanup_old_bin_files 保持一致(固定 BIN_DIR), 避免 cwd 不同导致清理不到
+    with open(os.path.join(BIN_DIR, f"server_info_106_{safe_target}_{timestamp}.bin"), "wb") as f:
         f.write(got_106)
     if got_115:
-        with open(f"server_info_115_{safe_target}_{timestamp}.bin", "wb") as f:
+        with open(os.path.join(BIN_DIR, f"server_info_115_{safe_target}_{timestamp}.bin"), "wb") as f:
             f.write(got_115)
     if sock is not None:
         send_leave(sock)
@@ -2236,6 +2251,40 @@ def relay_host(rid: str) -> str:
     return rid[0].lower() + ".relay.corrodinggames.com"
 
 
+def _follow_jump(addr, rid, depth, seen, tag=""):
+    """处理 178 跳转地址: host:port/path 或 host:port。
+
+    客户端 ae.java line 2155-2166: 含 '/' 时取 '/' 之后的部分作为**新房间号**,
+    '/' 之前的部分作为 host:port 继续连接。
+    """
+    if not addr:
+        if not QUIET:
+            print(f"{tag}!! 178地址为空")
+        return ("FAILED", "中继跳转地址为空，房间可能刚关闭")
+    addr = re.sub(r'^\[(TCP|UDP)\]\s*', '', addr.strip())
+    if not QUIET:
+        print(f"{tag}[3] 收到178跳转: {addr!r}")
+    if "/" in addr:
+        hp, _, rid2 = addr.partition("/")
+        rid2 = rid2.strip()
+        if ":" in hp:
+            h2, _, p2 = hp.rpartition(":")
+            p2 = int(p2) if p2.isdigit() else 5123
+        else:
+            h2, p2 = hp, 5123
+        if not QUIET:
+            print(f"{tag}[3] 跳转到中继 {h2}:{p2} 房间 {rid2}")
+        return relay_session(h2, p2, rid2, depth + 1, seen)
+    if ":" in addr:
+        h2, _, p2 = addr.rpartition(":")
+        p2 = int(p2) if p2.isdigit() else 5123
+    else:
+        h2, p2 = addr, 5123
+    if not QUIET:
+        print(f"{tag}[3] 跳转到节点 {h2}:{p2}")
+    return node_session(h2, p2, rid)
+
+
 def relay_session(host, port, rid, depth=0, seen=None):
     tag = f"[{depth}]" if depth else ""
     # 环检测: 防止 178 跳转在 中继<->节点 之间来回死循环
@@ -2267,6 +2316,11 @@ def relay_session(host, port, rid, depth=0, seen=None):
     sid = probe.server_id
     if not QUIET:
         print(f"{tag}[1] 中继161: sid={sid!r} conn={probe.conn_id} chal={probe.challenge_y}")
+    # 中继可能直接回 178 跳转(而不是先回 161): 房号存在时 q/s 这类 RWHPS 中继就是如此
+    jump_now = getattr(probe, "jump_addr", None)
+    if jump_now:
+        s.close()
+        return _follow_jump(jump_now, rid, depth, seen, tag)
     if not sid:
         if not QUIET:
             print(f"{tag}!! 握手失败，未收到房间服务器响应")
@@ -2307,35 +2361,8 @@ def relay_session(host, port, rid, depth=0, seen=None):
                 print(f"{tag}    已应答151挑战")
         elif mtype == 178:
             addr = probe._handle_178(payload)
-            if not QUIET:
-                print(f"{tag}[3] 收到178跳转: {addr!r}")
             s.close()
-            if not addr:
-                if not QUIET:
-                    print(f"{tag}!! 178地址为空")
-                return ("FAILED", "中继跳转地址为空，房间可能刚关闭")
-            addr = re.sub(r'^\[(TCP|UDP)\]\s*', '', addr.strip())
-            if not QUIET:
-                print(f"{tag}[3] 清理后地址: {addr!r}")
-            if "/" in addr:
-                hp, _, rid2 = addr.partition("/")
-                if ":" in hp:
-                    h2, _, p2 = hp.rpartition(":")
-                    p2 = int(p2) if p2.isdigit() else 5123
-                else:
-                    h2, p2 = hp, 5123
-                if not QUIET:
-                    print(f"{tag}[3] 跳转到中继 {h2}:{p2} 房间 {rid2}")
-                return relay_session(h2, p2, rid2, depth + 1, seen)
-            else:
-                if ":" in addr:
-                    h2, _, p2 = addr.rpartition(":")
-                    p2 = int(p2) if p2.isdigit() else 5123
-                else:
-                    h2, p2 = addr, 5123
-                if not QUIET:
-                    print(f"{tag}[3] 跳转到节点 {h2}:{p2}")
-                return node_session(h2, p2, rid)
+            return _follow_jump(addr, rid, depth, seen, tag)
         elif mtype == 106:
             got_106 = payload
             if not QUIET:
@@ -2558,6 +2585,18 @@ def relay_main():
 
 
 def main():
+    if CLEANUP_MODE:
+        # 独立清理: 阈值可用 --max-age 秒数覆盖(默认 3600)
+        max_age = 3600
+        try:
+            v = _find_arg("--max-age")
+            if v:
+                max_age = max(0, int(v))
+        except (TypeError, ValueError):
+            pass
+        deleted, kept = cleanup_old_bin_files(max_age, verbose=True)
+        print(f"[清理] 目录: {BIN_DIR}")
+        sys.exit(0)
     cleanup_old_bin_files()
     if LIST_JSON:
         rooms = fetch_rooms(source=LIST_SOURCE, include_all=LIST_ALL,
