@@ -83,6 +83,13 @@
         "default": "",
         "options": ["", "hide"]
     },
+    "probe_max_per_msg": {
+        "description": "单条消息最多召唤的探针数（默认5）",
+        "type": "int",
+        "default": 5,
+        "min": 1,
+        "max": 20
+    },
     "群撤回": {
         "description": "每个群独立的撤回配置，格式 \"#群号:开:延迟\"（开=1/0），例 \"#123456:1:60\"",
         "type": "list",
