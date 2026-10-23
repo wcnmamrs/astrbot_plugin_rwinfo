@@ -27,7 +27,7 @@ COOLDOWN = 10
 PROBE_MIN, PROBE_MAX = 1, 99
 
 # 插件版本(菜单显示与 @register 共用, 避免两处不一致)
-PLUGIN_VERSION = "1.5.5"
+PLUGIN_VERSION = "1.5.7"
 
 # ================================================================ 房号识别
 # 铁锈客户端构造中继连接串的逻辑 (ae.smali line 7107-7180):
@@ -195,6 +195,111 @@ class RWInfoPlugin(Star):
         self.probe_next = PROBE_MIN
         self.pending_tasks = set()
         self.pending_recall_tasks = set()
+        # bin 缓存定时清理任务(插件启动后开始循环)
+        self._bin_cleanup_task = None
+        self._start_bin_cleanup()
+
+    # ================================================================ bin 缓存清理
+    def _bin_cleanup_conf(self):
+        """读取并矫正 bin 清理配置, 返回 (enabled, interval_sec, max_age_sec)."""
+        enabled = bool(self.config.get("bin_cleanup_enabled", True))
+        try:
+            interval_h = float(self.config.get("bin_cleanup_interval_hours", 24))
+        except (TypeError, ValueError):
+            interval_h = 24.0
+        try:
+            max_age_h = float(self.config.get("bin_cleanup_max_age_hours", 1))
+        except (TypeError, ValueError):
+            max_age_h = 1.0
+        # 下限保护: 间隔至少 60s(避免配置成 0 后疯狂跑), 缓存年龄至少 60s
+        interval_sec = max(60.0, interval_h * 3600.0)
+        max_age_sec = max(60.0, max_age_h * 3600.0)
+        return enabled, interval_sec, max_age_sec
+
+    def _start_bin_cleanup(self):
+        """插件启动时启动 bin 清理循环(需在事件循环内创建任务)."""
+        enabled, interval_sec, _ = self._bin_cleanup_conf()
+        if not enabled:
+            self.logger.info("[清理] bin 定时清理已在配置中关闭")
+            return
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                raise RuntimeError("event loop closed")
+            self._bin_cleanup_task = asyncio.create_task(self._bin_cleanup_loop())
+        except RuntimeError as e:
+            # __init__ 可能早于事件循环启动; 退化为首次消息时惰性启动
+            self.logger.debug(f"[清理] 事件循环不可用, 改为惰性启动: {e}")
+            self._bin_cleanup_task = None
+            return
+        self.logger.info(f"[清理] bin 缓存定时清理已启动: 每 {interval_sec / 3600:.2f} 小时检查一次")
+
+    async def _bin_cleanup_loop(self):
+        """循环: 从插件启动起计时, 每隔 interval 清理一次(启动瞬间不清理)。"""
+        while True:
+            try:
+                _, interval_sec, _ = self._bin_cleanup_conf()
+                await asyncio.sleep(interval_sec)
+                enabled, _, max_age_sec = self._bin_cleanup_conf()
+                if not enabled:
+                    self.logger.debug("[清理] 配置已关闭, 清理循环退出")
+                    return
+                await self._run_bin_cleanup(max_age_sec)
+            except asyncio.CancelledError:
+                self.logger.debug("[清理] 定时任务被取消")
+                raise
+            except Exception as e:
+                # 单次失败不应终止循环, 等下一轮
+                self.logger.warning(f"[清理] 本轮清理异常, 将在下轮重试: {e}")
+                await asyncio.sleep(60)
+
+    async def _run_bin_cleanup(self, max_age_sec: float):
+        """调用 room_info.py --cleanup-bins 执行实际清理(独立进程, 不阻塞事件循环)."""
+        if not os.path.exists(ROOM_INFO_PY):
+            return
+        python = sys.executable
+        if not python or not os.path.exists(python):
+            python = "python3"
+        cmd = [python, "-B", ROOM_INFO_PY, "--cleanup-bins",
+               "--max-age", str(int(max_age_sec))]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=ROOM_INFO_DIR,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            except asyncio.TimeoutError:
+                proc.kill()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except Exception:
+                    pass
+                self.logger.warning("[清理] 清理子进程超时(>60s), 已终止")
+                return
+        except Exception as e:
+            self.logger.warning(f"[清理] 启动清理子进程失败: {e}")
+            return
+        out = stdout.decode("utf-8", "replace").strip()
+        err = stderr.decode("utf-8", "replace").strip()
+        # 只把「删除/完成」这类结果行写进日志, 避免 --cleanup 帮助文本刷屏
+        for line in out.splitlines():
+            if line.startswith("[清理]"):
+                self.logger.info(line)
+        if proc.returncode not in (0, None):
+            self.logger.warning(f"[清理] 子进程退出码={proc.returncode} stderr={err[:300]}")
+        if self.config.get("debug", False) and out:
+            self.logger.debug(f"[清理] 完整输出: {out[:800]}")
+
+    def _ensure_bin_cleanup(self):
+        """惰性启动: __init__ 时事件循环不可用则在首条消息补启。"""
+        if self._bin_cleanup_task is not None:
+            return
+        enabled, _, _ = self._bin_cleanup_conf()
+        if enabled:
+            self._start_bin_cleanup()
 
     def _default_config(self) -> dict:
         return {
@@ -210,6 +315,15 @@ class RWInfoPlugin(Star):
             "max_players_display": 10,
             "show_players": False,
             "retry_times": 3,
+            # ---- 房间列表 ----
+            "list_max_display": 20,           # 列表指令最多展示的房间数(0=不限)
+            "list_page_size": 5,              # 列表指令每页显示数量
+            "list_default_full": "",          # 列表默认人数筛选: 空=全部 / hide=隐藏人满
+            "probe_max_per_msg": 5,           # 单条消息最多召唤的探针数
+            # ---- bin 缓存清理 ----
+            "bin_cleanup_enabled": True,      # 是否在插件启动后定时清理 bin 缓存
+            "bin_cleanup_interval_hours": 24, # 清理间隔(小时), 默认一天一次
+            "bin_cleanup_max_age_hours": 1,   # 只清理超过该小时数(默认1小时)的 bin
             "群撤回": [],                     # 按群独立的撤回配置: 每条 "#群号:开:延迟" 例 "#123456:1:60"
             "私聊撤回": [],                   # 按用户独立的撤回配置: 每条 "@用户ID:开:延迟" 例 "@3856554669:1:60"
         }
@@ -272,16 +386,30 @@ class RWInfoPlugin(Star):
         key = parts[0].strip() if parts else ""
         on = False
         delay = 60
-        if len(parts) >= 2 and parts[1].strip() != "":
-            on = parts[1].strip() in ("1", "开", "true", "True", "on")
-        if len(parts) >= 3 and parts[2].strip().isdigit():
-            delay = max(0, min(300, int(parts[2].strip())))
+        if len(parts) >= 2:
+            # 布尔值大小写不敏感: 1/开/true/on 任意大小写都算开启
+            on = parts[1].strip().lower() in ("1", "开", "true", "on", "yes", "y")
+        if len(parts) >= 3:
+            raw = parts[2].strip()
+            try:
+                # 允许负数/超界输入, 统一夹到 0-300(负数此前会被静默丢弃)
+                delay = max(0, min(300, int(raw)))
+            except (TypeError, ValueError):
+                delay = 60
         return {"key": key, "开": on, "延迟": delay}
 
-    def _get_recall_cfg(self, event) -> dict:
-        """读取当前会话的撤回配置: 精确匹配优先; 群聊其次回退通配符 '*'; 私聊不使用通配符.
+    def _get_recall_cfg(self, event, want_wildcard=False) -> dict:
+        """读取当前会话的撤回配置. want_wildcard=True 时只读 '*' 那条(用于 /铁锈撤回 * 查询).
+        否则: 精确匹配优先, 群聊其次回退通配符 '*', 私聊不使用通配符.
         缺省 {开: False, 延迟: 60}."""
         key, is_private = self._recall_session_key(event)
+        if want_wildcard:
+            # 显式要求读通配符: 直接取 '*', 找不到返回缺省
+            for entry in self._recall_store(is_private):
+                cfg = self._recall_parse(entry)
+                if cfg["key"] == "*":
+                    return {"开": cfg["开"], "延迟": cfg["延迟"]}
+            return {"开": False, "延迟": 60}
         wildcard = None
         for entry in self._recall_store(is_private):
             cfg = self._recall_parse(entry)
@@ -481,85 +609,6 @@ class RWInfoPlugin(Star):
         month = v + 1
         return month, day, hour, minute, sec
 
-    @staticmethod
-    def _relay_challenge(a) -> str:
-        """由列表第 21 列(A 字段)推导 masterserver get 的挑战码。
-
-        反推自客户端 gameFramework/j/m.java 的 a(int i):
-            i < 100000  -> MD5("x"  + i)[:10]
-            i < 200000  -> MD5("y"  + i)[:11]
-            i < 300000  -> MD5("z"  + i)[:12]
-            i < 1000000 -> MD5("xx" + i)[:13]
-            i < 2000000 -> MD5("yy" + i)[:14]
-        实测 A=10605 -> "da7821ccf7"
-        """
-        try:
-            a = int(a)
-        except (TypeError, ValueError):
-            return "NA"
-        if a <= 0:
-            return ""
-        if a < 100000:
-            pre, n = "x", 10
-        elif a < 200000:
-            pre, n = "y", 11
-        elif a < 300000:
-            pre, n = "z", 12
-        elif a < 1000000:
-            pre, n = "xx", 13
-        elif a < 2000000:
-            pre, n = "yy", 14
-        else:
-            return "NA"
-        try:
-            import hashlib
-            return hashlib.md5((pre + str(a)).encode("utf-8")).hexdigest()[:n]
-        except Exception:
-            return ""
-
-    def _resolve_relay_addr(self, room_uuid: str, join_a) -> str:
-        """把中继房在列表里的入口地址解析成真实游戏地址(同步, 供 to_thread 调用)。
-
-        中继房(RELAY-CN 等通过 UPList 开放到官方列表)在列表里的 ip:port 全是
-        同一个入口(如 18.216.139.119:5158), 直连会被踢
-        "Your client is newer then the server"。
-        真实地址需向 masterserver 发 action=get, 参数 c 由 A 字段推导。
-        """
-        c = self._relay_challenge(join_a)
-        if not c or c == "NA":
-            return ""
-        import urllib.parse
-        import urllib.request
-        import gzip as _gzip
-        for base in ("http://gs1.corrodinggames.com/masterserver/1.4",
-                     "http://gs4.corrodinggames.net/masterserver/1.4"):
-            url = base + "/interface?" + urllib.parse.urlencode(
-                {"action": "get", "game_id": room_uuid, "c": c})
-            try:
-                req = urllib.request.Request(url, headers={
-                    "User-Agent": "rw android 176 en", "Language": "en"})
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    data = resp.read()
-                    if resp.headers.get("Content-Encoding") == "gzip":
-                        try:
-                            data = _gzip.decompress(data)
-                        except OSError:
-                            pass
-                text = data.decode("utf-8", "replace")
-            except Exception as e:
-                self.logger.debug(f"[查房] get 请求失败 {base}: {e}")
-                continue
-            rows = [x for x in text.splitlines() if x.strip()]
-            if len(rows) < 4 or rows[1].strip().upper() != "OK":
-                self.logger.debug(f"[查房] get 响应异常: {rows[:2]}")
-                continue
-            f = rows[3].split(",")
-            if len(f) > 5:
-                ip, port = f[3].strip(), f[5].strip()
-                if ip and port.isdigit():
-                    return f"{ip}:{port}"
-        return ""
-
     async def _query_room(self, rid: str, probe_name: str) -> str:
         if not os.path.exists(ROOM_INFO_PY):
             return f"[rwinfo] 找不到探针脚本: {ROOM_INFO_PY}"
@@ -726,8 +775,11 @@ class RWInfoPlugin(Star):
             "组合: /铁锈列表 模组 房间中 2",
             "别名: /房间列表 /铁锈房列表 /rwlist",
             "/铁锈下一页 / 铁锈上一页",
-            "/铁锈查房 <序号|房号|IP:端口>",
-            "  序号来自列表, 房号如 r5132 / hytvvi",
+            "",
+            "—— 查房 ——",
+            "/铁锈查房 <序号|房号>",
+            "  序号: 先发 /铁锈列表, 再填表里的序号, 如 /铁锈查房 2",
+            "  房号: r5132 / s1024 / Q12345 / hytvvi",
             "",
             "给筛选词就整体替换旧筛选; 只给页码或翻页则沿用;",
             "只发 /铁锈列表 (不带任何参数) 则重新查全部。",
@@ -923,7 +975,15 @@ class RWInfoPlugin(Star):
             is_private = bool(event.is_private_chat())
         except Exception:
             is_private = False
-        if not is_private and not event.is_admin():
+        # 列表是只读查询, 走黑白名单而不是硬性要求管理员
+        # (早期版本非管理员直接静默 return, 群里普通成员完全看不到任何反应)
+        uid = normalize_gid(event.get_sender_id())
+        gid = normalize_gid(event.get_group_id())
+        if not self._is_allowed(is_private, uid, gid):
+            yield event.plain_result(
+                "当前会话没有房间列表权限。\n"
+                "管理员可用 /铁锈模式 与 /铁锈白名 调整放行范围。"
+            )
             return
 
         # 取该 QQ 的历史状态(已过期则视为无)
@@ -1074,6 +1134,16 @@ class RWInfoPlugin(Star):
             yield event.plain_result("[房间列表] 没有符合条件的房间，试试 /铁锈列表（不带参数）")
             return
 
+        # 总条数上限(避免房间数暴涨时分页过多/消息过长), 0 或非法值视为不限
+        matched_total = len(rooms)
+        max_display = 20
+        try:
+            max_display = int(self.config.get("list_max_display", 20))
+        except (TypeError, ValueError):
+            max_display = 20
+        if max_display > 0:
+            rooms = rooms[:max_display]
+
         page_size = 5
         try:
             page_size = max(1, int(self.config.get("list_page_size", 5)))
@@ -1085,15 +1155,13 @@ class RWInfoPlugin(Star):
         page_rooms = rooms[start:start + page_size]
 
         # 保存该 QQ 的翻页/筛选状态(滑动续期 60 秒)
-        # addrs 只存当前页, 与列表展示的序号一一对应;
-        # 每项带 id/join_a, 供 /铁锈查房 <序号> 解析中继房的真实地址
+        # items 只存当前页, 与列表展示的序号一一对应; 查房时直接用 addr 或 room_id
         self._state_put(event, page, keyword, status, mod_filter, full, source,
                         total_pages,
                         [{
                             "addr": str(r.get("addr") or ""),
-                            "id": str(r.get("id") or ""),
+                            "room_id": str(r.get("room_id") or ""),
                             "name": str(r.get("name") or ""),
-                            "join_a": str(r.get("join_a") or "0"),
                         } for r in page_rooms])
 
         # ---- 组装消息 ----
@@ -1118,6 +1186,9 @@ class RWInfoPlugin(Star):
             conds.append(f"搜索「{keyword}」")
 
         header = f"【房间列表】{len(rooms)} 个"
+        # 命中数超过上限时明确提示, 避免用户误以为只有这么多
+        if matched_total > len(rooms):
+            header += f"（共 {matched_total} 个，已限 {len(rooms)} 个）"
         if conds:
             header += f"（{'/'.join(conds)}）"
         header += f"　第 {page}/{total_pages} 页"
@@ -1136,22 +1207,13 @@ class RWInfoPlugin(Star):
             mod = "模组" if rm.get("is_mod") else "原版"
             lines.append(f"{idx}. {host}　{pl}/{mx}　{sts}　{mod}")
             lines.append(f"   地图：{mapname}")
-            addr = str(rm.get("addr") or "").strip()
-            if addr:
-                # 中继入口地址(如 RELAY-CN 的 18.216.139.119:5158)只用于展示,
-                # 端口不是游戏端口, 填进 /铁锈查房 查不到; 真人房地址才可直连。
-                if rm.get("addr_direct", True):
-                    lines.append(f"   地址：{addr}")
-                else:
-                    lines.append(f"   入口：{addr}（中继房，用 /铁锈查房 房号 查询）")
             hostname = str(rm.get("host") or "").strip()
             if hostname and hostname not in host:
                 lines.append(f"   房主：{hostname[:24]}")
             if rm.get("source") == "official":
                 lines.append("   （官方自动房）")
-
         lines.append("")
-        lines.append("查房: /铁锈查房 <序号> 或 /铁锈查房 <房号|IP:端口>")
+        lines.append(f"/铁锈查房 <序号> 查详情（本条 1-{len(page_rooms)}）")
         nav = []
         if page > 1:
             nav.append("/铁锈上一页")
@@ -1161,7 +1223,6 @@ class RWInfoPlugin(Star):
             lines.append("　".join(nav))
         if total_pages > 1:
             lines.append(f"/铁锈列表 <页码> 直达 1-{total_pages}")
-
         yield event.plain_result("\n".join(lines))
 
     @filter.command("铁锈下一页")
@@ -1208,14 +1269,21 @@ class RWInfoPlugin(Star):
             is_private = bool(event.is_private_chat())
         except Exception:
             is_private = False
-        if not is_private and not event.is_admin():
+        # 显式查房同样走黑白名单, 不再硬性要求管理员:
+        # 普通群成员发 /铁锈查房 之前会被静默 return, 表现为"指令完全没反应"
+        uid = normalize_gid(event.get_sender_id())
+        gid = normalize_gid(event.get_group_id())
+        if not self._is_allowed(is_private, uid, gid):
+            yield event.plain_result(
+                "当前会话没有查房权限。\n"
+                "管理员可用 /铁锈模式 与 /铁锈白名 调整放行范围。"
+            )
             return
 
         USAGE = (
-            "用法: /铁锈查房 <序号|房号|IP:端口>\n"
+            "用法: /铁锈查房 <序号|房号>\n"
             "  序号: 先发 /铁锈列表, 再填列表里的序号, 如 /铁锈查房 2\n"
-            "  房号: r5132 / s1024 / hytvvi\n"
-            "  直连: 1.2.3.4 或 1.2.3.4:5123"
+            "  房号: r5132 / s1024 / Q12345 / hytvvi"
         )
         if not arg:
             yield event.plain_result(USAGE)
@@ -1231,50 +1299,33 @@ class RWInfoPlugin(Star):
         elif arg.isdigit():
             # 纯数字 = 列表序号(纯数字本身不是房号)
             st = self._state_get(event)
-            addrs = (st or {}).get("addrs") or []
-            if not addrs:
+            items = (st or {}).get("addrs") or []
+            if not items:
                 yield event.plain_result(
                     "请先发送 /铁锈列表（序号取自最近一次列表结果，60 秒内有效）"
                 )
                 return
             n = int(arg)
-            if n < 1 or n > len(addrs):
+            if n < 1 or n > len(items):
                 yield event.plain_result(
-                    f"序号超出范围：当前页共 {len(addrs)} 条"
+                    f"序号超出范围：当前页共 {len(items)} 条"
                 )
                 return
-            item = addrs[n - 1]
+            item = items[n - 1]
             if isinstance(item, dict):
-                target = str(item.get("addr") or "").strip()
-                room_uuid = str(item.get("id") or "").strip()
-                join_a = str(item.get("join_a") or "0").strip()
                 label = str(item.get("name") or "").strip()
+                # qroom 房只有房号, official 房只有地址
+                target = (str(item.get("addr") or "").strip()
+                          or str(item.get("room_id") or "").strip())
             else:
+                label = ""
                 target = str(item or "").strip()
-                room_uuid = join_a = label = ""
             if not target:
                 yield event.plain_result(
-                    f"第 {n} 条没有可用的直连地址，无法查询"
+                    f"第 {n} 条没有可用的地址或房号，无法查询"
                 )
                 return
-            # 中继入口地址(UPList)不能直连, 先向 masterserver 换取真实地址
-            if join_a and join_a != "0" and room_uuid:
-                yield event.plain_result(
-                    f"第 {n} 条是中继房，正在解析真实地址…"
-                )
-                real = await asyncio.to_thread(
-                    self._resolve_relay_addr, room_uuid, join_a
-                )
-                if real:
-                    target = real
-                else:
-                    yield event.plain_result(
-                        f"第 {n} 条的中继地址解析失败（房间可能已关闭或已下架）"
-                    )
-                    return
-            desc = f"第 {n} 条 {target}"
-            if label:
-                desc = f"第 {n} 条 {label} {target}"
+            desc = f"第 {n} 条 {label}".strip()
         else:
             rids = extract_room_ids(arg)
             if not rids:
@@ -1321,7 +1372,7 @@ class RWInfoPlugin(Star):
                 if not is_name_check_error(result):
                     break
                 self.logger.debug(
-                    f"[查房] {target} 探针名被过滤, 重试({attempt}/{max_retry})"
+                    f"[查房] {desc} 探针名被过滤, 重试({attempt}/{max_retry})"
                 )
         finally:
             self._release_probe(idx)
@@ -1337,7 +1388,23 @@ class RWInfoPlugin(Star):
         elif is_error_info(result):
             yield event.plain_result(translate_error(result))
         else:
-            yield event.plain_result(f"[查房] {desc}\n{result[:800]}")
+            # 既不是房间信息也不是已知错误: 多为中继链路调试输出,
+            # 不把原始日志贴到群里, 只取第一条像样的说明文字
+            noise = ("[", "===", "!!", "151 relay", "relay:", "DEBUG", "sid=")
+            tail = ""
+            for line in result.splitlines():
+                s = line.strip()
+                if not s or s.startswith(noise):
+                    continue
+                # 跳过纯 kv 调试行 (如 v7=1 v8=5 ...)
+                if "=" in s and " " in s and not any(c in s for c in "，。：！？"):
+                    continue
+                tail = s
+                break
+            msg = f"[查房] {desc} 未获取到房间信息"
+            if tail:
+                msg += f"\n{tail[:200]}"
+            yield event.plain_result(msg)
 
     @filter.command("铁锈全局解析")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1584,7 +1651,8 @@ class RWInfoPlugin(Star):
             return
         scope = ("全部群" if wildcard else (f"本群({key})" if not is_private else "本私聊"))
         if not arg:
-            cfg = self._get_recall_cfg(event)
+            # 查询: 带 * 时读通配符配置, 否则读本会话生效配置
+            cfg = self._get_recall_cfg(event, want_wildcard=wildcard)
             state = "开启" if cfg["开"] else "关闭"
             yield event.plain_result(f"{scope}自动撤回：{state}；延迟秒数：{cfg['延迟']} 秒")
             return
@@ -1678,6 +1746,8 @@ class RWInfoPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_all_message(self, event: AstrMessageEvent):
         try:
+            # 兜底: 若 __init__ 时事件循环未就绪, 在首条消息补启 bin 清理循环
+            self._ensure_bin_cleanup()
             text = event.message_str or ""
             if not text.strip():
                 return
@@ -1859,6 +1929,14 @@ class RWInfoPlugin(Star):
 
     async def terminate(self):
         """插件卸载时取消所有待执行的查询任务与延迟撤回任务，避免资源泄漏。"""
+        # bin 清理循环是长驻任务, 必须先取消, 否则卸载后仍在后台运行
+        if self._bin_cleanup_task is not None:
+            self._bin_cleanup_task.cancel()
+            try:
+                await self._bin_cleanup_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._bin_cleanup_task = None
         for task in list(self.pending_tasks):
             if not task.done():
                 task.cancel()

@@ -18,8 +18,8 @@ Protocol notes in [PROTOCOL.md](PROTOCOL.md), version history in [CHANGELOG.md](
   - Numeric rooms: `o` `q` `r` `s` + digits, e.g. `r5132`, `s1024`, `o9999`, `q7777`
   - Alphabetic rooms: other leading letters + pure letters, e.g. `hytvvi`, `aabcde`, `babc`
   - Both forms require the whole token to be ≥ 3 chars; bare digits, mixed forms (`a1b2c3`), URL fragments and `u_` prefixes are rejected
-- **Room list**: `/铁锈列表` paged browser with automatic ad filtering
-- **Relay room address resolution**: entry addresses in the list are auto-resolved to real game addresses (see below)
+- **Room list**: `/铁锈列表` paged browser
+- **Look up straight from the list**: `/铁锈查房 <index>` reuses the last list result
 - **Localized failure reasons**: full room / game started / room locked return clear hints
 - **Auto-retry on probe-name filter**: configurable count (default 3), retry names carry each probe index to avoid collisions
 - **Auto-recall**: room info and retry progress can be auto-recalled, per-group / per-private config, off by default
@@ -118,19 +118,16 @@ e.g. /铁锈列表 模组 房间中 2
 Filter state is per-QQ and expires 60 seconds after the last action.
 
 Display format (5 entries per page by default):
-
 ```
-1. 范阮默  1/6  房间中  模组
-   map: 10P&12P 雪葬迷城
-   addr: 113.127.204.47:5129
-
-2. 测试房  1/10  房间中  原版
+1. 萧逸  1/10  房间中  原版
    map: Crossing Large (10p)
-   entry: 18.216.139.119:5158 (relayed room, look up by room ID)
+   addr: Q23486
+2. SERVER  2/10  房间中  原版
+   map: Two Sides Remake (10p)
+   addr: 3.19.39.252:5137
 ```
-
-`addr` is a directly connectable game address; `entry` is a relay room's registration entry which
-cannot be connected to directly, but `/铁锈查房 <index>` resolves it automatically.
+`addr` is the lookup target for that entry: a room ID (e.g. `Q23486`) for player rooms,
+or `ip:port` for official rooms. Both work directly with `/铁锈查房`.
 
 When the room name is `Unnamed`, the host name is shown instead (CSV column 1 is the room name,
 column 7 is the host name).
@@ -147,6 +144,13 @@ column 7 is the host name).
 | numeric room | `o` `q` `r` `s` + digits, at least 3 chars | `/铁锈查房 r5132` |
 | alphabetic room | Other letters, pure alphabetic, at least 3 chars | `/铁锈查房 hytvvi` |
 | direct | `IP` or `IP:port` (port defaults to 5123) | `/铁锈查房 45.76.27.30:5125` |
+
+**Permissions**
+
+Both `/铁锈列表` and `/铁锈查房` follow the white/black lists: with the default `black`
+mode and empty lists, everyone in the group can use them. Admins can narrow access with
+`/铁锈模式`, `/铁锈白名` and `/铁锈黑名`. When blocked, the reason is reported instead of
+being silently dropped.
 
 **Automatic detection vs explicit lookup**
 
@@ -167,88 +171,11 @@ Two sources merged, player rooms first, then waiting rooms, then by player count
 | Q Room List | `https://www.rtsbox.cn/api/paiwei/room_last.php`, player-hosted rooms with host / map / players / status / mod flag |
 | Official | Full official `masterserver` list (Auto Server + relay rooms), placed after player rooms |
 
-### Ad filtering
-
-**Two hard rules**: never use player counts, never use `ip:port`, never use control characters.
-
-| Criterion | Description |
-|---|---|
-| `LINK` / `url:` entries | Discord / QQ group links in the official list, not rooms |
-| Invalid IPv4 / port | Malformed fields |
-| Relay entry placeholder | Host or description matches `RELAY` / `中继` / `入口` / `节点`, **and players == 0** |
-| Group promotion | Name / host / description contains `群号123456789`, `加群`, `QQ群`, `直播服务器`, etc. |
-| Duplicate UUID | Same room UUID reported more than once |
-
-On a 340-row sample: **295 real rooms kept**, 41 group ads + 3 empty relay entries + 1 link dropped.
-
-**Why these three criteria are avoided**
-
-| Criterion | What it would wrongly kill |
-|---|---|
-| Player counts | Self-reported and forgeable (`6360/64921`, `943438591/10` measured), so it always kills real large rooms |
-| `ip:port` | RELAY-CN publishes player rooms via UPList sharing **one single entry** `18.216.139.119:5158`; aggregating by `ip:port` deletes every relayed player room |
-| Control characters | RELAY-CN prefixes every published player room with `\x01`, so host names look like `\x01测试房` |
-
-The relay entry marker (`RELAY-CN 入口`) actually sits in the **host column** (7th), not the
-description column, and it must be `players <= 0` to be dropped — a "entry" with players in it
-is usually a real player's own room.
+Only queryable player rooms are kept: link entries, malformed fields, empty relay
+placeholders, promotional wording, and entries whose player cap exceeds the game
+limit (100 max) are skipped.
 
 Cache: room data is shared globally, paging and filter state are isolated per QQ number, both with a 60-second sliding expiry renewed on activity.
-
-### Relay room address resolution
-
-Relayed rooms (published to the official list by RELAY-CN via UPList) all carry the
-**same entry address** (e.g. `18.216.139.119:5158`), and connecting directly is rejected:
-
-```
-[1] connected, sid='0803f3f3-...'
-KICKED: Your client is newer then the server
-```
-
-The real address lives in the 21st CSV column, field `A`. Client `MultiplayerLobbyActivity/gl.java`:
-
-```java
-if (fVar2.A == 0) str = fVar2.c + ":" + fVar2.g;                    // direct
-else              str = "get|" + fVar2.b + "|" + fVar2.A + "|" + …;  // via get
-```
-
-The challenge code is derived from `A` (`gameFramework/j/m.java`):
-
-| A range | Challenge code |
-|---|---|
-| `0` | empty (connect to `ip:port` directly) |
-| `< 100000` | `MD5("x" + A)[:10]` |
-| `< 200000` | `MD5("y" + A)[:11]` |
-| `< 300000` | `MD5("z" + A)[:12]` |
-| `< 1000000` | `MD5("xx" + A)[:13]` |
-| `< 2000000` | `MD5("yy" + A)[:14]` |
-
-Request `action=get&game_id=<UUID>&c=<challenge>`, the 4th response line holds the real address:
-
-```
-GET ?action=get&game_id=u_c587d747-...&c=da7821ccf7
-
-CORRODINGGAMES[1.0]
-OK
-0d50353605e90e
-u_c587d747-...,Unnamed,176,1.94.184.91,127.0.0.1,5125,true,测试房,...
-                                              ↑ real address 1.94.184.91:5125
-```
-
-`/铁锈查房 <index>` walks this chain automatically when the picked row is a relayed room:
-
-```
-/铁锈查房 3
-→ resolving real address for entry 3…
-→ room info
-```
-
-Sampled 8 of the 260 relayed rooms under `5158`, **all resolved successfully**:
-
-| Room | A | Real address | Lookup result |
-|---|---|---|---|
-| RW-HPS (原版九图单挑排位服) | 43824 | `36.138.100.120:5523` | ✅ 0/100, vanilla |
-| 𒀱EK群内有可爱男娘A | 33805 | `124.222.3.44:5127` | ✅ 0/10, 694-unit mod |
 
 ---
 
@@ -269,9 +196,44 @@ Auto-persisted by the AstrBot framework, editable via WebUI or commands.
 | `show_players` | Show player list, default false |
 | `retry_times` | Retry count when probe name filtered, 0-10, default 3 |
 | `list_page_size` | Room list page size, default 5 |
+| `list_max_display` | Max rooms shown in list, default 20 (0 = unlimited); header shows the matched total when truncated |
 | `list_default_full` | Default full-room filter, `hide` hides full rooms |
+| `probe_max_per_msg` | Max probes per message, default 5 (1-20) |
+| `bin_cleanup_enabled` | Enable periodic bin cache cleanup while the plugin runs, default true |
+| `bin_cleanup_interval_hours` | Cleanup check interval in hours, default 24 (once a day), min 1 |
+| `bin_cleanup_max_age_hours` | Only delete bin files older than N hours, default 1 |
 | `群撤回` | Per-group auto-recall config, `#groupID:on:delay`, e.g. `#123456:1:60` |
 | `私聊撤回` | Per-user auto-recall config, `@userID:on:delay`, e.g. `@3856554669:1:60` |
+
+### bin cache cleanup
+
+After each successful lookup, `room_info.py` dumps the raw 106/115 payloads to
+`server_info_<version>_<target>_<timestamp>.bin` for protocol debugging. They are only
+useful while debugging and pile up during long-running deployments.
+
+Policy: **starting from plugin load, every `bin_cleanup_interval_hours` (default 24h)
+it deletes bin files whose mtime is older than `bin_cleanup_max_age_hours` (default 1h).**
+
+Implementation notes:
+
+- Cleanup always targets the directory containing `room_info.py` (`BIN_DIR`), independent
+  of the current working directory. Writes use the same path, so writer and cleaner can
+  never disagree.
+- The actual deletion runs in a separate subprocess (`room_info.py --cleanup-bins`) so it
+  never blocks the event loop.
+- A failed run does not kill the loop; it retries on the next tick.
+- `terminate()` cancels the loop so nothing keeps running after unload.
+- If the event loop is not ready at construction time, it is lazily started on the first
+  incoming message.
+- Interval and age threshold both have a 60-second floor to prevent a misconfigured 0
+  from hammering the disk.
+
+Manual cleanup:
+
+```bash
+python3 room_info.py --cleanup-bins               # delete files older than 1 hour
+python3 room_info.py --cleanup-bins --max-age 600 # delete files older than 10 minutes
+```
 
 ---
 
