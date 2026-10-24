@@ -1994,16 +1994,19 @@ def parse_player_record(r, stream_ver, game_running=False):
          'is_ai': None, 'player_id': None, 'ping': None, 'exists': True}
     try:
         if game_running:
+            # z=true(游戏中): 客户端丢弃前 5 个字段, 只读公共扩展字段
             r.byte()          # slot (丢弃)
             r.int32()         # credits (丢弃)
             r.int32()         # spawn_id (丢弃)
-            r.nullable_str()  # name (客户端丢弃, 我们也不取)
+            r.nullable_str()  # name (客户端丢弃)
             r.boolean()       # is_ai (丢弃)
         else:
+            # z=false(房间阶段): byte slot + int32 credits + int32 spawn
+            #                   + nullable_str name + boolean is_ai
+            # 对照客户端 p.a(j,z) cond_131: readByte + readInt(credits=p.p)
+            #   + readInt(spawn=p.s) + readUTF(name=p.w) + readBoolean(is_ai=p.X)
             p['slot'] = r.byte()
             p['credits'] = r.int32()
-            r.int32()         # 跳过
-            r.int32()         # 跳过
             p['spawn_id'] = r.int32()
             p['name'] = r.nullable_str()
             p['is_ai'] = r.boolean()
@@ -2096,6 +2099,78 @@ def _classify_name(name: str):
     return True, False, False
 
 
+def _parse_115_offset(block_body: bytes, team_count: int, full_load: bool,
+                      stream_ver: int, game_running: bool = False):
+    """纯偏移解析 teams 块(标准协议), 严格复刻客户端 ae.smali 循环 + p.a()。
+
+    返回 (players, ok) —— players 为解析出的玩家列表; ok=False 表示
+    解析中途字段非法, 应回退到启发式扫描。
+
+    客户端 ae.smali 精确逻辑:
+      for team_idx in range(team_count):
+          team = get_team(team_idx)
+          exists = readBoolean()
+          score  = readInt()
+          if not full_load:             # v0 == 0
+              p.a(reader, is_running)   # 完整玩家结构
+          else:
+              readByte(); readInt(); readBoolean(); readBoolean()  # 精简结构
+    注意: 无论 exists 与否、team 是否存在, score 之后都会读一条玩家/精简记录。
+    """
+    r = NetReader(block_body)
+    players = []
+    try:
+        for team_idx in range(team_count):
+            exists = r.boolean()
+            score = r.int32()
+            if not full_load:
+                # 完整玩家结构: p.a(j, z=false)
+                p = parse_player_record(r, stream_ver, game_running=game_running)
+                if p.get('name') is None and not game_running:
+                    # 名字是空(None): 说明是空槽, 客户端仍保留该槽位但不展示
+                    continue
+                if not game_running:
+                    players.append({
+                        'slot': p.get('slot'),
+                        'team': team_idx,
+                        'num': (p.get('slot') or 0) + 1,
+                        'name': p.get('name'),
+                        'raw_name': p.get('name'),
+                        'is_ai': bool(p.get('is_ai')),
+                        'is_id_only': _classify_name(p.get('name') or '')[2],
+                        'player_id': p.get('player_id'),
+                        'ping': None,
+                        'exists': exists,
+                    })
+                else:
+                    # 游戏中: p.a() 丢弃了 name, 只能拿到公共扩展字段
+                    # 探针场景基本不进入此分支(查房时是房间阶段)
+                    if p.get('player_id'):
+                        players.append({
+                            'slot': None,
+                            'team': team_idx,
+                            'num': 0,
+                            'name': None,
+                            'raw_name': None,
+                            'is_ai': None,
+                            'is_id_only': True,
+                            'player_id': p.get('player_id'),
+                            'ping': None,
+                            'exists': exists,
+                        })
+            else:
+                # 精简结构: byte + int32 + bool + bool
+                r.byte()
+                r.int32()
+                r.boolean()
+                r.boolean()
+        # 读完所有队伍后, 检查是否还有尾部字段(as.d/as.c/as.e/as.f ...)
+        # 客户端循环结束后还会读公共尾部, 但我们只关心玩家列表, 忽略即可。
+        return players, True
+    except (EOFError, struct.error, ValueError):
+        return [], False
+
+
 def parse_115(payload, stream_ver=DEFAULT_VER):
     """解析115 (teams) 消息.
 
@@ -2103,8 +2178,8 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
       int32 own_player_id
       boolean full_load              (stream_ver >= 141)
       int32 team_count
-      readUTF("teams") + int32 block_len + gzip块
-    块内按分隔符 ff ff d8 f1 切分记录, 每条记录取 nullable_str 名字.
+      readUTF("teams") + int32 block_len + [gzip块 stream_ver>=141]
+    块内优先纯偏移解析(标准协议), 失败回退到启发式扫描(RCN 畸形数据)。
 
     返回 dict(players, capacity, team_count, own_player_id, ...)
     """
@@ -2149,7 +2224,18 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
             print(f"[DEBUG] 115: own_id={own_id} full_load={full_load} teams={team_count} "
                   f"block='{block_name}' len={block_len} body={len(block_body)}")
 
-        # 按分隔符切段 (RCN服务器固定分隔符)
+        # ---- 首选: 纯偏移解析(标准协议) ----
+        players, ok = _parse_115_offset(
+            block_body, team_count, full_load, stream_ver)
+        if ok and players:
+            result['players'] = players
+            if DEBUG_MODE:
+                print(f"[DEBUG] 纯偏移解析成功: {len(players)} 个玩家")
+            return result
+        if DEBUG_MODE:
+            print(f"[DEBUG] 纯偏移解析失败/为空(ok={ok} n={len(players)}), 回退启发式")
+
+        # ---- 回退: 启发式扫描(RCN 畸形数据) ----
         sep = b'\xff\xff\xd8\xf1'
         segments = []
         start = 0
@@ -2364,14 +2450,14 @@ def direct_main():
     # 早期这里另写了一套 connect_and_161 流程, 只认 161, 遇到节点先回 178
     # 就报 sid=None / 未收到106 —— 而同样的地址走 node_session 是能查到的。
     result = node_session(ip, port, None)
-    if isinstance(result, tuple) and result and result[0] in ("KICKED", "FAILED", "LOOP"):
+    if isinstance(result, tuple) and result and result[0] in ("KICKED", "FAILED", "LOOP", "CAPTCHA"):
         kind, msg = result[0], str(result[1])
         if kind == "KICKED":
             _handle_kicked(msg)
         if not QUIET:
             print(f"!! {msg}")
         print(f"[房间查询失败] {msg}")
-        sys.exit(1 if kind == "LOOP" else 0)
+        sys.exit(1 if kind in ("LOOP", "CAPTCHA") else 0)
     if result is None:
         print("[房间查询失败] 房间不存在或已关闭")
         sys.exit(1)
@@ -2414,7 +2500,7 @@ def _follow_jump(addr, rid, depth, seen, tag=""):
         h2, p2 = addr, 5123
     if not QUIET:
         print(f"{tag}[3] 跳转到节点 {h2}:{p2}")
-    return node_session(h2, p2, rid)
+    return node_session(h2, p2, rid, depth + 1, seen)
 
 
 def relay_session(host, port, rid, depth=0, seen=None):
@@ -2539,6 +2625,15 @@ def relay_session(host, port, rid, depth=0, seen=None):
             if not QUIET:
                 print(f"{tag}    未处理消息 mtype={mtype} len={len(payload)} hex={payload.hex()[:80]}")
         if got_106 is not None:
+            # 反机器人验证码房识别(同 node_session)
+            try:
+                _vinfo = parse_106(got_106)
+                if _is_verification_map(_vinfo):
+                    send_leave(s)
+                    s.close()
+                    return ("CAPTCHA", "验证码房无法继续")
+            except Exception:
+                pass
             send_leave(s)
             s.close()
             return got_106, got_115
@@ -2610,7 +2705,22 @@ def _follow_node_jump(addr, rid, depth=0, seen=None):
     return node_session(h, p, rid, depth + 1, seen)
 
 
+def _is_verification_map(info: dict) -> bool:
+    """识别 RELAY-CN 的反机器人验证码房间。
+
+    部分中继房通过 action=get 解析出的地址, 连上去后返回的地图是
+    "rank-verification.tmx"(der.kim 的排位验证码), 而非目标房间。
+    这种是反机器人机制: 探针继续交互或反复尝试会被封 IP。
+
+    必须识别并立即撤退, 不能把验证码房当成目标房展示给用户。
+    """
+    mn = str((info or {}).get("mapname") or "").lower()
+    return "verification" in mn or "verif" in mn or "captcha" in mn
+
+
 def node_session(host, port, rid=None, depth=0, seen=None):
+    if seen is None:
+        seen = set()
     if not QUIET:
         print(f"[4] 连接节点: {host}:{port} (房间 {rid or '-'})")
     try:
@@ -2642,7 +2752,7 @@ def node_session(host, port, rid=None, depth=0, seen=None):
         s2.close()
         if not QUIET:
             print(f"[5] 节点握手即178: {jump_now!r}")
-        return _follow_node_jump(jump_now, rid, 0)
+        return _follow_node_jump(jump_now, rid, depth + 1, seen)
     if not sid2:
         if not QUIET:
             print("!! 节点握手失败")
@@ -2724,6 +2834,16 @@ def node_session(host, port, rid=None, depth=0, seen=None):
             if not QUIET:
                 print(f"[6] 未处理消息 mtype={mtype} len={len(payload)} hex={payload.hex()[:80]}")
         if got_106 is not None:
+            # 反机器人验证码房识别: RELAY-CN 对部分房会下发 rank-verification
+            # 这种是验证码, 不是目标房间。立即撤退并明确标记, 避免误报和封 IP。
+            try:
+                _vinfo = parse_106(got_106)
+                if _is_verification_map(_vinfo):
+                    send_leave(s2)
+                    s2.close()
+                    return ("CAPTCHA", "验证码房无法继续")
+            except Exception:
+                pass
             send_leave(s2)
             s2.close()
             return got_106, got_115
@@ -2771,6 +2891,9 @@ def relay_main():
     result = relay_session(host, 5123, RID)
     if isinstance(result, tuple) and result[0] == "KICKED":
         _handle_kicked(result[1])
+    if isinstance(result, tuple) and result[0] == "CAPTCHA":
+        print(f"[房间查询失败] {result[1]}")
+        sys.exit(1)
     if isinstance(result, tuple) and result[0] == "LOOP":
         if not QUIET:
             print(f"!! {result[1]}")

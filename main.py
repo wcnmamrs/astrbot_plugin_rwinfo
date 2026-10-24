@@ -1409,6 +1409,13 @@ class RWInfoPlugin(Star):
                         self._resolve_relay_addr, uuid_, join_a)
                     if real:
                         target = real
+                    else:
+                        # 解析失败: 不能用 :5158 入口直连(会被踢或串到别的房),
+                        # 明确报错而不是静默退回入口地址。
+                        yield event.plain_result(
+                            f"第 {n} 条 {label} 无法解析真实地址，暂时无法查询"
+                        )
+                        return
             else:
                 label = ""
                 target = str(item or "").strip()
