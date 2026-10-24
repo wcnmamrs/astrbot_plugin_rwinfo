@@ -1827,17 +1827,21 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
     lines.append(f"当前人数：{count}/{maxp if maxp else '?'}")
 
     # 显示 Mod 信息
+    # 坑: customUnits 块与 mod 无关 —— 发送端 l.a(bg) 是**无条件**调用
+    # (aj.smali:746), 遍历的是全局单位表 l.d, 任何房间(含原版)都会带
+    # 121 个内置单位。所以:
+    #   · cnt=121 不代表任何 mod
+    #   · has_custom 也不代表有 mod
+    # 只能靠单位显示名判断: mod 会带来"与单位ID不同"的显示名(如"炮塔科技1.4")。
     mod_names = info.get('mod_names', [])
-    unit_count = info.get('custom_unit_count', len(info.get('custom_units', [])))
-    # mod_names 收集自 customUnits 块每条单位的 mod 归属名(如"炮塔科技1.4"), 去重后=房间用的 mod 列表
-    # 为空 = 原版 (custom_unit_count 只是内置单位数)
+    unit_count = info.get('custom_unit_count') or 0
     if mod_names:
         mod_str = ', '.join(f"[{m}]" for m in mod_names[:5])
         if len(mod_names) > 5:
             mod_str += f" 等{len(mod_names)}个"
         lines.append(f"使用Mod：{mod_str}（{unit_count} 个单位）")
     else:
-        lines.append(f"使用Mod：原版（{unit_count} 内置单位）")
+        lines.append("使用Mod：原版")
 
     # 只展示房号类标识(Q57390 / r5132 / u_xxx), 不展示 IP 形式的目标地址
     _rid_s = str(rid or "").strip()
