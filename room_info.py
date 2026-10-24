@@ -1678,6 +1678,22 @@ UNIT_NAMES = {1: '常规模式（1个建造者）', 2: '小军队', 3: '3工程�
 PICKABLE_STARTING_UNITS = ['experimentalDropship', 'experimentalGunship', 'experimentalSpider', 'modularSpider']
 MULTIPLIER_NAMES = {0: '1x', 1: '1.5x', 2: '2x', 3: '2.5x'}
 
+
+def _fmt_multiplier(v):
+    """格式化收入倍率（协议字段本就是 float32）。
+
+    读取用 struct.unpack('>f') 已是 float32 语义; 显示时用 'g'
+    按最短有效数字输出, 避免 Python double repr 的精度噪声
+    (0.1f -> 0.10000000149011612)。
+    """
+    if v is None:
+        return "1x"
+    v = float(v)
+    key = int((v - 1.0) * 2.0)
+    if key in MULTIPLIER_NAMES:
+        return MULTIPLIER_NAMES[key]
+    return f"{format(v, 'g')}x"
+
 UNIT_TRANSLATIONS = {
     'AntiNukeLaucher': '反核防御',
     'NukeLaucher': '核弹发射井',
@@ -1822,7 +1838,7 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
         money_str = "4000¤"
     else:
         money_str = CREDITS_NAMES.get(c, f"${c}")
-    mul = MULTIPLIER_NAMES.get(int((info.get('multiplier', 1.0) - 1.0) * 2.0), f"{info.get('multiplier', 1.0)}x")
+    mul = _fmt_multiplier(info.get('multiplier', 1.0))
     lines.append(f"初始资金：{money_str}[{mul}倍率]")
 
     lines.append(f"初始禁核：{'禁用核蛋蛋' if info.get('no_nukes', False) else '未禁用核蛋蛋'}")
