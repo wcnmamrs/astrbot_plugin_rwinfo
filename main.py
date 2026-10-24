@@ -1278,7 +1278,7 @@ class RWInfoPlugin(Star):
         lines = [header, ""]
         status_cn = {"battleroom": "房间中", "ingame": "游戏中",
                      "locked": "已锁定", "chat": "聊天", "unknown": "-"}
-        for idx, rm in enumerate(page_rooms, start + 1):
+        for idx, rm in enumerate(page_rooms, 1):
             host = str(rm.get("name") or "?")[:16]
             mapname = str(rm.get("map") or "-")[:28]
             pl = rm.get("players", 0)
@@ -1290,7 +1290,7 @@ class RWInfoPlugin(Star):
             hostname = str(rm.get("host") or "").strip()
             if hostname and hostname not in host:
                 lines.append(f"   房主：{hostname[:24]}")
-            if rm.get("source") == "official":
+            if rm.get("is_auto_server"):
                 lines.append("   （官方自动房）")
         lines.append("")
         lines.append(f"/铁锈查房 <序号> 查详情（本条 1-{len(page_rooms)}）")
