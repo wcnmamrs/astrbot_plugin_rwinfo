@@ -999,10 +999,43 @@ def classify_room(room: dict) -> tuple:
 
     return "ok", ""
 
-
 def is_joinable(room: dict) -> bool:
     """是否为可加入的房间(status=battleroom)"""
     return (room.get("status") or "").strip().lower() == "battleroom"
+
+
+# 客户端把某房间用到的 mod 名用 "; " 拼接后放在列表第 21 列(下标 20),
+# 数量超出展示上限时截断成 "xxx; yyy; 2 more..."(见 ae.smali:13056)。
+_MORE_RE = re.compile(r"^(\d+)\s+more\.\.\.$", re.IGNORECASE)
+
+# 官方自动房(Auto Server)的描述格式: "Auto Server 4+ [US-E #3]"
+#   4+      = 最少玩家数
+#   [US-E]  = 区域(US-E/US-F/US-G/CN...)
+#   #3      = 编号
+_AUTO_SERVER_RE = re.compile(r"^auto\s*server\s*\d+\s*\+?\s*\[[^\]]*#\d+\]",
+                             re.IGNORECASE)
+
+
+def _split_mod_names(v) -> list:
+    """把第 21 列的 mod 名串拆成名字列表。
+
+    空串 / "0" / "-" 视为原版, 返回 []。
+    "A; B; 2 more..." -> ["A", "B"]  (more 只是"还有 N 个没列出来"的标记)
+    """
+    s = (v or "").strip()
+    if not s or s in ("0", "-"):
+        return []
+    out = []
+    for part in s.split(";"):
+        name = part.strip()
+        if not name:
+            continue
+        if _MORE_RE.match(name):
+            continue          # "2 more..." 不是 mod 名
+        if name not in out:
+            out.append(name)
+    return out
+
 
 
 def _parse_room_line(line: str, index: int) -> dict:
@@ -1024,8 +1057,9 @@ def _parse_room_line(line: str, index: int) -> dict:
     #   10 模式(skirmishMap/customMap/LINK)   11 状态(battleroom/ingame/LINK)
     #   12 游戏版本        13 ?               14 描述(备用)
     #   15 当前人数        16 人数上限        17 ?
-    #   18 UUID副本        19 ?               20 ?
-#   21 A 字段(仅协议层使用, 插件不再解析)
+    #   18 UUID副本        19 ?               20 Mod 名列表(分号分隔)
+    #   21 A 字段(加入方式; 0=列表地址即真实地址, 非0=中继房需 action=get)
+    mod_names = _split_mod_names(f[20] if len(f) > 20 else "")
     return {
         "idx": index,
         "id": g(0),
@@ -1042,7 +1076,11 @@ def _parse_room_line(line: str, index: int) -> dict:
         "desc": g(9) or g(14, ""),
         "players": g(15, "0"),
         "max": g(16, "?"),
-        # 第 21 列: 加入方式。0 = 列表里的 ip:port 就是真实地址;
+        # 第 21 列(下标 20): Mod 名列表, 空表示原版。
+        # 客户端把多个名字用 "; " 拼起来, 超出上限时截断成 "N more..."
+        "mod_names": mod_names,
+        "is_mod": bool(mod_names),
+        # 第 22 列(下标 21): 加入方式。0 = 列表里的 ip:port 就是真实地址;
         # 非 0 = 中继房, 需要向 masterserver 发 action=get 换真实地址。
         "join_a": g(21),
         # 原始未清洗字段: 仅用于内容判定, 不对外展示
@@ -1258,6 +1296,17 @@ def _normalize_official(room: dict) -> dict:
     desc = (room.get("desc") or "").strip()
     status = (room.get("status") or "").strip().lower() or "unknown"
 
+    # 是否为官方自动房(Auto Server)。
+    # 判据: 房主列(第 7 列)是 "SERVER" 且描述是 "Auto Server <N>+ [区域 #N]" 格式。
+    # 不能只看 source == "official" —— official 源里绝大多数是玩家自己开的
+    # 中继房(自己公开后会进这张表), 早期把它们全标成"官方自动房"是错的。
+    # 也不能只看地图含 "Auto Server": 有玩家拿这张地图自己开房(如"世界征服1942"),
+    # 那种房的房主不是 "SERVER"。
+    # 注意: 房名列(第 1 列)对 Auto Server 是 "Unnamed", 房主列才是 "SERVER"。
+    raw_host = (room.get("host") or "").strip()
+    is_auto = bool(raw_host.upper() == "SERVER"
+                   and _AUTO_SERVER_RE.match(desc))
+
     return {
         "source": "official",
         "id": room.get("id", ""),
@@ -1268,7 +1317,13 @@ def _normalize_official(room: dict) -> dict:
         "players": _as_int(room.get("players"), 0),
         "max": _as_int(room.get("max"), 0),
         "status": status,
-        "is_mod": False,
+        # Mod: 来自列表第 21 列(下标 20)。空 = 原版。
+        # 早期版本这里硬编码 False, 导致所有 official 房在列表里
+        # 一律显示"原版", 且 /铁锈列表 模组 会把 official 房全过滤掉。
+        "is_mod": bool(room.get("is_mod")),
+        "mod_names": list(room.get("mod_names") or []),
+        # 官方自动房(Auto Server)标记, 仅用于展示标注
+        "is_auto_server": is_auto,
         "is_started": 1 if status == "ingame" else 0,
         "desc": desc,
         # 中继房判定所需(仅内部使用, 不展示): 非 0 表示列表地址是注册入口
@@ -1395,24 +1450,29 @@ def fetch_rooms(source: str = "all", include_all: bool = False,
                 str(room.get("name") or ""),
                 str(room.get("map") or ""),
                 str(room.get("desc") or ""),
+                " ".join(str(m) for m in (room.get("mod_names") or [])),
             ]).lower()
             if kw not in blob:
                 continue
         out.append(room)
 
-    # 排序: 有可查目标的排前面, 其次 房间中 > 游戏中, 再按人数降序
-    # 注意: RELAY-CN 的 :5158 是 UPList 注册入口, 不是游戏端口, 直连查不到,
-    # 这类地址不算"可查目标", 否则会把一屏假人数条目顶到最前面。
-    def _has_target(r):
-        addr = str(r.get("addr") or "")
-        if r.get("room_id"):
-            return True
-        return bool(addr) and not addr.endswith(":5158")
-
+    # 排序: 有人的排前面 > 玩家自开房优先 > 房间中优先 > 人数降序。
+    # 早期用 _has_target(有可直连地址) 排第一关键字, 导致两个问题:
+    #   1) 官方 Auto Server 空房(0/10)有直连 ip:port, 全部顶到前 20 条,
+    #      把"随机生存挑战 18/21"这类热闹真人房挤到后面;
+    #   2) RELAY-CN 的 :5158 是注册入口, 被当成"不可查目标"沉底, 但中继房
+    #      现在能通过 join_a+uuid 向 masterserver 解析真实地址, 早已可查。
+    # 因此第一关键字改为"是否有人", 其次再区分玩家房 / Auto Server。
     def _sort_key(r):
-        return (0 if _has_target(r) else 1,
-                0 if (r.get("status") or "").lower() == "battleroom" else 1,
-                -(r.get("players") or 0))
+        players = int(r.get('players') or 0)
+        st = (r.get('status') or '').strip().lower()
+        is_auto = bool(r.get('is_auto_server'))
+        return (
+            0 if players > 0 else 1,        # 有人的房排前面(热闹优先)
+            0 if not is_auto else 1,        # 玩家自开房优先于官方自动房
+            0 if st == 'battleroom' else 1, # 房间中优先于游戏中
+            -players,                        # 人数降序
+        )
     out.sort(key=_sort_key)
     return out
 
@@ -1744,7 +1804,7 @@ def detect_client(info):
     return '?'
 
 
-def format_room(info, rid, players, capacity=None, players_detail=None, max_players_display=10, player_count=None, show_players=False):
+def format_room(info, rid, players, capacity=None, players_detail=None, max_players_display=10, player_count=None, show_players=False, room_mod_names=None):
     import re as _re
 
     lines = []
@@ -1827,18 +1887,26 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
     lines.append(f"当前人数：{count}/{maxp if maxp else '?'}")
 
     # 显示 Mod 信息
-    # 坑: customUnits 块与 mod 无关 —— 发送端 l.a(bg) 是**无条件**调用
-    # (aj.smali:746), 遍历的是全局单位表 l.d, 任何房间(含原版)都会带
-    # 121 个内置单位。所以:
-    #   · cnt=121 不代表任何 mod
-    #   · has_custom 也不代表有 mod
-    # 只能靠单位显示名判断: mod 会带来"与单位ID不同"的显示名(如"炮塔科技1.4")。
-    mod_names = info.get('mod_names', [])
+    # 两处来源, 优先级: 列表自带的名字 > 106 包里的单位显示名
+    #   1) 列表第 21 列(下标 20) 的 mod 名 —— official / qroom 列表都有
+    #      这是房主上报的**权威**信息, 且能覆盖"只改数值不改单位"的 mod
+    #   2) 106 包里 customUnits 的单位显示名 —— 仅当列表没给名字时兜底
+    # 坑: customUnits 块本身与 mod 无关 —— 发送端 l.a(bg) 是**无条件**调用
+    # (aj.smali:746), 遍历全局单位表 l.d, 任何房间(含原版)都会带 121 个内置单位。
+    # 所以 cnt=121 不代表任何 mod, has_custom 也不代表有 mod。
+    list_mods = [m for m in (room_mod_names or []) if m]
+    pkt_mods = info.get('mod_names', []) or []
     unit_count = info.get('custom_unit_count') or 0
-    if mod_names:
-        mod_str = ', '.join(f"[{m}]" for m in mod_names[:5])
-        if len(mod_names) > 5:
-            mod_str += f" 等{len(mod_names)}个"
+    if list_mods:
+        shown = list_mods[:5]
+        mod_str = ', '.join(f"[{m}]" for m in shown)
+        if len(list_mods) > 5:
+            mod_str += f" 等{len(list_mods)}个"
+        lines.append(f"使用Mod：{mod_str}")
+    elif pkt_mods:
+        mod_str = ', '.join(f"[{m}]" for m in pkt_mods[:5])
+        if len(pkt_mods) > 5:
+            mod_str += f" 等{len(pkt_mods)}个"
         lines.append(f"使用Mod：{mod_str}（{unit_count} 个单位）")
     else:
         lines.append("使用Mod：原版")
