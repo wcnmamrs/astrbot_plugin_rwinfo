@@ -2287,58 +2287,24 @@ def direct_main():
         ip, port = DIRECT_TARGET, 5123
     if not QUIET:
         print(f"=== 直连 {ip}:{port} (客户端 1.15) ===")
-    # 直连地址不一定是游戏服务器(可能是 Web/其他服务), 连接失败属正常情况,
-    # 必须输出 [房间查询失败] 而非抛 traceback, 否则插件无法归类失败原因。
-    try:
-        s, probe = connect_and_161(ip, port)
-    except (socket.timeout, TimeoutError):
-        print(f"[房间查询失败] 连接 {ip}:{port} 超时（地址不可达或非游戏服务器）")
-        sys.exit(0)
-    except (OSError, ConnectionError) as e:
-        print(f"[房间查询失败] 连接 {ip}:{port} 失败（{type(e).__name__}，"
-              f"地址不可达或非游戏服务器）")
-        sys.exit(0)
-    except Exception as e:
-        print(f"[房间查询失败] 连接 {ip}:{port} 失败（{type(e).__name__}）")
-        sys.exit(0)
-    sid = probe.server_id
-    if not QUIET:
-        print(f"[1] 已连, sid={sid!r} conn={probe.conn_id}")
-    send_110(s, sid, CK, probe.conn_id, probe.challenge_y)
-    got_106 = None
-    got_115 = None
-    kick_reason = None
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        try:
-            mtype, payload = read_frame(s, 2)
-        except (socket.timeout, OSError):
-            break
-        if mtype == 151:
-            probe._handle_relay_151(payload)
-        elif mtype == 106:
-            got_106 = payload
-            if not QUIET:
-                print(f"[2] 收到106 SERVER_INFO ({len(payload)}B)")
-        elif mtype == 115:
-            got_115 = payload
-            if not QUIET:
-                print(f"[2] 收到115 teams ({len(payload)}B)")
-        elif mtype == 150:
-            kick_reason = NetReader(payload).utf()
-            if not QUIET:
-                print("KICKED:", kick_reason)
-            break
-        if got_106 and got_115:
-            break
-    if kick_reason:
-        _handle_kicked(kick_reason, s)
-    if got_106 is None:
+
+    # 统一走 node_session: 它会处理 161 之前的 178 跳转、151 挑战、106/115。
+    # 早期这里另写了一套 connect_and_161 流程, 只认 161, 遇到节点先回 178
+    # 就报 sid=None / 未收到106 —— 而同样的地址走 node_session 是能查到的。
+    result = node_session(ip, port, None)
+    if isinstance(result, tuple) and result and result[0] in ("KICKED", "FAILED", "LOOP"):
+        kind, msg = result[0], str(result[1])
+        if kind == "KICKED":
+            _handle_kicked(msg)
         if not QUIET:
-            print("!! 未收到106")
-        s.close()
+            print(f"!! {msg}")
+        print(f"[房间查询失败] {msg}")
+        sys.exit(1 if kind == "LOOP" else 0)
+    if result is None:
+        print("[房间查询失败] 房间不存在或已关闭")
         sys.exit(1)
-    finish_report(s, got_106, got_115, DIRECT_TARGET)
+    got_106, got_115 = result
+    finish_report(None, got_106, got_115, DIRECT_TARGET)
 
 
 def relay_host(rid: str) -> str:
@@ -2513,7 +2479,66 @@ def relay_session(host, port, rid, depth=0, seen=None):
     return ("FAILED", f"未收到房间信息（中继 {host}:{port} 无响应）")
 
 
-def node_session(host, port, rid=None):
+def _follow_node_jump(addr, rid, depth=0, seen=None):
+    """跟随节点下发的 178 跳转(节点侧, 不带 161)。
+
+    节点回包形如:
+        [TCP]h1.example.com:5123/RA      -> host:port + 新房间号, 继续中继
+        [TCP]1.2.3.4:5123                -> 纯地址, 继续连节点
+
+    客户端(ae.java)收到 178 后一律关闭当前连接再连新地址, 不把它当错误。
+    这里统一处理, 并做环检测与深度限制, 防止节点互相推诿造成死循环。
+    """
+    if seen is None:
+        seen = set()
+    if depth > 6:
+        if not QUIET:
+            print(f"!! 节点跳转层级过深({depth})")
+        return ("LOOP", "节点跳转层级过深")
+    raw = (addr or "").strip()
+    if not raw:
+        return ("FAILED", "节点跳转地址为空")
+    raw = re.sub(r'^\[(TCP|UDP)\]\s*', '', raw)
+    if not QUIET:
+        print(f"[*] 跟随节点178: {raw!r} (depth={depth})")
+
+    # 客户端 ae.smali 的地址归一化(必须照做, 否则短代号全部连不上):
+    #   · 以 ".relay" 结尾            -> 补 ".corrodinggames.com"
+    #   · 不含 : . / \ 且非 localhost -> "首字母.relay.corrodinggames.com/<原串>"
+    # 例: "[TCP]RRELAY-CN" -> "R.relay.corrodinggames.com/RRELAY-CN"
+    if raw.lower().endswith(".relay"):
+        raw = raw + ".corrodinggames.com"
+    elif (len(raw) > 1 and ":" not in raw and "." not in raw
+          and "/" not in raw and "\\" not in raw and raw != "localhost"):
+        raw = f"{raw[0]}.relay.corrodinggames.com/{raw}"
+        if not QUIET:
+            print(f"[*] 短代号转域名: {raw!r}")
+
+    key = raw.lower()
+    if key in seen:
+        if not QUIET:
+            print(f"!! 节点跳转环路 {raw}")
+        return ("LOOP", f"节点跳转环路: {raw}")
+    seen.add(key)
+
+    if "/" in raw:
+        hp, _, rid2 = raw.partition("/")
+        rid2 = rid2.strip()
+        if ":" in hp:
+            h, _, p = hp.rpartition(":")
+            p = int(p) if p.isdigit() else 5123
+        else:
+            h, p = hp, 5123
+        return relay_session(h, p, rid2, depth + 1, set(seen))
+    if ":" in raw:
+        h, _, p = raw.rpartition(":")
+        p = int(p) if p.isdigit() else 5123
+    else:
+        h, p = raw, 5123
+    return node_session(h, p, rid, depth + 1, seen)
+
+
+def node_session(host, port, rid=None, depth=0, seen=None):
     if not QUIET:
         print(f"[4] 连接节点: {host}:{port} (房间 {rid or '-'})")
     try:
@@ -2537,6 +2562,15 @@ def node_session(host, port, rid=None):
     sid2 = probe2.server_id
     if not QUIET:
         print(f"[5] 节点161: sid={sid2!r} conn={probe2.conn_id}")
+    # 有些节点在握手阶段就直接回 178(连 161 都不发): RELAY-CN / Tiexiu 的
+    # 分配节点就是这样, 回包形如 "[TCP]h1.example:5123/RA"。客户端收到后
+    # 会关掉连接继续跟随, 早期这里只认 161, 于是全部报"未响应握手"。
+    jump_now = getattr(probe2, "jump_addr", None)
+    if jump_now:
+        s2.close()
+        if not QUIET:
+            print(f"[5] 节点握手即178: {jump_now!r}")
+        return _follow_node_jump(jump_now, rid, 0)
     if not sid2:
         if not QUIET:
             print("!! 节点握手失败")
@@ -2600,11 +2634,13 @@ def node_session(host, port, rid=None):
                 kick_reason = hint
                 break
         elif mtype == 178:
+            # 178 是跳转指令, 不是拒绝。节点把房间转挂到别处时会再下发一跳
+            # (如 62.234.56.66:5126/RB), 客户端收到后关掉当前连接继续跟随。
             addr = probe2._handle_178(payload)
             if not QUIET:
-                print(f"[6] 节点再次178: {addr!r}（忽略，终止）")
-            kick_reason = f"节点拒绝接入({addr})"
-            break
+                print(f"[6] 节点178跳转: {addr!r}")
+            s2.close()
+            return _follow_node_jump(addr, rid, depth + 1, seen)
         elif mtype == 141:
             sender, message = parse_141(payload)
             if not QUIET:
