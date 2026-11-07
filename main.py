@@ -669,6 +669,37 @@ def extract_room_ids(text: str):
     return ids
 
 
+# ---- 忽略正则：哪些消息「不该被解析房号」 ----
+# 自动触发只看「消息里有没有房号」，可别的机器人（以及本插件的另一个实例）
+# 发出来的房间信息、房间列表、错误提示里也全是房号。这类文本一旦被当成
+# 用户请求，就会滚成「A 机器人发结果 → B 机器人去查房 → 又发结果」的循环，
+# 白烧探针名额，群里还刷屏。
+#
+# 判据分两层：
+#   1. 内置规则（下表，不可删除）—— 覆盖本插件自己的输出形状，
+#      以及常见第三方查房机器人的报告格式；
+#   2. 自定义规则（配置项「忽略正则」，用 /铁锈忽略 维护）—— 站长自己补。
+# 任一条命中即整条消息不解析；显式 /铁锈查房、/铁锈列表 不受影响。
+#
+# 写规则的原则：宁可窄一点。命中即静默，误伤的表现是「用户发了房号却没反应」，
+# 比多查一次更难排查。
+IGNORE_PATTERNS = (
+    # 字段名后必须跟冒号（或表格分隔符）才算「报告」——
+    # 否则「地图名称是什么」这种提问也会被当成报告，把真请求挡掉。
+    ("房间信息块", r"房间版本\s*[：:]|地图名称\s*[：:]|初始资金\s*[：:]"
+                 r"|初始禁核\s*[：:]|初始迷雾\s*[：:]"
+                 r"|\|\s*(?:房间版本|地图名称|初始资金|初始禁核|初始迷雾)\s*\|"),
+    ("字段行", r"^\s*(?:ID|当前人数|单位上限|地图模式|默认单位|共享控制|允许旁观|队伍锁定)\s*[：:]"),
+    ("房号标注", r"房号\s*[：:]\s*[A-Za-z]"),
+    ("房间列表", r"【房间列表】|房间列表\s*[：:]|第\s*\d+\s*页\s*/\s*共"),
+    ("错误报告", r"\[房间查询失败\]|\[插件错误\]|查房无响应|房间不存在或已关闭"),
+    ("探针输出", r"探针(?:脚本不可用|没有任何输出|进房时间|池|名被过滤)"),
+    ("中继诊断", r"relay\.corrodinggames|中继\s*[：:]|\[151\]|\[DBG\]|\[DEBUG\]"),
+    ("撤回回执", r"自动撤回\s*[：:]|撤回配置|已把\s*\*\s*展开"),
+    ("插件界面", r"【铁锈查房"),
+)
+
+
 # 房间信息字段名（用于归一化匹配）。
 # 只放「我们自己会输出」的字段；用于判断探针返回的是不是有效房间信息
 # （is_room_info 在查房结果校验处被调用，决定回传结果还是报错）。
@@ -1162,6 +1193,11 @@ class RWInfoPlugin(Star):
             "房号冷却秒": 10,
             # 冷却中是否回一条提示。默认关(完全静默)。
             "冷却提示": False,
+            # ---- 忽略规则 ----
+            # 命中「忽略正则」的消息不解析房号（内置规则另有一套，见
+            # IGNORE_PATTERNS）。用来挡住别的机器人发的房间报告/错误。
+            "忽略开关": True,
+            "忽略正则": [],
         }
 
     def _save_config(self):
@@ -1569,6 +1605,50 @@ class RWInfoPlugin(Star):
             tag = "self-" + format(int(time.time()) & 0xFFFFFF, "06x")
             self._self_tag = tag
         return tag
+
+    def _ignore_rules(self):
+        """编译忽略规则：内置规则 + 配置项「忽略正则」。
+
+        结果按「自定义规则元组」缓存，配置没变就不重复编译
+        （每次群消息都要判定，正则编译不能放在热路径上）。
+        编译失败的自定义规则会被跳过并记 warning —— 一条写错的正则
+        不该让整个过滤失效，更不该让插件起不来。
+        """
+        custom = self.cfg.get("忽略正则", [])
+        if not isinstance(custom, list):
+            custom = []
+        custom = [str(p) for p in custom if str(p).strip()]
+        cache = getattr(self, "_ignore_cache", None)
+        if cache is not None and cache[0] == tuple(custom):
+            return cache[1]
+        rules = [(name, re.compile(pat, re.MULTILINE)) for name, pat in IGNORE_PATTERNS]
+        for i, pat in enumerate(custom, 1):
+            try:
+                rules.append((f"自定义#{i}", re.compile(pat, re.MULTILINE)))
+            except re.error as e:
+                self.logger.warning(
+                    f"[忽略] 自定义规则 #{i} 不是合法正则，已跳过：{pat!r}（{e}）")
+        self._ignore_cache = (tuple(custom), rules)
+        return rules
+
+    def _is_ignored_text(self, text: str) -> str:
+        """这条消息是否「不该解析房号」：命中返回规则名，否则返回空串。
+
+        只用于自动触发路径。显式 /铁锈查房 <房号> 走的是指令参数，
+        不经过这里 —— 用户明确要查，就照查。
+        """
+        if not self.cfg.get("忽略开关", True):
+            return ""
+        t = str(text or "")
+        if not t.strip():
+            return ""
+        for name, rx in self._ignore_rules():
+            try:
+                if rx.search(t):
+                    return name
+            except Exception:
+                continue
+        return ""
 
     def _is_plugin_ui_text(self, text: str) -> bool:
         """判断这条消息是不是插件自己发出的「界面文本」。
@@ -4375,6 +4455,7 @@ async for _r in _ag:
             "/铁锈私聊策略 白|黑　/铁锈私聊开关 开|关",
             "/铁锈玩家列表 开|关　/铁锈重试 [0-10]",
             "/铁锈撤回 列出|+|-|重置　* 表示所有群",
+            "/铁锈忽略 +|-|测试|开|关　挡住别的机器人发的报告",
             "",
             "—— 调试 ——",
             "/铁锈查房调试 [会话|撤回|探针|列表|配置|官机]",
@@ -4432,6 +4513,7 @@ async for _r in _ag:
             "铁锈官机探测",
             "铁锈官机测试",
             "铁锈压缩",
+            "铁锈忽略",
         }
         if cmd in known:
             return
@@ -5721,6 +5803,136 @@ async for _r in _ag:
         async for _r in _ag:
             yield _r
 
+    @filter.command("铁锈忽略")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_ignore(self, event: AstrMessageEvent, arg: str = ""):
+        """维护「忽略正则」：命中的消息不解析房号。
+
+        用法：
+          /铁锈忽略                    查看内置/自定义规则
+          /铁锈忽略 + <正则>           添加一条（多行可连写多条）
+          /铁锈忽略 - <序号>           按序号删除自定义规则
+          /铁锈忽略 - <正则原文>       按内容删除
+          /铁锈忽略 测试 <文本>        看这段文本会命中哪条规则
+          /铁锈忽略 开|关              总开关
+
+        用途：别的机器人（或本插件的另一个实例）发出来的房间信息、
+        房间列表、错误提示里也全是房号。不挡住就会形成
+        「A 发结果 → B 去查房 → 又发结果」的循环。
+        """
+        _why = self._session_blocked(event)
+        if _why:
+            _ag = self._send_text(event, _why)
+            async for _r in _ag:
+                yield _r
+            return
+
+        # 正则里常带空格，按命令名取完整参数，否则 `+ ^房间 版本` 会被截断
+        arg = self._raw_args(event, arg, "铁锈忽略")
+        _ag = self._send_text(event, self._ignore_text(arg))
+        async for _r in _ag:
+            yield _r
+
+    def _ignore_text(self, arg: str) -> str:
+        """忽略规则的查看/增删/测试（同步，返回要发送的文本）。"""
+        custom = self.cfg.get("忽略正则", [])
+        if not isinstance(custom, list):
+            custom = []
+        custom = [str(p) for p in custom if str(p).strip()]
+        raw = (arg or "").strip()
+        low = raw.lower()
+
+        def _save(lst):
+            self._write_config("忽略正则", lst)
+            self._save_config()
+            self._ignore_cache = None   # 让下一条消息重新编译
+
+        if not raw or low in ("列出", "列表", "查看"):
+            L = [f"忽略开关：{'开' if self.cfg.get('忽略开关', True) else '关'}"]
+            L.append(f"内置规则 {len(IGNORE_PATTERNS)} 条（不可删除）：")
+            L.append("　" + "、".join(name for name, _ in IGNORE_PATTERNS))
+            L.append(f"自定义规则 {len(custom)} 条：")
+            if custom:
+                for i, pat in enumerate(custom, 1):
+                    L.append(f"  {i}. {pat}")
+            else:
+                L.append("  （空）")
+            L.append("")
+            L.append("用法：/铁锈忽略 + <正则>　添加（可换行连写多条）")
+            L.append("　　　/铁锈忽略 - <序号|正则原文>　删除")
+            L.append("　　　/铁锈忽略 测试 <文本>　看是否命中")
+            L.append("　　　/铁锈忽略 开|关　总开关")
+            L.append("说明：命中的消息不会被自动解析房号；显式 /铁锈查房 不受影响")
+            return "\n".join(L)
+
+        if low in ("开", "关"):
+            self._write_config("忽略开关", low == "开")
+            self._save_config()
+            self._ignore_cache = None
+            return f"忽略规则已{'开启' if low == '开' else '关闭'}"
+
+        if raw.startswith("测试"):
+            body = raw[2:].strip()
+            if not body:
+                return "用法：/铁锈忽略 测试 <文本>"
+            if not self.cfg.get("忽略开关", True):
+                return "忽略开关当前是关的，任何消息都不会被忽略"
+            hit = self._is_ignored_text(body)
+            if hit:
+                return f"命中规则：{hit}\n这条消息不会被解析房号"
+            ids = extract_room_ids(body)
+            if ids:
+                return "没有命中任何规则\n会被解析出房号：" + "、".join(ids)
+            return "没有命中任何规则\n也提取不到房号（本来就不会触发）"
+
+        added, removed, failed, exists = [], [], [], []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            sign = line[0] if line[0] in "+-" else ""
+            body = line[1:].strip() if sign else line
+            if not body:
+                continue
+            if sign == "-" or (not sign and False):
+                # 按序号删
+                if body.isdigit() and 1 <= int(body) <= len(custom):
+                    removed.append(custom.pop(int(body) - 1))
+                elif body in custom:
+                    custom.remove(body)
+                    removed.append(body)
+                else:
+                    failed.append(f"{body}（没有这条）")
+                continue
+            # 加：先校验能不能编译，再查重
+            try:
+                re.compile(body, re.MULTILINE)
+            except re.error as e:
+                failed.append(f"{body}（不是合法正则：{e}）")
+                continue
+            if body in custom:
+                exists.append(body)
+                continue
+            custom.append(body)
+            added.append(body)
+
+        if added or removed:
+            _save(custom)
+
+        L = []
+        if added:
+            L.append("已添加：" + "、".join(added))
+        if removed:
+            L.append("已删除：" + "、".join(removed))
+        if exists:
+            L.append("已存在（跳过）：" + "、".join(exists))
+        if failed:
+            L.append("未处理：" + "；".join(failed))
+        if not L:
+            return "用法：/铁锈忽略 + <正则>\n查看现有规则：/铁锈忽略"
+        L.append(f"当前自定义规则 {len(custom)} 条")
+        return "\n".join(L)
+
     def _diag_text(self, event, section: str = "") -> str:
         """生成运行时诊断信息. 不修改任何状态, 只读取。
 
@@ -5951,6 +6163,13 @@ async for _r in _ag:
             L.append(f"冷却提示：{'开' if self.cfg.get('冷却提示') else '关'}　"
                      f"官Q模式：{'开' if self.cfg.get('官Q模式') else '关'}　"
                      f"debug：{'开' if self.cfg.get('debug') else '关'}")
+            try:
+                _cust = self.cfg.get("忽略正则", [])
+                _n_cust = len(_cust) if isinstance(_cust, list) else 0
+            except Exception:
+                _n_cust = 0
+            L.append(f"忽略规则：{'开' if self.cfg.get('忽略开关', True) else '关'}　"
+                     f"内置 {len(IGNORE_PATTERNS)} 条　自定义 {_n_cust} 条")
 
         # 统一收口：分类标题前保证一个空行、去掉开头的空行
         # （section 指定某一节时 L 为空列表，首行就是标题）
@@ -7196,6 +7415,16 @@ async for _r in _ag:
             # 界面文本当作用户查房请求，提取出 ['s5132','black'] 后去查房
             # —— 实测：第三方发调试信息，官方机器人立刻去查 s5132 并回传。
             if self._is_plugin_ui_text(text):
+                return
+
+            # ---- 检查 1.6: 忽略正则 ----
+            # 内置规则覆盖本插件与常见查房机器人的输出（房间信息块、
+            # 房间列表、错误报告、探针/中继诊断行），自定义规则由站长补。
+            # 命中就整条不解析：这类文本里的房号是「结果」，不是「请求」。
+            _hit = self._is_ignored_text(text)
+            if _hit:
+                self.logger.debug(
+                    f"[忽略] 群 {gid or '-'} 命中规则「{_hit}」，不解析房号")
                 return
 
             rids = extract_room_ids(text)

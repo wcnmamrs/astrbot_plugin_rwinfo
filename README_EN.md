@@ -93,6 +93,7 @@ Two permission tiers:
 | `/铁锈官机探测` | Admin | Detect the official-bot channel |
 | `/铁锈官机测试` | Admin | Send a test message through the official-bot channel |
 | `/铁锈探针时解 <suffix>` | Everyone | Decode the timestamp embedded in a probe name |
+| `/铁锈忽略 [列出\|+\|-\|测试\|开\|关]` | Admin | Ignore regex: matching messages are never parsed for room IDs. 9 built-in rules cover room reports / lists / error dumps from this plugin and other bots; add your own with `+ <regex>` |
 | `/铁锈撤回 列出\|+\|-\|重置` | Admin | Auto-recall config, `key:delay` entries, `*` expands to all known groups. See the Chinese README for the full syntax |
 
 Unrecognized `/铁锈xxx` commands automatically return the help menu.
@@ -218,6 +219,8 @@ Auto-persisted by the AstrBot framework, editable via WebUI or commands.
 | `bin_cleanup_max_age_hours` | Only delete bin files older than N hours, default 1 |
 | `机器人QQ号` | Bot QQ, only used as sender uin for forward cards. Empty = auto-detect |
 | `冷却提示` | Reply when a room is still cooling down, default false |
+| `忽略开关` | Enable ignore rules, default true. When off, only the "plugin's own UI text" guard stays |
+| `忽略正则` | Custom ignore regexes (one per entry); matching messages are not parsed for room IDs. Default empty, maintain with `/铁锈忽略` |
 | `撤回` | Auto-recall config, `key:delaySeconds`; `#groupID` / `@userID` / `*`. An explicit `#groupID:off` entry means "closed here" and overrides an inherited `*` default |
 
 ### Project address display
