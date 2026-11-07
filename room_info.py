@@ -1753,11 +1753,12 @@ def detect_client(info):
 def format_room(info, rid, players, capacity=None, players_detail=None, max_players_display=10, player_count=None, show_players=False):
     import re as _re
 
-    # 排版约定（群里一屏看完）：
-    #   · 每行放 1~2 个字段，用全角空格分栏 —— 行首半角空格会被 QQ 当代码块
+    # 排版约定：
+    #   · 一行一个字段，不做并排 —— 并排后群里一窄屏就折行，
+    #     读起来像「初始资金和地图模式粘在一起」，反而不如竖排清楚
     #   · 字段名与值之间统一用全角冒号
+    #   · 行首不加半角空格（QQ 会当代码块）
     #   · 「玩家列表：」顶格，条目缩进两格，冒号同样全角
-    SEP = "　"
     lines = []
     cver = detect_client(info)
 
@@ -1766,7 +1767,8 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
         mapname = mapname[:-4]
     mapname = _re.sub(r'^\[[^\]]*\]', '', mapname).strip()
     # 首行必须仍以「房间版本：」开头：main.py 靠这个前缀切掉探针的调试输出
-    lines.append(f"房间版本：{cver}{SEP}地图名称：{mapname}")
+    lines.append(f"房间版本：{cver}")
+    lines.append(f"地图名称：{mapname}")
 
     c = info.get('credits', 0)
     if c == 0:
@@ -1775,12 +1777,14 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
         money_str = CREDITS_NAMES.get(c, f"${c}")
     mul = _fmt_multiplier(info.get('multiplier', 1.0))
     mode_str = {0: '遭遇战', 1: '自定义', 2: '存档'}.get(info.get('mode'), '未知(' + str(info.get('mode')) + ')')
-    lines.append(f"初始资金：{money_str}[{mul}倍率]{SEP}地图模式：{mode_str}")
+    lines.append(f"初始资金：{money_str}[{mul}倍率]")
+    lines.append(f"地图模式：{mode_str}")
 
     _fog = info.get('fog')
     _fog_str = FOG_NAMES.get(_fog, '未知(' + str(_fog) + ')') if _fog is not None else "未知"
     _nuke_str = '禁用核蛋蛋' if info.get('no_nukes', False) else '未禁用核蛋蛋'
-    lines.append(f"初始禁核：{_nuke_str}{SEP}初始迷雾：{_fog_str}")
+    lines.append(f"初始禁核：{_nuke_str}")
+    lines.append(f"初始迷雾：{_fog_str}")
     # 默认单位: 客户端下拉 ae.d() = 1..4 + 可选起始单位(100+, RWPP isPickableStartingUnit)
     # 100+ 是 g 列表索引 (客户端 ae.d 100+ 部分), 不是服务器 custom_unit_list 顺序!
     # g: 100=experimentalDropship(飞行堡垒), 101=experimentalGunship(实验悬浮型气垫船), 102=experimentalSpider(实验型战斗蜘蛛), 103=modularSpider(模块蜘蛛)
@@ -1812,19 +1816,20 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
         dbg.append(f'final={unit_str}')
         print('[DEBUG] 默认单位: ' + ' | '.join(dbg))
 
-    _unit_line = f"默认单位：{unit_str}"
+    lines.append(f"默认单位：{unit_str}")
     cap = info.get('unit_cap')
     cap_max = info.get('unit_cap_max')
     if cap is not None and cap_max is not None:
-        _unit_line += f"{SEP}单位上限：{cap}"
-    lines.append(_unit_line)
+        lines.append(f"单位上限：{cap}")
 
     # 共享控制/允许旁观: 106 消息 customUnits 块之后 (as.l / as.o)
     spec = info.get('spectators')
     _spec_str = "未知" if spec is None else ("是" if spec else "否")
     _shared_str = '是' if info.get('shared', False) else '否'
     _lock_str = '是' if info.get("teamlock") else '否'
-    lines.append(f"共享控制：{_shared_str}{SEP}允许旁观：{_spec_str}{SEP}队伍锁定：{_lock_str}")
+    lines.append(f"共享控制：{_shared_str}")
+    lines.append(f"允许旁观：{_spec_str}")
+    lines.append(f"队伍锁定：{_lock_str}")
 
     maxp = capacity if capacity else 0
     if not maxp:

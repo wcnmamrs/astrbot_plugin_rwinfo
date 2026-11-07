@@ -2505,6 +2505,22 @@ class RWInfoPlugin(Star):
             pass
         return text
 
+    def _is_official_platform(self, event=None) -> bool:
+        """当前会话是不是官方机器人（qq_official 一类）。
+
+        官方适配器没有 `send_group_forward_msg`，试合并转发必然失败，
+        失败了还要在正文末尾附一句「当前适配器不支持合并转发，请让管理员
+        确认适配器支持合并转发」—— 对官方机器人用户纯属噪音：他没得选，
+        那句话也解决不了任何问题。所以官方平台直接跳过合并转发这一步。
+        """
+        if self._want_markdown(event):
+            return True
+        try:
+            name = str(self._platform_name_of(event) or "").lower()
+        except Exception:
+            return False
+        return "official" in name
+
     async def _send_forward_card(self, event, text: str, title: str = "房间信息"):
         """非官方平台：把长内容发成「聊天记录」合并转发卡片。
 
@@ -2535,32 +2551,18 @@ class RWInfoPlugin(Star):
         gid = self._as_int(event.get_group_id())
         if gid is None:
             return False, None, "私聊无法合并转发"
-        # 拆成多条 node：标题 + 正文分段，让卡片里有多条记录可翻
-        body = str(text).replace("\r\n", "\n").replace("\r", "\n")
-        chunks = []
-        cur = []
-        size = 0
-        for ln in body.split("\n"):
-            cur.append(ln)
-            size += len(ln) + 1
-            if size >= 400:            # 单条 node 不超过约 400 字，避免超限
-                chunks.append("\n".join(cur))
-                cur, size = [], 0
-        if cur:
-            chunks.append("\n".join(cur))
-        if not chunks:
+        # 整条内容做成**一条**记录：标题和正文放在同一个 node 里。
+        # 早先按 400 字切块，卡片里会横着好几条聊天记录，点开还得一条条翻，
+        # 房间信息本来就一屏能看完，切块纯属添乱。
+        body = str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not body:
             return False, None, "内容为空"
-        nodes = []
         me = self._as_int(self._resolve_self_qq(event)) or 10000
-        nodes.append({
+        nodes = [{
             "type": "node",
-            "data": {"name": "铁锈查房", "uin": me, "content": f"【{title}】"},
-        })
-        for ch in chunks:
-            nodes.append({
-                "type": "node",
-                "data": {"name": "铁锈查房", "uin": me, "content": ch},
-            })
+            "data": {"name": "铁锈查房", "uin": me,
+                     "content": f"【{title}】\n{body}"},
+        }]
         try:
             result = await fn(group_id=gid, messages=nodes)
             mid = self._extract_message_id(result)
@@ -3293,7 +3295,8 @@ async for _r in _ag:
             k = self._guess_kind(s) if kind == "auto" else kind
         except Exception:
             k = "help"
-        if self._should_compress(k) and k not in ("room", "diag"):
+        if (self._should_compress(k) and k not in ("room", "diag")
+                and not self._is_official_platform(event)):
             ok_fw, _mid, reason = await self._send_forward_card(event, s, _FOLD_TITLES.get(k, "房间信息"))
             if ok_fw:
                 return
@@ -3569,7 +3572,7 @@ async for _r in _ag:
         # 官方机器人没有这个接口（那边用 Markdown 代码块），
         # 个人机器人（OneBot v11）支持，群里只占一条消息、点开才展开。
         # 折叠没意义，失败提示更是纯噪音。
-        if (not self._want_markdown(event)
+        if (not self._is_official_platform(event)
                 and self._should_compress("room")):
             ok_fw, mid_fw, fw_reason = await self._send_forward_card(
                 event, text, _FOLD_TITLES["room"])
