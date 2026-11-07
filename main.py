@@ -3782,13 +3782,16 @@ async for _r in _ag:
                     return f"{ip}:{port}"
         return ""
 
-    async def _query_room(self, rid: str, probe_name: str, gid: str = "") -> str:
+    async def _query_room(self, rid: str, probe_name: str, gid: str = "",
+                          explain: bool = False) -> str:
         # 探针脚本缺失 / 接口过旧 -> 从仓库补齐（仅这两种情况，不做自动更新）。
         # 放到线程里跑：里面会起子进程探测版本 + 网络下载，不能阻塞事件循环。
         if not os.path.exists(ROOM_INFO_PY) or not self._room_info_ok:
             ok, err = await _run_in_thread(ensure_room_info, True)
             self._room_info_ok = ok
             if not ok:
+                if explain:
+                    return f"[房间查询失败] 探针脚本不可用：{err}"
                 return f"[rwinfo] 探针脚本不可用：{err}"
         python = sys.executable
         if not python or not os.path.exists(python):
@@ -3833,6 +3836,9 @@ async for _r in _ag:
                 await asyncio.wait_for(proc.wait(), timeout=5)
             except Exception:
                 pass
+            if explain:
+                return (f"[房间查询失败] 查询超时（超过 {QUERY_TIMEOUT} 秒）——"
+                        f"探针进程无响应，通常是到中继的连接卡住了")
             return f"[rwinfo] 查询超时(>{QUERY_TIMEOUT}s): {rid}"
         except asyncio.CancelledError:
             # 协程被取消(插件卸载/任务清理): 必须终止并回收子进程, 避免留下孤儿进程
@@ -3861,6 +3867,20 @@ async for _r in _ag:
         if not out:
             # 无输出 = 房间不存在/英文单词误报, 静默丢弃 (避免国际房批量尝试刷屏)
             self.logger.debug(f"查询 {rid} 无输出, 静默 (python={python} rc={rc}) stderr: {err[:300]}")
+            if explain:
+                # 用户主动查房时不能只说「无响应」——那等于没说。
+                # 把退出码和 stderr 尾部带回去，至少能区分
+                # 「进程没起来 / 网络不通 / 脚本自己崩了」三种情况。
+                tail = [ln.strip() for ln in (err or "").splitlines() if ln.strip()][-3:]
+                detail = "；".join(tail)[:240]
+                msg = (f"[房间查询失败] 探针没有任何输出（退出码 {rc}）。"
+                       f"常见原因：本机到中继不通、DNS 解析失败，"
+                       f"或插件目录里的 room_info.py 与运行环境不匹配")
+                if detail:
+                    msg += f"\n脚本输出：{detail}"
+                else:
+                    msg += "\n脚本没有任何 stderr 输出"
+                return msg
             return ""
         # 过滤调试行: room_info.py 的流程日志以 [DEBUG]/[n] 中继/===/151 relay 等开头,
         # 房间信息正文以 "房间版本：" 开头（新版）或 "版本："（旧版）。
@@ -5177,7 +5197,7 @@ async for _r in _ag:
                     probe_name = f"{self._probe_prefix()}探针{idx:02d}_{attempt}"
                 try:
                     result = await asyncio.wait_for(
-                        self._query_room(target, probe_name, gid),
+                        self._query_room(target, probe_name, gid, explain=True),
                         timeout=QUERY_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
