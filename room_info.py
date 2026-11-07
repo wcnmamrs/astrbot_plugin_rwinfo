@@ -26,15 +26,35 @@ import uuid
 import random
 import zlib
 
+# ================================================================ 接口版本
+# 插件（main.py）用它判断「本地 room_info.py 是否够新、支持新加的命令行参数」。
+#
+# **只在 room_info.py 的调用契约发生变化时才需要递增**：
+#   · 新增插件会传的命令行参数（如 --promote）
+#   · 改变输出格式（如「版本：」→「房间版本：」）
+#   · 改变退出码语义
+# 纯内部修复（解析优化、bug 修复）不必递增，插件不用因此重新下载。
+#
+# 插件侧对应常量 ROOM_INFO_API_REQUIRED（见 main.py）。
+ROOM_INFO_API = 2
+
 # 全局安静模式（插件调用时设为 True，屏蔽调试输出）
-# 命令行直接运行时自动关闭静默（否则 --list 等模式看不到任何输出）
+# 命令行直接运行时自动关闭静默（否则 --list 等模式看不到最终结果）
+#
+# 注意区分两个开关:
+#   QUIET      —— 是否屏蔽「最终结果/正常输出」。CLI 直接运行时为 False,
+#                 因为结果要打到 stdout 给插件或用户看。
+#   DEBUG_MODE —— 是否输出「协议链路调试日志」(连接节点/161/178/110...)。
+#                 默认 False; 只有显式传 --debug 才打开。
+#
+# 历史 bug: 早期把链路调试日志也挂在 `if not QUIET` 上。插件是用子进程
+# `python3 room_info.py <房号>` 调用的, 此时 __name__ == "__main__",
+# QUIET 恒为 False, 于是用户在 QQ 里会看到 [4][5][6][*] 一大堆调试信息。
 QUIET = True if __name__ != "__main__" else False
 DEBUG_MODE = False
-SHOW_PLAYERS = False   # 默认不显示玩家列表
 
 PROTO_MAGIC = "com.corrodinggames.rts"
 MAGIC_INTL = "com.corrodinggames.rts"
-VERSIONS = {174: "1.15p11", 176: "1.15"}
 DEFAULT_VER = 176
 DEFAULT_PORT = 5123
 DEFAULT_NAME = "abab-探针"
@@ -46,11 +66,6 @@ MASTERSERVERS = [
 
 CREDITS_MAP = {0: 4000, 1: 0, 2: 1000, 3: 2000, 4: 5000,
                5: 10000, 6: 50000, 7: 100000, 8: 200000}
-AI_DIFF = {-2: "Very Easy", -1: "Easy", 0: "Medium", 1: "Hard", 2: "Very Hard", 3: "Impossible"}
-FOG = {0: "off", 1: "basic", 2: "los"}
-GAME_MODES = {0: "Skirmish Map", 1: "Custom Map", 2: "Saved Game"}
-STARTING_UNITS = {1: "Normal (1 builder)", 2: "Small Army", 3: "3 Engineers",
-                  4: "3 Engineers (No CC)", 5: "Experimental Spider", 9: "Custom"}
 
 # ================================================================ 二进制协议工具
 
@@ -216,13 +231,6 @@ def sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest().upper()
 
 
-def md5_lower(s: str) -> str:
-    return hashlib.md5(s.encode("utf-8")).hexdigest()
-
-
-def hash_f(s: str) -> str:
-    return md5_lower(sha256_hex(s))
-
 
 def f_c(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest().upper()[:14]
@@ -325,36 +333,6 @@ class RWProbe:
         if self.verbose:
             print("[probe]", *a)
 
-    def connect(self, proto_variant=1, room_id=None):
-        self.t_connect = time.time()
-        self.sock = socket.create_connection((self.host, self.port), timeout=8)
-        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        w = NetWriter()
-        w.utf(self.magic)
-        if room_id:
-            w.int32(4)
-            w.int32(self.client_version)
-            w.int32(1)
-            w.nullable_str(room_id)
-            w.utf(self.name)
-            w.utf(self.network_client_id)
-            w.utf("")
-        elif proto_variant in (0, 2):
-            w.int32(4)
-            w.int32(self.client_version)
-            w.int32(1 if proto_variant == 0 else 2)
-            w.int32(random.randint(1, 1_000_000))
-            w.utf(self.name)
-            w.utf("en")
-            w.utf("")
-        else:
-            w.int32(2)
-            w.int32(self.client_version)
-            w.int32(1 if proto_variant == 3 else 2)
-            w.utf(self.name)
-            w.utf("en")
-        self.sock.sendall(pack_frame(160, w.output()))
-        self._wait_161()
 
     def _wait_161(self):
         """等待 161 握手。
@@ -437,7 +415,7 @@ class RWProbe:
                 s2 = r.utf()
                 v10 = r.int32()
 
-            if not QUIET:
+            if DEBUG_MODE:
                 print(f"151 relay: v7={v7} v8={v8} bf_i={bf_i} bf_j={bf_j} "
                       f"s1={s1!r} s2={s2!r} v10={v10}")
 
@@ -464,14 +442,14 @@ class RWProbe:
                         for i in range(v10 + 1):
                             if f_c(prefix + str(i)) == s1:
                                 v0 = str(i)
-                                if not QUIET:
+                                if DEBUG_MODE:
                                     print(f"[151] POW solved: i={i} ({time.time()-t_pow:.1f}s)")
                                 break
                             if time.time() - t_pow > POW_TIMEOUT:
-                                if not QUIET:
+                                if DEBUG_MODE:
                                     print(f"[151] POW超时({POW_TIMEOUT}s), 发-1")
                                 break
-                            if i > 0 and i % 2_000_000 == 0 and not QUIET:
+                            if i > 0 and i % 2_000_000 == 0 and DEBUG_MODE:
                                 print(f"[151] POW进度: {i}/{v10} ({time.time()-t_pow:.0f}s)", flush=True)
             else:
                 v0 = "max"
@@ -512,43 +490,6 @@ class RWProbe:
         self.challenge_y = f.get("challenge_y")
         self.extra = f.get("extra")
 
-    def register(self, v_challenge, w_challenge, unit_checksum=None, wait=10):
-        ver = self.server_e or self.client_version
-        reg_ver = 5
-        candidates = [unit_checksum] if unit_checksum is not None else [0, -1, 1]
-        last = "NO_RESPONSE"
-        for ck in candidates:
-            if self.sock is None:
-                return "CONNECTION_CLOSED"
-            w = NetWriter()
-            w.utf(self.magic)
-            w.int32(reg_ver)
-            w.int32(ver)
-            w.int32(ver)
-            w.utf(self.name)
-            w.nullable_str(hash_f(self.password) if self.password else None)
-            w.utf(self.magic)
-            w.utf(sha256_hex(self.network_client_id + (self.server_id or "")))
-            w.int32(ck)
-            w.utf(challenge_e(v_challenge))
-            if reg_ver >= 5:
-                w.utf(hash_e_int(w_challenge))
-            try:
-                self.sock.sendall(pack_frame(110, w.output()))
-            except OSError:
-                return "CONNECTION_CLOSED"
-            self.log(f"REGISTER(ver{reg_ver},e={ver},unit={ck})")
-            result = self._read_after_register(wait)
-            last = result
-            if "units" not in result and "Integrity" not in result and "PASSWORD" not in result:
-                return result
-            if "units" in result and len(candidates) > 1:
-                self.close()
-                try:
-                    self.connect(proto_variant=1)
-                except Exception:
-                    return result
-        return last
 
     def _handle_178(self, payload):
         """解析 178 PACKET_RECONNECT_TO。
@@ -579,96 +520,6 @@ class RWProbe:
                 addr = ""
         return addr
 
-    def _read_after_register(self, wait=5):
-        deadline = time.time() + wait
-        msgs = []
-        self.last_msgs = []
-        while time.time() < deadline:
-            try:
-                mtype, payload = read_frame(self.sock, 2)
-            except socket.timeout:
-                break
-            except OSError:
-                break
-            if self.verbose:
-                print(f"[DBG] recv mtype={mtype} len={len(payload)} raw={payload.hex()}")
-            if mtype == 106:
-                info = parse_server_info(payload)
-                self.last_server_info = info
-                msgs.append(("SERVER_INFO", info))
-                self.last_msgs.append(f"106(SERVER_INFO {len(payload)}B)")
-            elif mtype == 115:
-                msgs.append(("TEAMS", parse_teams(payload)))
-                self.last_msgs.append(f"115(TEAMS {len(payload)}B)")
-            elif mtype == 150:
-                return "KICKED: " + NetReader(payload).utf()
-            elif mtype == 113:
-                return "PASSWORD_REQUIRED"
-            elif mtype == 111:
-                return "DISCONNECTED: " + NetReader(payload).utf()
-            elif mtype == 141:
-                sender, message = parse_141(payload)
-                if not QUIET:
-                    if sender:
-                        print(f"[聊天] {sender}: {message}")
-                    else:
-                        print(f"[聊天] {message}")
-                msgs.append(("CHAT", sender, message))
-                self.last_msgs.append(f"141(CHAT {sender}: {message[:30]}...)")
-            elif mtype == 151:
-                _t151 = time.time()
-                v7 = v8 = 0; s1 = s2 = ""; v10 = 0; bf_i = bf_j = 0
-                try:
-                    r = NetReader(payload)
-                    v7 = r.int32(); v8 = r.int32()
-                    b1 = r.boolean()
-                    if b1:
-                        bf_i = r.int32()
-                    b2 = r.boolean()
-                    if b2:
-                        bf_j = r.int32()
-                    s1 = r.utf() if r.remaining() > 2 else ""
-                    s2 = r.utf() if r.remaining() > 2 else ""
-                    v10 = r.int32() if r.remaining() >= 4 else 0
-                    if v8 == 5 and s1:
-                        self.relay_entries.append((s1, s2, v10))
-                    if v8 == 0:
-                        v0 = ""
-                    elif v8 == 1:
-                        v0 = str(bf_j)
-                    elif v8 == 2:
-                        v0 = challenge_e(bf_i)
-                    elif v8 in (3, 4):
-                        v0 = f_c(f"{bf_i}|{bf_j}")
-                    elif v8 in (5, 6):
-                        v0 = "-1"
-                        if s1 and s2:
-                            for i in range(v10 + 1):
-                                if f_c(s2 + str(i)) == s1:
-                                    v0 = str(i)
-                                    break
-                    else:
-                        v0 = "max"
-                    if not QUIET:
-                        self.log(f"151 relay: v7={v7} v8={v8} b={b1},{b2} bf_i={bf_i} bf_j={bf_j} "
-                                 f"s1={s1} s2={s2} v10={v10} -> 152v0={v0}")
-                    ack = NetWriter()
-                    ack.int32(v7); ack.int32(v8); ack.utf(v0)
-                    ack.float32((time.time() - _t151) * 1000.0)
-                    self.sock.sendall(pack_frame(152, ack.output()))
-                    self._ack_sent = True
-                    self.log("152 ack sent")
-                except Exception as e:
-                    self.log(f"151 parse err: {e}")
-                msgs.append(("RELAY151", len(payload)))
-                self.last_msgs.append(f"151(v8={v8},{s1}/{s2}/{v10})")
-            elif mtype == 108:
-                r = NetWriter(); r.int64(NetReader(payload).int64()); r.byte(1)
-                self.sock.sendall(pack_frame(109, r.output()))
-            else:
-                msgs.append((f"MSG{mtype}", len(payload)))
-                self.last_msgs.append(f"{mtype}({len(payload)}B):{payload.hex()}")
-        return f"OK({len(msgs)} msgs)" if msgs else "NO_RESPONSE"
 
     def close(self):
         if self.sock:
@@ -681,11 +532,6 @@ class RWProbe:
 # ================================================================ 106/115/141 解析
 
 
-MASTERSERVERS = [
-    "http://gs1.corrodinggames.com/masterserver/1.4",
-    "http://gs4.corrodinggames.net/masterserver/1.4",
-]
-ALLOCATOR = ("210.16.163.55", 5123)
 REG_VER = 5
 CK = 678359601
 CLIENT_VER = 176
@@ -707,17 +553,21 @@ HELP_TEXT = """\
   --joinable            只列可加入的房间(状态=房间中)
   --status <状态>       battleroom / ingame
   --search <关键词>     按 房主名/地图名/描述 搜索(不区分大小写)
-  --mod <类型>          mod(只看模组房) / vanilla(只看原版房)
   --full <模式>         hide(隐藏人满) / only(只看人满)
   --all                 official 源保留全部条目(仅调试用)
 
 查询选项:
-  --name <名字>         设置探针名字 (默认 ABAB探针)
+  --name <名字>         设置探针名字 (默认 abab-探针)
+  --show-players        显示玩家列表
+  --max-players <N>     玩家列表最多显示人数 (默认 10)
+  --promote <文本>      进房后发一条消息
+  --promote-cooldown <秒>  同一房间推广冷却 (默认 180)
+  --api-version         打印接口版本号 (供插件判断是否兼容)
   --debug               调试输出
 
 支持的中继房号:
-  首字母+数字    r5132 / s1024 / a5132 / b5132 / h1234 / c8888 / o9999 / q7777
-  国际房(纯字母) h 开头, 如 hytvvi / hlbifz
+  o/q/r/s + 数字    数字房, 如 r5132 / s1024 / o9999 / q7777
+  其他字母 + 纯字母  国际房, 如 hytvvi / aabcde / babc
 
 可用中继首字母 (实测 5123 端口开放):
   a/b/h  官方中继 (Relay US1 / US2 / ASIA2)
@@ -739,8 +589,6 @@ def _find_arg(name, default=None):
     return default
 
 
-_NAME_ARG = None
-_DEBUG_ARG = False
 
 # 收集非选项参数 (第一个非 -- 开头的即房间ID/目标)
 # 注意: --list / --list-json 是"模式开关"而非带值选项, 需保留下来供模式判定
@@ -751,6 +599,11 @@ _arg1 = _positional[0] if _positional else None
 
 # 帮助: 仅命令行直接运行时生效 (import 不触发)
 if __name__ == "__main__":
+    # 接口版本探测：插件用它判断本地文件是否支持新参数。
+    # 放在 --help 之前，且不受 _arg1 为空影响（否则会被当成"无参数"打印帮助）。
+    if "--api-version" in sys.argv:
+        print(ROOM_INFO_API)
+        sys.exit(0)
     if "--help" in sys.argv or "-h" in sys.argv or len(sys.argv) <= 1 or _arg1 is None:
         print(HELP_TEXT)
         sys.exit(0)
@@ -761,7 +614,6 @@ if _arg1 is None:
 
 _NAME_ARG = _find_arg("--name")
 if "--debug" in sys.argv:
-    _DEBUG_ARG = True
     QUIET = False
     DEBUG_MODE = True
     print("[DEBUG] 调试模式已启用")
@@ -772,6 +624,24 @@ if "--max-players" in sys.argv:
         _MAX_PLAYERS_DISPLAY = int(_find_arg("--max-players"))
     except (IndexError, ValueError, TypeError):
         pass
+
+# ================================================================ 进房推广
+# 探针进房后发一条推广消息（如仓库链接）。
+# 必须由插件显式传 --promote <文本> 才启用；命令行直接运行默认不发，
+# 避免调试时到处刷广告。
+#
+# 冷却：同一房间 3 分钟内不重复推广。用文件持久化而不是内存变量，
+# 因为每次查房都是独立子进程，内存变量跨进程不生效。
+PROMOTE_TEXT = _find_arg("--promote") or ""
+PROMOTE_COOLDOWN = 180.0
+if "--promote-cooldown" in sys.argv:
+    try:
+        PROMOTE_COOLDOWN = max(0.0, float(_find_arg("--promote-cooldown")))
+    except (IndexError, ValueError, TypeError):
+        pass
+# 冷却状态文件。用脚本自身目录（此时 BIN_DIR 还没定义，不能提前引用）。
+PROMOTE_STATE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".promote_state.json")
 
 # 玩家列表默认显示
 SHOW_PLAYERS = "--show-players" in sys.argv
@@ -786,9 +656,12 @@ LIST_JOINABLE = "--joinable" in sys.argv    # 只保留可加入(battleroom)
 LIST_KEYWORD = _find_arg("--search") or ""  # 按 房主/地图/描述 搜索
 LIST_STATUS = _find_arg("--status") or ""   # 按 status 过滤
 LIST_SOURCE = _find_arg("--source") or "all"  # all / qroom / official
-LIST_MOD = _find_arg("--mod") or ""         # mod / vanilla
 LIST_FULL = _find_arg("--full") or ""       # hide / only
-_DIRECT_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+(:\d+)?$")
+# 直连目标：IP[:端口] 或 IP[:端口]/房间UUID
+# 后者是「从房间列表进入」的形式：列表里的 addr 是分配中心地址，
+# 必须带 UUID 才能路由到目标房间。
+_DIRECT_RE = re.compile(
+    r"^\d+\.\d+\.\d+\.\d+(?::\d+)?(?:/[A-Za-z0-9_\-]+)?$")
 DIRECT_TARGET = _arg1 if _DIRECT_RE.match(_arg1) else None
 RID = _arg1 if DIRECT_TARGET is None else _arg1
 NAME = _NAME_ARG or "ABAB探针"
@@ -842,12 +715,162 @@ def send_leave(sock):
         pass
 
 
+def send_chat(sock, text, channel=0):
+    """发送聊天消息（包 140）。
+
+    字段结构严格对齐客户端 j/ae.smali `k(String)` (line 23483):
+        bg.b(String) -> writeUTF(聊天内容)
+        bg.b(int)    -> writeInt(频道, 0=公共)
+    然后以包类型 0x8C(140) 发出。
+    服务端会把消息内容当命令解析（`-` `.` `_` 三种前缀），
+    所以发 `.id` 就能触发服务端返回本房间的中继房号。
+    """
+    try:
+        w = NetWriter()
+        w.utf(str(text))
+        w.int32(int(channel))
+        sock.sendall(pack_frame(140, w.output()))
+        return True
+    except OSError:
+        return False
+
+
+def _promote_key(rid, sid):
+    """冷却用的房间标识。
+
+    **不能用服务端的 `server_id`**：实测中继/游戏服务器回的 sid 是
+    `RELAY-CN Team & Copyright dr@der.kim` 这类**中继自身标识**，
+    所有经过同一中继的房间都一样 —— 拿它当 key 会让「A 房发过推广，
+    3 分钟内查 B 房就不发了」，等于随机漏发。
+
+    正确优先级：
+      1. `_LAST_ROOM_ID` —— 本次进房从服务端聊天里捕获到的真实房号
+         （如 s5132），这是房间的真实身份，最准
+      2. `rid` —— 本次查询用的入口（短号 / UUID / IP:端口）
+
+    同一房间用短号进能命中 `_LAST_ROOM_ID`；用 UUID/IP 进时若没捕获到，
+    退回 rid 记账（此时不同入口算不同房间，但至少不会互相误伤）。
+    """
+    for cand in (_LAST_ROOM_ID, sid if _looks_like_room_id(sid) else "", rid):
+        k = str(cand or "").strip().lower()
+        if k:
+            return k
+    return ""
+
+
+def _looks_like_room_id(v):
+    """判断一个值是否像房间号（单字母 + 2~8 位数字）。
+
+    用来把「中继 sid 这种长串」挡在外面，避免它被当成房间 key。
+    """
+    return bool(re.match(r'^[A-Za-z]\d{2,8}$', str(v or "").strip()))
+
+
+def _load_promote_state():
+    try:
+        with open(PROMOTE_STATE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_promote_state(state):
+    """原子写，避免并发子进程写坏文件。"""
+    try:
+        tmp = PROMOTE_STATE + f".{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp, PROMOTE_STATE)
+    except OSError:
+        pass
+
+
+def maybe_promote_room(sock, rid, sid=None, tag=""):
+    """探针进房后发一条推广消息（仓库链接等）。
+
+    触发条件（全部满足才发）：
+      1. 插件传了 `--promote <文本>`（配置开关打开）
+      2. 该房间距上次推广已超过 `PROMOTE_COOLDOWN`（默认 180 秒）
+
+    设计要点：
+      · 连接必须还开着 —— 所以调用点在收到 106 之后、`send_leave` 之前
+      · 冷却按**服务端 session id** 记账，不按 rid：
+        同一个房间用短号 / UUID / IP 查，都算同一个房间
+      · 发送失败不影响查房主流程（全程 try/except）
+      · 顺带清理超过 24 小时的陈旧条目，防止状态文件无限增长
+
+    返回 True 表示本次确实发出去了。
+    """
+    if not PROMOTE_TEXT:
+        return False
+    key = _promote_key(rid, sid)
+    if not key:
+        return False
+    try:
+        now = time.time()
+        state = _load_promote_state()
+        # 清理陈旧条目（24h）：避免文件随房间数无限膨胀
+        state = {k: v for k, v in state.items()
+                 if isinstance(v, (int, float)) and now - v < 86400}
+        last = state.get(key, 0)
+        if isinstance(last, (int, float)) and now - last < PROMOTE_COOLDOWN:
+            if DEBUG_MODE:
+                print(f"{tag}    推广冷却中（{int(PROMOTE_COOLDOWN - (now - last))}s 后到期），跳过")
+            return False
+        if not send_chat(sock, PROMOTE_TEXT):
+            if DEBUG_MODE:
+                print(f"{tag}!! 推广消息发送失败")
+            return False
+        state[key] = now
+        _save_promote_state(state)
+        if DEBUG_MODE:
+            print(f"{tag}    已发送进房推广: {PROMOTE_TEXT[:40]!r}")
+        return True
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"{tag}    推广流程异常(忽略): {e}")
+        return False
+
+
+# 服务端 `.id` 回复里提取房号。
+# 实测 s5132 的返回: "SERVER: S5132"（只一条）
+# 也可能出现在更长的系统广播里，因此做宽松提取：
+#   · 优先匹配独立的大写房号（1 位前缀 + 2~8 位数字，如 S5132 / R454525）
+#   · 排除明显不是房号的词（SERVER / RELAY / ADMIN 等在 \b 边界下也不会命中，
+#     因为房号形如「单字母紧跟数字」，而 SERVER 是纯字母）
+_ID_REPLY_RE = re.compile(r'\b([A-Za-z])(\d{2,8})\b')
+
+# 最近一次通过 `.id` 拿到的房号（进程内单次查询用，用完即弃）。
+# 为什么用模块级变量而不是改返回值：relay_session/node_session 的返回值
+# 被多处解包（got_106, got_115 = result），改结构会牵连所有调用点。
+_LAST_ROOM_ID = ""
+
+
+def extract_room_id_from_chat(message):
+    """从服务端聊天回复里提取房号（如 "SERVER: S5132" -> "s5132"）。
+
+    返回小写房号；提取不到返回 ""。
+
+    注意只接受「o/q/r/s」或已知中继首字母形态太严格 —— 中继可能随时
+    开通新字母，因此这里接受任意「单字母 + 2~8 位数字」，
+    由调用方（探针）去验证房间真实存在。
+    """
+    if not message:
+        return ""
+    m = _ID_REPLY_RE.search(str(message))
+    if not m:
+        return ""
+    return (m.group(1) + m.group(2)).lower()
+
+
 # ================================================================ Q Room List (真人房)
 # 来源: RW++ 启动器 io.github.rwpp.impl.BaseNetImpl$init$6$1
 #   接口: https://www.rtsbox.cn/api/paiwei/room_last.php
 #   返回: {"status":"success","data":[ {...} ],"page":"1","page_size":"1000"}
 #   字段: internal_id(房号) / map_name(地图) / current_players / max_players
-#         host_name(房主) / is_started(0=房间中,1=游戏中) / is_mod(是否模组)
+#         host_name(房主) / is_started(0=房间中,1=游戏中)
+#         (is_mod 字段存在但不用: 第三方服务端黑盒判定, 无法交叉验证)
 #         host_ip / host_port / myhost_ip
 # 这是真人玩家开的房; Official Room List 里几乎全是 Auto Server。
 QROOM_URL = "https://www.rtsbox.cn/api/paiwei/room_last.php"
@@ -873,7 +896,7 @@ def fetch_qroom_list(timeout=None) -> list:
       players     当前人数
       max         人数上限
       status      "battleroom" / "ingame"
-      is_mod      是否模组房
+      注意: 不解析 is_mod(见 fetch_qroom_list 内注释)
       is_started  原始开局标记
     """
     ctx = ssl.create_default_context()
@@ -936,7 +959,8 @@ def fetch_qroom_list(timeout=None) -> list:
             "players": _as_int(r.get("current_players"), 0),
             "max": _as_int(r.get("max_players"), 0),
             "status": "ingame" if started else "battleroom",
-            "is_mod": _as_int(r.get("is_mod"), 0) == 1,
+            # is_mod 不再解析: rwpp 客户端(其原始数据来源)根本不读这个字段,
+            # 它是 rtsbox 服务端黑盒判定, 无法用客户端行为交叉验证, 误判会误导用户。
             "is_started": started,
         })
     return rooms
@@ -999,14 +1023,6 @@ def classify_room(room: dict) -> tuple:
 
     return "ok", ""
 
-def is_joinable(room: dict) -> bool:
-    """是否为可加入的房间(status=battleroom)"""
-    return (room.get("status") or "").strip().lower() == "battleroom"
-
-
-# 客户端把某房间用到的 mod 名用 "; " 拼接后放在列表第 21 列(下标 20),
-# 数量超出展示上限时截断成 "xxx; yyy; 2 more..."(见 ae.smali:13056)。
-_MORE_RE = re.compile(r"^(\d+)\s+more\.\.\.$", re.IGNORECASE)
 
 # 官方自动房(Auto Server)的描述格式: "Auto Server 4+ [US-E #3]"
 #   4+      = 最少玩家数
@@ -1014,28 +1030,6 @@ _MORE_RE = re.compile(r"^(\d+)\s+more\.\.\.$", re.IGNORECASE)
 #   #3      = 编号
 _AUTO_SERVER_RE = re.compile(r"^auto\s*server\s*\d+\s*\+?\s*\[[^\]]*#\d+\]",
                              re.IGNORECASE)
-
-
-def _split_mod_names(v) -> list:
-    """把第 21 列的 mod 名串拆成名字列表。
-
-    空串 / "0" / "-" 视为原版, 返回 []。
-    "A; B; 2 more..." -> ["A", "B"]  (more 只是"还有 N 个没列出来"的标记)
-    """
-    s = (v or "").strip()
-    if not s or s in ("0", "-"):
-        return []
-    out = []
-    for part in s.split(";"):
-        name = part.strip()
-        if not name:
-            continue
-        if _MORE_RE.match(name):
-            continue          # "2 more..." 不是 mod 名
-        if name not in out:
-            out.append(name)
-    return out
-
 
 
 def _parse_room_line(line: str, index: int) -> dict:
@@ -1057,9 +1051,13 @@ def _parse_room_line(line: str, index: int) -> dict:
     #   10 模式(skirmishMap/customMap/LINK)   11 状态(battleroom/ingame/LINK)
     #   12 游戏版本        13 ?               14 描述(备用)
     #   15 当前人数        16 人数上限        17 ?
-    #   18 UUID副本        19 ?               20 Mod 名列表(分号分隔)
+    #   18 UUID副本        19 ?               20 Mod 名列表(已弃用)
     #   21 A 字段(加入方式; 0=列表地址即真实地址, 非0=中继房需 action=get)
-    mod_names = _split_mod_names(f[20] if len(f) > 20 else "")
+    #
+    # 第 21 列(下标 20) 的 Mod 名列表已不再解析: 它是房主客户端自己上报的,
+    # 装"只改数值不改单位"的 mod 时该列为空, 会被误判成原版;
+    # 而 qroom 源的同名字段也是第三方服务端黑盒判定, 无客户端行为可交叉验证。
+    # 两者都不稳定且会误导用户, 故整体移除。
     return {
         "idx": index,
         "id": g(0),
@@ -1076,10 +1074,6 @@ def _parse_room_line(line: str, index: int) -> dict:
         "desc": g(9) or g(14, ""),
         "players": g(15, "0"),
         "max": g(16, "?"),
-        # 第 21 列(下标 20): Mod 名列表, 空表示原版。
-        # 客户端把多个名字用 "; " 拼起来, 超出上限时截断成 "N more..."
-        "mod_names": mod_names,
-        "is_mod": bool(mod_names),
         # 第 22 列(下标 21): 加入方式。0 = 列表里的 ip:port 就是真实地址;
         # 非 0 = 中继房, 需要向 masterserver 发 action=get 换真实地址。
         "join_a": g(21),
@@ -1190,90 +1184,6 @@ def _is_group_ad(name: str, host: str, desc: str) -> bool:
     return True
 
 
-def _challenge_code(a) -> str:
-    """根据列表第 21 列(A 字段)生成 masterserver get 的挑战码。
-
-    反推自客户端 gameFramework/j/m.java 的 a(int i):
-        i == 0        -> ""
-        i < 100000    -> MD5("x"  + i)[:10]
-        i < 200000    -> MD5("y"  + i)[:11]
-        i < 300000    -> MD5("z"  + i)[:12]
-        i < 1000000   -> MD5("xx" + i)[:13]
-        i < 2000000   -> MD5("yy" + i)[:14]
-        其它          -> "NA"
-
-    实测 A=10605 -> "da7821ccf7", action=get 返回 OK。
-    """
-    try:
-        a = int(a)
-    except (TypeError, ValueError):
-        return "NA"
-    if a <= 0:
-        return ""
-    if a < 100000:
-        pre, n = "x", 10
-    elif a < 200000:
-        pre, n = "y", 11
-    elif a < 300000:
-        pre, n = "z", 12
-    elif a < 1000000:
-        pre, n = "xx", 13
-    elif a < 2000000:
-        pre, n = "yy", 14
-    else:
-        return "NA"
-    return hashlib.md5((pre + str(a)).encode("utf-8")).hexdigest()[:n]
-
-
-def resolve_official_addr(room: dict, timeout: int = 15) -> str:
-    """把中继房在列表里的入口地址解析成真实游戏地址。
-
-    中继房(RELAY-CN 等通过 UPList 开放到官方列表)在列表里的 ip:port 全是
-    同一个入口(如 18.216.139.119:5158), 直连会被踢
-    "Your client is newer then the server"。真实地址需向 masterserver 发
-    action=get, 参数 c 由 A 字段推导。
-
-    仅内部使用; 结果只用于连接, 不对外展示。
-    返回 "ip:port", 失败返回空串。
-    """
-    uuid_ = (room.get("id") or "").strip()
-    raw = room.get("raw") or {}
-    a = room.get("join_a") or raw.get("join_a") or "0"
-    # A == 0 说明列表里的 ip:port 就是真实地址, 无需解析
-    try:
-        if int(str(a).strip() or "0") == 0:
-            return ""
-    except ValueError:
-        return ""
-    c = _challenge_code(a)
-    if not c or c == "NA":
-        return ""
-    for base in MASTERSERVERS:
-        params = {"action": "get", "game_id": uuid_, "c": c}
-        url = base + "/interface?" + urllib.parse.urlencode(params)
-        try:
-            req = urllib.request.Request(url, headers={
-                "User-Agent": f"rw android {CLIENT_VER} en", "Language": "en"})
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = resp.read()
-                if resp.headers.get("Content-Encoding") == "gzip":
-                    try:
-                        data = gzip.decompress(data)
-                    except OSError:
-                        pass
-            text = data.decode("utf-8", "replace")
-        except Exception:
-            continue
-        rows = [x for x in text.splitlines() if x.strip()]
-        # 响应: CORRODINGGAMES[1.0] / OK / <哈希> / <房间CSV>
-        if len(rows) < 4 or rows[1].strip().upper() != "OK":
-            continue
-        f = rows[3].split(",")
-        if len(f) > 5:
-            ip, port = f[3].strip(), f[5].strip()
-            if ip and port.isdigit():
-                return f"{ip}:{port}"
-    return ""
 
 
 def _normalize_official(room: dict) -> dict:
@@ -1317,12 +1227,6 @@ def _normalize_official(room: dict) -> dict:
         "players": _as_int(room.get("players"), 0),
         "max": _as_int(room.get("max"), 0),
         "status": status,
-        # Mod: 来自列表第 21 列(下标 20)。空 = 原版。
-        # 早期版本这里硬编码 False, 导致所有 official 房在列表里
-        # 一律显示"原版", 且 /铁锈列表 模组 会把 official 房全过滤掉。
-        "is_mod": bool(room.get("is_mod")),
-        "mod_names": list(room.get("mod_names") or []),
-        # 官方自动房(Auto Server)标记, 仅用于展示标注
         "is_auto_server": is_auto,
         "is_started": 1 if status == "ingame" else 0,
         "desc": desc,
@@ -1407,7 +1311,7 @@ def fetch_official_rooms(include_all: bool = False) -> list:
 
 def fetch_rooms(source: str = "all", include_all: bool = False,
                 only_joinable: bool = False, keyword: str = "",
-                status: str = "", mod_filter: str = "", full: str = "") -> list:
+                status: str = "", full: str = "") -> list:
     """拉取并合并房间列表, 返回统一结构。
 
     source:        "all"(默认, Q优先+Official补充) / "qroom" / "official"
@@ -1415,7 +1319,6 @@ def fetch_rooms(source: str = "all", include_all: bool = False,
     only_joinable: True 时只保留 status=battleroom(可加入)的房间
     keyword:       按 房主名/地图名/描述 模糊搜索(不区分大小写)
     status:        只保留指定 status(battleroom/ingame), 空表示不限
-    mod_filter:    "mod"=只看模组房 / "vanilla"=只看原版房 / 空=不限
     full:          "hide"=隐藏人满 / "only"=只看人满 / 空=不限
     """
     rooms = []
@@ -1432,11 +1335,6 @@ def fetch_rooms(source: str = "all", include_all: bool = False,
             continue
         if status and st != status.lower():
             continue
-        # 模组过滤
-        if mod_filter == "mod" and not room.get("is_mod"):
-            continue
-        if mod_filter == "vanilla" and room.get("is_mod"):
-            continue
         # 人满过滤
         is_full = (room.get("max") or 0) > 0 and (room.get("players") or 0) >= (room.get("max") or 0)
         if full == "hide" and is_full:
@@ -1450,7 +1348,6 @@ def fetch_rooms(source: str = "all", include_all: bool = False,
                 str(room.get("name") or ""),
                 str(room.get("map") or ""),
                 str(room.get("desc") or ""),
-                " ".join(str(m) for m in (room.get("mod_names") or [])),
             ]).lower()
             if kw not in blob:
                 continue
@@ -1482,15 +1379,14 @@ STATUS_CN = {"battleroom": "房间中", "ingame": "游戏中", "locked": "已锁
 
 
 def _fmt_room_line(room: dict) -> str:
-    """单行房间展示: 房主 | 地图 | 人数 | 状态 | 模组"""
+    """单行房间展示: 房主 | 地图 | 人数 | 状态"""
     st = STATUS_CN.get((room.get("status") or "").lower(), room.get("status") or "-")
     pl = room.get("players", 0)
     mx = room.get("max", 0)
-    mod = "模组" if room.get("is_mod") else "原版"
     desc = room.get("desc") or ""
     line = (f"{str(room.get('name') or '?')[:14]:<16}"
             f"{str(room.get('map') or '-')[:26]:<28}"
-            f"{pl}/{mx:<7}{st:<7}{mod:<5}")
+            f"{pl}/{mx:<7}{st:<7}")
     if desc and desc != room.get("map"):
         line += desc[:24]
     return line
@@ -1498,27 +1394,25 @@ def _fmt_room_line(room: dict) -> str:
 
 def room_list(source: str = "all", include_all: bool = False,
               only_joinable: bool = False, keyword: str = "",
-              status: str = "", mod_filter: str = "", full: str = "") -> list:
+              status: str = "", full: str = "") -> list:
     if not QUIET:
         print("[list] 获取房间列表...")
     rooms = fetch_rooms(source=source, include_all=include_all,
                         only_joinable=only_joinable, keyword=keyword,
-                        status=status, mod_filter=mod_filter, full=full)
+                        status=status, full=full)
     if not QUIET:
         conds = []
         if only_joinable:
             conds.append("仅可加入")
         if status:
             conds.append("状态=" + status)
-        if mod_filter:
-            conds.append("模组=" + mod_filter)
         if full:
             conds.append("人满=" + full)
         if keyword:
             conds.append("关键词=" + keyword)
         print("筛选: " + (" / ".join(conds) if conds else "无"))
         print("-" * 100)
-        print(f"{'房主':<16}{'地图':<28}{'人数':<7}{'状态':<7}{'类型':<5}描述")
+        print(f"{'房主':<16}{'地图':<28}{'人数':<7}{'状态':<7}描述")
         print("-" * 100)
         for room in rooms:
             print(_fmt_room_line(room))
@@ -1530,8 +1424,6 @@ def room_list(source: str = "all", include_all: bool = False,
 def parse_106(data):
     """解析 106 SERVER_INFO 房间信息消息"""
     r = NetReader(data)
-    def u16():
-        return struct.unpack('>H', r.read(2))[0]
     def i32():
         return struct.unpack('>i', r.read(4))[0]
     def utf():
@@ -1579,8 +1471,10 @@ def parse_106(data):
         info['flag_j'] = boolean()    # as.j
         info['has_custom'] = boolean()
 
-        # 初始化 Mod 相关字段
-        info['mod_names'] = []
+        # 初始化 customUnits 相关字段
+        # 注: customUnits 块与"是否使用 Mod"无关 —— 发送端 l.a(bg) 是无条件调用
+        # (aj.smali:746), 遍历全局单位表 l.d, 任何房间(含原版)都会带 121 个内置单位。
+        # 因此这里只保留「默认单位」展示所需的列表, 不再推测 mod 名。
         info['custom_unit_count'] = 0
         info['custom_units'] = []
         info['custom_unit_list'] = []   # 自定义单位显示名列表, 索引0对应ID=100
@@ -1617,11 +1511,6 @@ def parse_106(data):
                         nullable_str()
                     # 客户端 ae.c(i): 100+ 显示 lVarC.e() (本地化名, 回退单位ID)
                     info['custom_unit_list'].append(unit_id if unit_id else dname)
-                    # 收集 mod 引入单位的显示名 (如"炮塔科技1.4") → mod 名来源
-                    if dname:
-                        d = dname.strip()
-                        if d and d not in info['mod_names'] and d != unit_id:
-                            info['mod_names'].append(d)
             except (EOFError, struct.error):
                 # 单位解析中途失败: 放弃块内容, 但确保跳到块尾, 后续字段不错位
                 if DEBUG_MODE:
@@ -1654,7 +1543,6 @@ def parse_106(data):
               f"force2team={info.get('force2team')}, roomlock={info.get('roomlock')}, seed={info.get('seed')}")
         print(f"[DEBUG] 自定义单位数量: {info.get('custom_unit_count', 0)}")
         print(f"[DEBUG] 自定义单位列表: {info.get('custom_unit_list', [])[:10]}{'...' if len(info.get('custom_unit_list', [])) > 10 else ''}")
-        print(f"[DEBUG] Mod名称列表: {info.get('mod_names', [])}")
 
     return info
 
@@ -1801,37 +1689,62 @@ UNIT_TRANSLATIONS = {
     'wall_v': '墙 (V)',
 }
 
-AI_NAMES = {-2: '非常容易', -1: '容易', 0: '正常', 1: '困难', 2: '疯狂', 3: '噩梦'}
 
 OFFICIAL_VERSIONS = {
     176: '1.15',
+    175: '1.15 (测试版)',
     174: '1.15p11',
+    173: '1.15p10',
+    172: '1.15p9',
+    170: '1.15p7',
     130: '1.13',
     100: '1.12',
 }
 
+# 版本号的「特殊标记」：无法从协议得知，只能从房间/服务端特征推断。
+# 目前协议里没有可靠的改版标识（app_ver 只反映版本号，sub_ver 是兼容性版本），
+# 所以这里只保留有确凿依据的识别，其余一律显示原始版本号。
+
 
 def detect_client(info):
+    """识别房间版本。
+
+    协议里的 app_ver 是客户端版本号（176 = 1.15）。
+    sub_ver 是「兼容性版本」，同版本客户端之间保持一致，但不能用来区分改版。
+
+    **不做改版猜测**：rwpp / 汉化版 等改版不修改 app_ver，
+    协议层没有任何可靠标记，猜测只会误导用户。
+    """
     ver = info.get('app_ver')
     if ver in OFFICIAL_VERSIONS:
         return OFFICIAL_VERSIONS[ver]
     if ver:
-        return f'{ver / 100:.2f}' if ver < 1000 else str(ver)
-    return '?'
+        # 未登记的版本号：显示成「未知(177)」而不是含混的 1.77
+        major = ver // 100
+        minor = ver % 100
+        if major == 1 and 0 <= minor <= 99:
+            return f'1.{minor:02d}'
+        return f'未知({ver})'
+    return '未知'
 
 
-def format_room(info, rid, players, capacity=None, players_detail=None, max_players_display=10, player_count=None, show_players=False, room_mod_names=None):
+def format_room(info, rid, players, capacity=None, players_detail=None, max_players_display=10, player_count=None, show_players=False):
     import re as _re
 
+    # 排版约定（群里一屏看完）：
+    #   · 每行放 1~2 个字段，用全角空格分栏 —— 行首半角空格会被 QQ 当代码块
+    #   · 字段名与值之间统一用全角冒号
+    #   · 「玩家列表：」顶格，条目缩进两格，冒号同样全角
+    SEP = "　"
     lines = []
     cver = detect_client(info)
-    lines.append(f"版本：{cver}")
 
     mapname = info.get('mapname') or "(未知地图)"
     if mapname.endswith('.tmx'):
         mapname = mapname[:-4]
     mapname = _re.sub(r'^\[[^\]]*\]', '', mapname).strip()
-    lines.append(f"地图名称：{mapname}")
+    # 首行必须仍以「房间版本：」开头：main.py 靠这个前缀切掉探针的调试输出
+    lines.append(f"房间版本：{cver}{SEP}地图名称：{mapname}")
 
     c = info.get('credits', 0)
     if c == 0:
@@ -1839,13 +1752,13 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
     else:
         money_str = CREDITS_NAMES.get(c, f"${c}")
     mul = _fmt_multiplier(info.get('multiplier', 1.0))
-    lines.append(f"初始资金：{money_str}[{mul}倍率]")
-
-    lines.append(f"初始禁核：{'禁用核蛋蛋' if info.get('no_nukes', False) else '未禁用核蛋蛋'}")
-    _fog = info.get('fog')
-    lines.append("初始迷雾：" + (FOG_NAMES.get(_fog, '未知(' + str(_fog) + ')') if _fog is not None else "未知"))
     mode_str = {0: '遭遇战', 1: '自定义', 2: '存档'}.get(info.get('mode'), '未知(' + str(info.get('mode')) + ')')
-    lines.append(f"地图模式：{mode_str}")
+    lines.append(f"初始资金：{money_str}[{mul}倍率]{SEP}地图模式：{mode_str}")
+
+    _fog = info.get('fog')
+    _fog_str = FOG_NAMES.get(_fog, '未知(' + str(_fog) + ')') if _fog is not None else "未知"
+    _nuke_str = '禁用核蛋蛋' if info.get('no_nukes', False) else '未禁用核蛋蛋'
+    lines.append(f"初始禁核：{_nuke_str}{SEP}初始迷雾：{_fog_str}")
     # 默认单位: 客户端下拉 ae.d() = 1..4 + 可选起始单位(100+, RWPP isPickableStartingUnit)
     # 100+ 是 g 列表索引 (客户端 ae.d 100+ 部分), 不是服务器 custom_unit_list 顺序!
     # g: 100=experimentalDropship(飞行堡垒), 101=experimentalGunship(实验悬浮型气垫船), 102=experimentalSpider(实验型战斗蜘蛛), 103=modularSpider(模块蜘蛛)
@@ -1877,20 +1790,19 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
         dbg.append(f'final={unit_str}')
         print('[DEBUG] 默认单位: ' + ' | '.join(dbg))
 
-    lines.append(f"默认单位：{unit_str}")
+    _unit_line = f"默认单位：{unit_str}"
     cap = info.get('unit_cap')
     cap_max = info.get('unit_cap_max')
     if cap is not None and cap_max is not None:
-        lines.append(f"单位上限：{cap}")
+        _unit_line += f"{SEP}单位上限：{cap}"
+    lines.append(_unit_line)
 
     # 共享控制/允许旁观: 106 消息 customUnits 块之后 (as.l / as.o)
-    lines.append("共享控制：" + ("是" if info.get('shared', False) else "否"))
     spec = info.get('spectators')
-    if spec is None:
-        lines.append("允许旁观：未知")
-    else:
-        lines.append("允许旁观：" + ("是" if spec else "否"))
-    lines.append("队伍锁定：" + ("是" if info.get("teamlock") else "否"))
+    _spec_str = "未知" if spec is None else ("是" if spec else "否")
+    _shared_str = '是' if info.get('shared', False) else '否'
+    _lock_str = '是' if info.get("teamlock") else '否'
+    lines.append(f"共享控制：{_shared_str}{SEP}允许旁观：{_spec_str}{SEP}队伍锁定：{_lock_str}")
 
     maxp = capacity if capacity else 0
     if not maxp:
@@ -1902,32 +1814,11 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
     count = player_count if player_count is not None else len(players)
     lines.append(f"当前人数：{count}/{maxp if maxp else '?'}")
 
-    # 显示 Mod 信息
-    # 两处来源, 优先级: 列表自带的名字 > 106 包里的单位显示名
-    #   1) 列表第 21 列(下标 20) 的 mod 名 —— official / qroom 列表都有
-    #      这是房主上报的**权威**信息, 且能覆盖"只改数值不改单位"的 mod
-    #   2) 106 包里 customUnits 的单位显示名 —— 仅当列表没给名字时兜底
-    # 坑: customUnits 块本身与 mod 无关 —— 发送端 l.a(bg) 是**无条件**调用
-    # (aj.smali:746), 遍历全局单位表 l.d, 任何房间(含原版)都会带 121 个内置单位。
-    # 所以 cnt=121 不代表任何 mod, has_custom 也不代表有 mod。
-    list_mods = [m for m in (room_mod_names or []) if m]
-    pkt_mods = info.get('mod_names', []) or []
-    unit_count = info.get('custom_unit_count') or 0
-    if list_mods:
-        shown = list_mods[:5]
-        mod_str = ', '.join(f"[{m}]" for m in shown)
-        if len(list_mods) > 5:
-            mod_str += f" 等{len(list_mods)}个"
-        lines.append(f"使用Mod：{mod_str}")
-    elif pkt_mods:
-        mod_str = ', '.join(f"[{m}]" for m in pkt_mods[:5])
-        if len(pkt_mods) > 5:
-            mod_str += f" 等{len(pkt_mods)}个"
-        lines.append(f"使用Mod：{mod_str}（{unit_count} 个单位）")
-    else:
-        lines.append("使用Mod：原版")
-
     # 只展示房号类标识(Q57390 / r5132 / u_xxx), 不展示 IP 形式的目标地址
+    # 注: 原先这里还展示「使用Mod」, 已移除。列表第 21 列的 mod 名由房主客户端
+    # 自己上报, 装"只改数值不改单位"的 mod 时为空 -> 误判原版; 106 包里
+    # customUnits 块则与 mod 无关(发送端无条件调用, 任何房间都带内置单位)。
+    # 两个来源都不稳定且会误导用户, 故整体取消 mod 解析与展示。
     _rid_s = str(rid or "").strip()
     if _rid_s and not re.fullmatch(r"[\d.]+:\d+", _rid_s):
         lines.append(f"ID：{_rid_s}")
@@ -1935,7 +1826,7 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
     if show_players:
         if players_detail:
             lines.append("")
-            lines.append(" 玩家列表:")
+            lines.append("玩家列表：")
             total = len(players_detail)
             show = players_detail[:max_players_display]
             for p in show:
@@ -1964,17 +1855,17 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
                 if ping is None:
                     ping_str = ""
                 elif ping == -2:
-                    ping_str = " (断线)"
+                    ping_str = "（断线）"
                 elif ping == -1:
-                    ping_str = " (超时)"
+                    ping_str = "（超时）"
                 else:
-                    ping_str = f" (ping {ping}ms)"
-                lines.append(f"  {label}{mark}: {name}{ping_str}")
+                    ping_str = f"（ping {ping}ms）"
+                lines.append(f"  {label}{mark}：{name}{ping_str}")
             if total > max_players_display:
-                lines.append(f"  ... 还有 {total - max_players_display} 人")
+                lines.append(f"  … 还有 {total - max_players_display} 人")
         elif players:
             lines.append("")
-            lines.append(f" 玩家: {', '.join(players)}")
+            lines.append(f"玩家：{', '.join(players)}")
 
     return "\n".join(lines)
 
@@ -2074,29 +1965,6 @@ def parse_player_record(r, stream_ver, game_running=False):
 #   解析方法: 结构化扫描 (非正则), 名字长度由协议字段精确指定,
 #             扫描可 100% 复现, 不依赖固定偏移 (服务器记录变长)
 
-
-def _scan_nullable_names(block: bytes):
-    """扫描块内所有 nullable_str 名字.
-    结构化扫描: 01 + uint16长度 + UTF-8, 解码成功即候选.
-    返回 [(offset, name)] 按出现顺序.
-    """
-    names = []
-    i = 0
-    n = len(block)
-    while i < n - 3:
-        if block[i] == 0x01:          # nullable boolean=true
-            ln = struct.unpack('>H', block[i+1:i+3])[0]
-            if 0 < ln <= 64 and i + 3 + ln <= n:
-                try:
-                    s = block[i+3:i+3+ln].decode('utf-8')
-                    if s and all(c >= ' ' for c in s):
-                        names.append((i, s))
-                        i += 3 + ln
-                        continue
-                except UnicodeDecodeError:
-                    pass
-        i += 1
-    return names
 
 
 def _classify_name(name: str):
@@ -2363,14 +2231,6 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
         return result
 
 
-def parse_teams(payload):
-    r = parse_115(payload)
-    players = []
-    for p in r['players']:
-        if p['exists'] and p['name']:
-            players.append(p['name'])
-    return {'players': players, 'capacity': r['capacity'], 'detailed': r['players']}
-
 
 # bin 缓存目录: 固定为本脚本所在目录, 不依赖调用方的 cwd
 # (插件用 cwd=ROOM_INFO_DIR 启动子进程, 但 --list 等模式可能在其他 cwd 下被调用)
@@ -2412,6 +2272,124 @@ def cleanup_old_bin_files(max_age_seconds=3600, verbose=False):
     return deleted, kept
 
 
+def _ask_room_id_on_106(sock, probe, rid, tag=""):
+    """收到 106 后，若还没拿到房间短号，就发 `.id` 向服务端索取。
+
+    背景：从「房间列表」点进来的房间，客户端只知道 UUID / IP:端口，
+    不知道 s5132 这种中继短号，别人没法用短号直接进。
+    服务端（rwpp / IronCore 等）实现了 `.id` 命令，回一条 "SERVER: S5132"。
+
+    **这是备用手段，不是首选**：
+      1. 优先靠被动捕获 —— 部分中继（如 RELAY-CN）连上就主动推
+         `当前服务器ID是 您可以凭本ID在IP栏内重连 [S5132]`，
+         那条消息在 141 分支里已被捕获，写进 `_LAST_ROOM_ID`。
+      2. 只有被动没抓到（`_LAST_ROOM_ID` 为空）才发 `.id`。
+
+    另外只在 rid 不是短号形态时才问 —— 本来就是 s5132 进来的没必要问。
+
+    全程 try/except 包裹：`.id` 失败绝不能影响查房主流程。
+    """
+    global _LAST_ROOM_ID
+    try:
+        # ① 已经通过被动捕获拿到房号 -> 不再发，避免多余消息
+        if _LAST_ROOM_ID:
+            if DEBUG_MODE:
+                print(f"{tag}    已有房间号 {_LAST_ROOM_ID}（被动捕获），跳过 .id")
+            return
+        # ② 本来就是短号进房 -> 无需询问
+        if re.match(r'^[A-Za-z]\d{2,8}$', str(rid or "")):
+            return
+        # ③ 兜底：主动发 .id
+        if not send_chat(sock, ".id"):
+            return
+        if DEBUG_MODE:
+            print(f"{tag}    未捕获到房号，改发 .id 询问...")
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            try:
+                mt, pl = read_frame(sock, 1)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if mt == 141:
+                sender, message = parse_141(pl)
+                if DEBUG_MODE:
+                    print(f"{tag}    [id回复] {sender}: {message!r}")
+                got = extract_room_id_from_chat(message)
+                if got:
+                    _LAST_ROOM_ID = got
+                    if DEBUG_MODE:
+                        print(f"{tag}    => 房间号 {got}")
+                    return
+            elif mt == 150:
+                if DEBUG_MODE:
+                    print(f"{tag}    .id 后被踢: {NetReader(pl).utf()}")
+                return
+            elif mt == 151:
+                probe._handle_relay_151(pl)
+            elif mt == 108:
+                r = NetWriter()
+                r.int64(NetReader(pl).int64())
+                r.byte(1)
+                sock.sendall(pack_frame(109, r.output()))
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"{tag}    .id 流程异常(忽略): {e}")
+
+
+def _handle_chat_packet(payload, tag=""):
+    """处理 141 聊天包：打印 + 尝试捕获房间短号。
+
+    `relay_session` 与 `node_session` 两条主循环都要接 141，
+    逻辑完全一致，因此抽到一处，避免两处各写一遍导致行为漂移。
+
+    捕获说明：部分中继进房后会主动推
+    「当前服务器ID是 您可以凭本ID在IP栏内重连 [S5132]」，
+    这条消息可能落在中继连接上，也可能落在 178 跳转后的节点连接上，
+    所以两条路径都必须调用本函数。
+
+    即使本次查询用的就是短号，也照样捕获：用短号查 ≠ 进的就是那个房，
+    以服务端推送的为准。
+    """
+    global _LAST_ROOM_ID
+    sender, message = parse_141(payload)
+    if DEBUG_MODE:
+        print(f"[聊天] {sender}: {message}" if sender else f"[聊天] {message}")
+    if _LAST_ROOM_ID:
+        return
+    got = extract_room_id_from_chat(message)
+    if got:
+        _LAST_ROOM_ID = got
+        if DEBUG_MODE:
+            print(f"{tag}    => 从聊天捕获房间号 {got}")
+
+
+def _finalize_room(sock, got_106, got_115, probe, rid, tag=""):
+    """收到 106 后的统一收尾：验证码房识别 → 问房号 → 进房推广 → 离开。
+
+    `relay_session` 与 `node_session` 收尾步骤完全一致，抽到一处，
+    保证新加的收尾动作（如推广）不会只在其中一条路径生效。
+
+    返回 (got_106, got_115)，或 ("CAPTCHA", 原因) 表示是验证码房。
+    """
+    # 反机器人验证码房识别: 部分中继会对可疑客户端下发 rank-verification
+    # 地图, 继续交互可能被封 IP, 必须立即撤退。
+    try:
+        if _is_verification_map(parse_106(got_106)):
+            send_leave(sock)
+            sock.close()
+            return ("CAPTCHA", "验证码房无法继续")
+    except Exception:
+        pass
+    # 先问房号再推广：服务端若对连续消息有节流，优先保证关键信息发出。
+    _ask_room_id_on_106(sock, probe, rid, tag)
+    maybe_promote_room(sock, rid, getattr(probe, "server_id", None), tag)
+    send_leave(sock)
+    sock.close()
+    return got_106, got_115
+
+
 def finish_report(sock, got_106, got_115, target):
     info = parse_106(got_106)
     players_detail = []
@@ -2432,7 +2410,13 @@ def finish_report(sock, got_106, got_115, target):
         current_players = 0
 
     print()
-    print(format_room(info, target, players_names, capacity, players_detail, _MAX_PLAYERS_DISPLAY, player_count=current_players, show_players=SHOW_PLAYERS))
+    # ---- 展示用的房号：优先用 `.id` 从服务端拿到的中继短号 ----
+    # 从「房间列表」点进来的房间，target 是 UUID（一长串十六进制），
+    # 用户看到它没法告诉别人怎么进。`.id` 返回的才是 s5132 这种短号。
+    _disp_target = target
+    if _LAST_ROOM_ID:
+        _disp_target = _LAST_ROOM_ID
+    print(format_room(info, _disp_target, players_names, capacity, players_detail, _MAX_PLAYERS_DISPLAY, player_count=current_players, show_players=SHOW_PLAYERS))
 
     timestamp = int(time.time())
     safe_target = re.sub(r'[^\w\-]', '_', target)
@@ -2449,28 +2433,43 @@ def finish_report(sock, got_106, got_115, target):
 
 
 def direct_main():
+    """直连 IP:端口 查询房间。
+
+    支持两种形式：
+      · `IP:端口`                  —— 直接连节点（房间已分配到该节点）
+      · `IP:端口/房间UUID`          —— 从「房间列表」点进来的形式：带着 UUID
+                                       向分配中心请求，由它把连接转到正确节点
+    实测官方列表里所有真人房都指向同一个分配中心地址（如
+    18.216.139.119:5158），必须带 UUID 才能路由到目标房间。
+    """
+    target = DIRECT_TARGET
+    room_uuid = ""
+    if "/" in target:
+        target, _, room_uuid = target.partition("/")
+        room_uuid = room_uuid.strip()
     # 无端口时直接默认 5123, 避免 rpartition 把整个地址当端口
-    if ":" in DIRECT_TARGET:
-        ip, _, port = DIRECT_TARGET.rpartition(":")
+    if ":" in target:
+        ip, _, port = target.rpartition(":")
         try:
             port = int(port or 5123)
         except ValueError:
-            print(f"[房间查询失败] 端口无效: {DIRECT_TARGET}")
+            print(f"[房间查询失败] 端口无效: {target}")
             sys.exit(0)
     else:
-        ip, port = DIRECT_TARGET, 5123
-    if not QUIET:
-        print(f"=== 直连 {ip}:{port} (客户端 1.15) ===")
+        ip, port = target, 5123
+    if DEBUG_MODE:
+        _u = f" UUID={room_uuid}" if room_uuid else ""
+        print(f"=== 直连 {ip}:{port}{_u} (客户端 1.15) ===")
 
     # 统一走 node_session: 它会处理 161 之前的 178 跳转、151 挑战、106/115。
     # 早期这里另写了一套 connect_and_161 流程, 只认 161, 遇到节点先回 178
     # 就报 sid=None / 未收到106 —— 而同样的地址走 node_session 是能查到的。
-    result = node_session(ip, port, None)
+    result = node_session(ip, port, room_uuid or None)
     if isinstance(result, tuple) and result and result[0] in ("KICKED", "FAILED", "LOOP", "CAPTCHA"):
         kind, msg = result[0], str(result[1])
         if kind == "KICKED":
             _handle_kicked(msg)
-        if not QUIET:
+        if DEBUG_MODE:
             print(f"!! {msg}")
         print(f"[房间查询失败] {msg}")
         sys.exit(1 if kind in ("LOOP", "CAPTCHA") else 0)
@@ -2478,6 +2477,7 @@ def direct_main():
         print("[房间查询失败] 房间不存在或已关闭")
         sys.exit(1)
     got_106, got_115 = result
+    # 展示用 target：带 UUID 时保留完整形式，便于用户回看
     finish_report(None, got_106, got_115, DIRECT_TARGET)
 
 
@@ -2492,11 +2492,11 @@ def _follow_jump(addr, rid, depth, seen, tag=""):
     '/' 之前的部分作为 host:port 继续连接。
     """
     if not addr:
-        if not QUIET:
+        if DEBUG_MODE:
             print(f"{tag}!! 178地址为空")
         return ("FAILED", "中继跳转地址为空，房间可能刚关闭")
     addr = re.sub(r'^\[(TCP|UDP)\]\s*', '', addr.strip())
-    if not QUIET:
+    if DEBUG_MODE:
         print(f"{tag}[3] 收到178跳转: {addr!r}")
     if "/" in addr:
         hp, _, rid2 = addr.partition("/")
@@ -2506,7 +2506,7 @@ def _follow_jump(addr, rid, depth, seen, tag=""):
             p2 = int(p2) if p2.isdigit() else 5123
         else:
             h2, p2 = hp, 5123
-        if not QUIET:
+        if DEBUG_MODE:
             print(f"{tag}[3] 跳转到中继 {h2}:{p2} 房间 {rid2}")
         return relay_session(h2, p2, rid2, depth + 1, seen)
     if ":" in addr:
@@ -2514,41 +2514,42 @@ def _follow_jump(addr, rid, depth, seen, tag=""):
         p2 = int(p2) if p2.isdigit() else 5123
     else:
         h2, p2 = addr, 5123
-    if not QUIET:
+    if DEBUG_MODE:
         print(f"{tag}[3] 跳转到节点 {h2}:{p2}")
     return node_session(h2, p2, rid, depth + 1, seen)
 
 
 def relay_session(host, port, rid, depth=0, seen=None):
+    global _LAST_ROOM_ID
     tag = f"[{depth}]" if depth else ""
     # 环检测: 防止 178 跳转在 中继<->节点 之间来回死循环
     if seen is None:
         seen = set()
     node_key = (str(host).lower(), int(port), str(rid).lower())
     if node_key in seen:
-        if not QUIET:
+        if DEBUG_MODE:
             print(f"{tag}!! 检测到跳转环路 {host}:{port} rid={rid}，已中止")
         return ("LOOP", f"跳转环路: {host}:{port}/{rid}")
     seen.add(node_key)
     if depth > 6:
-        if not QUIET:
+        if DEBUG_MODE:
             print(f"{tag}!! 跳转层级过深({depth})，已中止")
         return ("LOOP", "跳转层级过深")
-    if not QUIET:
+    if DEBUG_MODE:
         print(f"{tag}=== 中继会话 {rid} @ {host}:{port} (depth={depth}) ===")
     # 连接失败必须显式报告: 该首字母的中继未开通端口(c/g/j/v)时会在此抛出
     try:
         s, probe = connect_and_161(host, port, rid)
     except OSError as e:
-        if not QUIET:
+        if DEBUG_MODE:
             print(f"{tag}!! 连接中继失败: {e}")
         return ("FAILED", f"无法连接中继 {host}:{port}（该首字母的中继未开放或网络不通）")
     except Exception as e:
-        if not QUIET:
+        if DEBUG_MODE:
             print(f"{tag}!! 握手异常: {e}")
         return ("FAILED", f"中继握手异常: {type(e).__name__}")
     sid = probe.server_id
-    if not QUIET:
+    if DEBUG_MODE:
         print(f"{tag}[1] 中继161: sid={sid!r} conn={probe.conn_id} chal={probe.challenge_y}")
     # 中继可能直接回 178 跳转(而不是先回 161): 房号存在时 q/s 这类 RWHPS 中继就是如此
     jump_now = getattr(probe, "jump_addr", None)
@@ -2556,13 +2557,13 @@ def relay_session(host, port, rid, depth=0, seen=None):
         s.close()
         return _follow_jump(jump_now, rid, depth, seen, tag)
     if not sid:
-        if not QUIET:
+        if DEBUG_MODE:
             print(f"{tag}!! 握手失败，未收到房间服务器响应")
         s.close()
         return ("FAILED", f"中继 {host}:{port} 未响应握手（房间不存在或中继繁忙）")
 
     send_110(s, sid, CK, probe.conn_id, probe.challenge_y)
-    if not QUIET:
+    if DEBUG_MODE:
         print(f"{tag}[2] 110已发送，等待验证/跳转/房间信息...")
 
     got_106 = None
@@ -2578,20 +2579,20 @@ def relay_session(host, port, rid, depth=0, seen=None):
             break
         if mtype == 161:
             probe._parse_161(payload)
-            if not QUIET:
+            if DEBUG_MODE:
                 print(f"{tag}    收到游戏服务器161: sid={probe.server_id!r} conn={probe.conn_id}")
             if probe.server_id:
                 send_110(s, probe.server_id, CK, probe.conn_id, probe.challenge_y)
-                if not QUIET:
+                if DEBUG_MODE:
                     print(f"{tag}    已重新发送110到游戏服务器")
         elif mtype == 163:
             r = NetReader(payload)
             r.byte(); relay_ver = r.int32(); r.int32(); r.boolean()
-            if not QUIET:
+            if DEBUG_MODE:
                 print(f"{tag}    163 relay_ver={relay_ver}")
         elif mtype == 151:
             probe._handle_relay_151(payload)
-            if not QUIET:
+            if DEBUG_MODE:
                 print(f"{tag}    已应答151挑战")
         elif mtype == 178:
             addr = probe._handle_178(payload)
@@ -2599,22 +2600,22 @@ def relay_session(host, port, rid, depth=0, seen=None):
             return _follow_jump(addr, rid, depth, seen, tag)
         elif mtype == 106:
             got_106 = payload
-            if not QUIET:
+            if DEBUG_MODE:
                 print(f"{tag}[4] 收到106 SERVER_INFO ({len(payload)}B)")
         elif mtype == 115:
             got_115 = payload
-            if not QUIET:
+            if DEBUG_MODE:
                 print(f"{tag}[4] 收到115 teams ({len(payload)}B)")
         elif mtype == 108:
             r = NetWriter(); r.int64(NetReader(payload).int64()); r.byte(1)
             s.sendall(pack_frame(109, r.output()))
         elif mtype == 150:
             kick_reason = NetReader(payload).utf()
-            if not QUIET:
+            if DEBUG_MODE:
                 print(f"{tag}KICKED:", kick_reason)
             break
         elif mtype == 111:
-            if not QUIET:
+            if DEBUG_MODE:
                 print(f"{tag}DISCONNECT")
             break
         elif mtype == 117:
@@ -2626,37 +2627,21 @@ def relay_session(host, port, rid, depth=0, seen=None):
                 hint = _r.utf()
             except Exception:
                 hint = ""
-            if not QUIET:
+            if DEBUG_MODE:
                 print(f"{tag}[117] {hint!r}")
             if hint:
                 return ("KICKED", hint)
         elif mtype == 141:
-            sender, message = parse_141(payload)
-            if not QUIET:
-                if sender:
-                    print(f"[聊天] {sender}: {message}")
-                else:
-                    print(f"[聊天] {message}")
+            _handle_chat_packet(payload, tag)
         else:
-            if not QUIET:
+            if DEBUG_MODE:
                 print(f"{tag}    未处理消息 mtype={mtype} len={len(payload)} hex={payload.hex()[:80]}")
         if got_106 is not None:
-            # 反机器人验证码房识别(同 node_session)
-            try:
-                _vinfo = parse_106(got_106)
-                if _is_verification_map(_vinfo):
-                    send_leave(s)
-                    s.close()
-                    return ("CAPTCHA", "验证码房无法继续")
-            except Exception:
-                pass
-            send_leave(s)
-            s.close()
-            return got_106, got_115
+            return _finalize_room(s, got_106, got_115, probe, rid, tag)
     s.close()
     if kick_reason:
         return ("KICKED", kick_reason)
-    if got_106 is None and not QUIET:
+    if got_106 is None and DEBUG_MODE:
         print(f"{tag}!! 未收到106（房间可能不存在/已关闭/需要密码）")
     # 静默模式也需要让调用方知道失败原因, 不能返回 None 让插件"无输出"
     return ("FAILED", f"未收到房间信息（中继 {host}:{port} 无响应）")
@@ -2675,14 +2660,14 @@ def _follow_node_jump(addr, rid, depth=0, seen=None):
     if seen is None:
         seen = set()
     if depth > 6:
-        if not QUIET:
+        if DEBUG_MODE:
             print(f"!! 节点跳转层级过深({depth})")
         return ("LOOP", "节点跳转层级过深")
     raw = (addr or "").strip()
     if not raw:
         return ("FAILED", "节点跳转地址为空")
     raw = re.sub(r'^\[(TCP|UDP)\]\s*', '', raw)
-    if not QUIET:
+    if DEBUG_MODE:
         print(f"[*] 跟随节点178: {raw!r} (depth={depth})")
 
     # 客户端 ae.smali 的地址归一化(必须照做, 否则短代号全部连不上):
@@ -2694,12 +2679,12 @@ def _follow_node_jump(addr, rid, depth=0, seen=None):
     elif (len(raw) > 1 and ":" not in raw and "." not in raw
           and "/" not in raw and "\\" not in raw and raw != "localhost"):
         raw = f"{raw[0]}.relay.corrodinggames.com/{raw}"
-        if not QUIET:
+        if DEBUG_MODE:
             print(f"[*] 短代号转域名: {raw!r}")
 
     key = raw.lower()
     if key in seen:
-        if not QUIET:
+        if DEBUG_MODE:
             print(f"!! 节点跳转环路 {raw}")
         return ("LOOP", f"节点跳转环路: {raw}")
     seen.add(key)
@@ -2737,13 +2722,13 @@ def _is_verification_map(info: dict) -> bool:
 def node_session(host, port, rid=None, depth=0, seen=None):
     if seen is None:
         seen = set()
-    if not QUIET:
+    if DEBUG_MODE:
         print(f"[4] 连接节点: {host}:{port} (房间 {rid or '-'})")
     try:
         s2 = socket.create_connection((host, port), timeout=8)
         s2.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     except Exception as e:
-        if not QUIET:
+        if DEBUG_MODE:
             print(f"!! 节点连接失败: {e}")
         return ("FAILED", f"无法连接游戏节点 {host}:{port}")
     w = NetWriter()
@@ -2758,7 +2743,7 @@ def node_session(host, port, rid=None, depth=0, seen=None):
     probe2.sock = s2
     probe2._wait_161()
     sid2 = probe2.server_id
-    if not QUIET:
+    if DEBUG_MODE:
         print(f"[5] 节点161: sid={sid2!r} conn={probe2.conn_id}")
     # 有些节点在握手阶段就直接回 178(连 161 都不发): RELAY-CN / Tiexiu 的
     # 分配节点就是这样, 回包形如 "[TCP]h1.example:5123/RA"。客户端收到后
@@ -2766,11 +2751,11 @@ def node_session(host, port, rid=None, depth=0, seen=None):
     jump_now = getattr(probe2, "jump_addr", None)
     if jump_now:
         s2.close()
-        if not QUIET:
+        if DEBUG_MODE:
             print(f"[5] 节点握手即178: {jump_now!r}")
         return _follow_node_jump(jump_now, rid, depth + 1, seen)
     if not sid2:
-        if not QUIET:
+        if DEBUG_MODE:
             print("!! 节点握手失败")
         s2.close()
         return ("FAILED", f"游戏节点 {host}:{port} 未响应握手")
@@ -2788,35 +2773,37 @@ def node_session(host, port, rid=None, depth=0, seen=None):
             break
         if mtype == 161:
             probe2._parse_161(payload)
-            if not QUIET:
+            if DEBUG_MODE:
                 print(f"[6] 收到游戏服务器161: sid={probe2.server_id!r} conn={probe2.conn_id}")
             if probe2.server_id:
                 send_110(s2, probe2.server_id, CK, probe2.conn_id, probe2.challenge_y)
-                if not QUIET:
+                if DEBUG_MODE:
                     print(f"[6] 已重新发送110到游戏服务器")
         elif mtype == 163:
             r = NetReader(payload)
             r.byte(); relay_ver = r.int32(); r.int32(); r.boolean()
-            if not QUIET:
+            if DEBUG_MODE:
                 print(f"[6] 163 relay_ver={relay_ver}")
         elif mtype == 151:
             probe2._handle_relay_151(payload)
         elif mtype == 106:
             got_106 = payload
-            if not QUIET:
+            if DEBUG_MODE:
                 print(f"[6] 收到106 SERVER_INFO ({len(payload)}B)")
         elif mtype == 115:
             got_115 = payload
-            if not QUIET:
+            if DEBUG_MODE:
                 print(f"[6] 收到115 teams ({len(payload)}B)")
         elif mtype == 108:
             r = NetWriter(); r.int64(NetReader(payload).int64()); r.byte(1)
             s2.sendall(pack_frame(109, r.output()))
         elif mtype == 150:
             kick_reason = NetReader(payload).utf()
-            if not QUIET:
+            if DEBUG_MODE:
                 print("KICKED:", kick_reason)
             break
+        elif mtype == 141:
+            _handle_chat_packet(payload, "[6]")
         elif mtype == 117:
             # 节点拒绝: byte 1 + int32 类型 + utf(文本)
             hint = ""
@@ -2826,7 +2813,7 @@ def node_session(host, port, rid=None, depth=0, seen=None):
                 hint = _r.utf()
             except Exception:
                 hint = ""
-            if not QUIET:
+            if DEBUG_MODE:
                 print(f"[7] 节点提示: {hint!r}")
             if hint:
                 kick_reason = hint
@@ -2835,38 +2822,20 @@ def node_session(host, port, rid=None, depth=0, seen=None):
             # 178 是跳转指令, 不是拒绝。节点把房间转挂到别处时会再下发一跳
             # (如 62.234.56.66:5126/RB), 客户端收到后关掉当前连接继续跟随。
             addr = probe2._handle_178(payload)
-            if not QUIET:
+            if DEBUG_MODE:
                 print(f"[6] 节点178跳转: {addr!r}")
             s2.close()
             return _follow_node_jump(addr, rid, depth + 1, seen)
-        elif mtype == 141:
-            sender, message = parse_141(payload)
-            if not QUIET:
-                if sender:
-                    print(f"[聊天] {sender}: {message}")
-                else:
-                    print(f"[聊天] {message}")
         else:
-            if not QUIET:
+            if DEBUG_MODE:
                 print(f"[6] 未处理消息 mtype={mtype} len={len(payload)} hex={payload.hex()[:80]}")
         if got_106 is not None:
-            # 反机器人验证码房识别: RELAY-CN 对部分房会下发 rank-verification
-            # 这种是验证码, 不是目标房间。立即撤退并明确标记, 避免误报和封 IP。
-            try:
-                _vinfo = parse_106(got_106)
-                if _is_verification_map(_vinfo):
-                    send_leave(s2)
-                    s2.close()
-                    return ("CAPTCHA", "验证码房无法继续")
-            except Exception:
-                pass
-            send_leave(s2)
-            s2.close()
-            return got_106, got_115
+            return _finalize_room(s2, got_106, got_115, probe2,
+                                  rid or f"{host}:{port}")
     s2.close()
     if kick_reason:
         return ("KICKED", kick_reason)
-    if got_106 is None and not QUIET:
+    if got_106 is None and DEBUG_MODE:
         print("!! 未收到106")
     return ("FAILED", f"游戏节点 {host}:{port} 未返回房间信息")
 
@@ -2892,7 +2861,7 @@ def _handle_kicked(reason, sock=None):
 
 def relay_main():
     host = relay_host(RID)
-    if not QUIET:
+    if DEBUG_MODE:
         print(f"=== 查询房间 {RID} (客户端 1.15) ===")
         try:
             print(f"[0] 中继: {host}:5123 (DNS={socket.gethostbyname(host)})")
@@ -2911,7 +2880,7 @@ def relay_main():
         print(f"[房间查询失败] {result[1]}")
         sys.exit(1)
     if isinstance(result, tuple) and result[0] == "LOOP":
-        if not QUIET:
+        if DEBUG_MODE:
             print(f"!! {result[1]}")
         print("[房间查询失败] 房间查询链路异常（跳转环路），该房间当前无法查询")
         sys.exit(1)
@@ -2942,23 +2911,25 @@ def main():
     if LIST_JSON:
         rooms = fetch_rooms(source=LIST_SOURCE, include_all=LIST_ALL,
                             only_joinable=LIST_JOINABLE, keyword=LIST_KEYWORD,
-                            status=LIST_STATUS, mod_filter=LIST_MOD,
-                            full=LIST_FULL)
+                            status=LIST_STATUS, full=LIST_FULL)
         print(json.dumps(rooms, ensure_ascii=False, default=str))
         return
     if LIST_MODE:
         room_list(source=LIST_SOURCE, include_all=LIST_ALL,
                   only_joinable=LIST_JOINABLE, keyword=LIST_KEYWORD,
-                  status=LIST_STATUS, mod_filter=LIST_MOD, full=LIST_FULL)
+                  status=LIST_STATUS, full=LIST_FULL)
         return
     if not RID:
         print(HELP_TEXT)
         return
+    # 每次查询前清空上次的 `.id` 结果，避免串到下一次查询
+    global _LAST_ROOM_ID
+    _LAST_ROOM_ID = ""
     if DIRECT_TARGET:
         direct_main()
         return
     if RID.startswith("u_"):
-        if not QUIET:
+        if DEBUG_MODE:
             print("!! u_房间(Auto Server)请先用 --list 找到该房的 IP:端口 再直连")
         return
     # 所有中继房间统一走 relay_main (含 h.relay.* 国际中继)

@@ -1,122 +1,270 @@
 {
-    "global_enabled": {
+  "基础设置": {
+    "type": "object",
+    "description": "基础设置：解析开关、名单模式、私聊与调试",
+    "items": {
+      "global_enabled": {
         "description": "全局解析开关",
         "type": "bool",
-        "default": true
-    },
-    "mode": {
-        "description": "名单模式: white(白名单) / black(黑名单) / mixed(混合模式@用户优先)",
+        "default": true,
+        "hint": "关闭后所有消息都不再解析房号，插件完全静默。"
+      },
+      "mode": {
+        "description": "名单模式",
         "type": "string",
         "default": "black",
-        "options": ["white", "black", "mixed"]
-    },
-    "白名单": {
-        "description": "白名单列表（black/white模式下使用）",
+        "options": [
+          "white",
+          "black",
+          "mixed"
+        ],
+        "hint": "white=仅名单内放行（白名单）；black=名单外都放行（黑名单）；mixed=@用户优先，其次按群号判定。",
+        "obvious_hint": true
+      },
+      "私聊启用": {
+        "description": "启用私聊查房",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后私聊发房号不会有任何响应。"
+      },
+      "debug": {
+        "description": "调试日志",
+        "type": "bool",
+        "default": false,
+        "hint": "输出详细运行信息，排查问题时开启。日常使用建议关闭，否则日志很多。"
+      },
+      "官Q模式": {
+        "description": "官方QQ机器人模式（一键接管排版）",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后统一接管消息排版：优先用 msg_type=2 的 Markdown 卡片发送（带表格与快捷按钮），通道不可用时自动降级纯文本，并顺带做换行规整。非官方平台（个人机器人 aiocqhttp 等）请保持关闭，走原有纯文本 / 合并转发。",
+        "obvious_hint": true
+      },
+      "调试菜单": {
+        "description": "调试指令使用菜单式展示",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后 /铁锈查房调试 支持分类查看（如 /铁锈查房调试 探针、/铁锈查房调试 列表），输出更短更清晰。关闭则一次性打印全部信息。",
+        "obvious_hint": true
+      },
+      "压缩范围": {
+        "description": "消息压缩范围（折叠长内容）",
+        "type": "string",
+        "default": "none",
+        "options": [
+          "none",
+          "room",
+          "list",
+          "diag",
+          "help",
+          "all"
+        ],
+        "hint": "none = 不压缩；room = 只压缩查房结果；list = 只压缩房间列表；diag = 只压缩调试输出；help = 只压缩帮助与菜单；all = 全部压缩（覆盖前四项）。第三方机器人没有 Markdown，改用合并转发卡片折叠。也可用 /铁锈压缩 <范围> 切换。",
+        "obvious_hint": true
+      },
+      "指令唤醒词": {
+        "description": "指令唤醒词",
+        "type": "string",
+        "default": "/",
+        "hint": "必须和 AstrBot 主配置里的唤醒词一致，否则卡片上的按钮点下去发不出指令，未知指令的帮助兜底也会失效。默认 /。如果你把 AstrBot 唤醒词改成了 > 或 ! 等，这里要同步填同一个字符。留空按 / 处理。",
+        "obvious_hint": true
+      },
+      "显示项目地址": {
+        "description": "展示项目地址",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后：官方机器人=卡片底部多一个「项目主页」跳转按钮；第三方机器人（个人号 / OneBot）=每条消息末尾多一行虚线小字项目地址。地址固定，不可修改。",
+        "obvious_hint": true
+      },
+      "机器人QQ号": {
+        "description": "本机机器人 QQ 号（可留空）",
+        "type": "string",
+        "default": "",
+        "hint": "仅用于合并转发消息的发送者 uin。留空会自动从事件读取；官方机器人读到的是 openid，属正常现象。"
+      }
+    }
+  },
+  "名单管理": {
+    "type": "object",
+    "description": "名单管理：白名单 / 黑名单 / 混合模式专用名单",
+    "items": {
+      "白名单": {
+        "description": "白名单列表",
         "type": "list",
-        "default": []
-    },
-    "黑名单": {
-        "description": "黑名单列表（black/white模式下使用）",
+        "default": [],
+        "hint": "格式：群用 #群号，用户用 @QQ号。例 #1033752827、@3856554669。仅在 white / mixed 模式下生效。"
+      },
+      "黑名单": {
+        "description": "黑名单列表",
         "type": "list",
-        "default": []
-    },
-    "混合_白名单": {
-        "description": "混合模式专用白名单（@用户/#群 独立管理）",
+        "default": [],
+        "hint": "格式同上。仅在 black / mixed 模式下生效。命中即拦截。"
+      },
+      "混合_白名单": {
+        "description": "混合模式白名单",
         "type": "list",
-        "default": []
-    },
-    "混合_黑名单": {
-        "description": "混合模式专用黑名单（@用户/#群 独立管理）",
+        "default": [],
+        "hint": "仅 mixed 模式使用。@用户 优先级高于 #群号。"
+      },
+      "混合_黑名单": {
+        "description": "混合模式黑名单",
         "type": "list",
-        "default": []
-    },
-    "混合_私聊策略": {
-        "description": "混合模式私聊默认策略: white(不在白名单拦截) / black(在黑名单拦截)",
+        "default": [],
+        "hint": "仅 mixed 模式使用。@用户 优先级高于 #群号。"
+      },
+      "混合_私聊策略": {
+        "description": "混合模式私聊策略",
         "type": "string",
         "default": "white",
-        "options": ["white", "black"]
-    },
-    "私聊启用": {
-        "description": "是否启用私聊查房处理（关闭则私聊不发房号）",
-        "type": "bool",
-        "default": true
-    },
-    "debug": {
-        "description": "开启调试日志（输出详细运行信息）",
-        "type": "bool",
-        "default": false
-    },
-    "max_players_display": {
-        "description": "玩家列表最多显示人数，超过则折叠",
+        "options": [
+          "white",
+          "black"
+        ],
+        "hint": "white=不在白名单就拦截；black=在黑名单才拦截。"
+      }
+    }
+  },
+  "查房行为": {
+    "type": "object",
+    "description": "查房行为：冷却、并发探针、玩家列表、重试",
+    "items": {
+      "房号冷却秒": {
+        "description": "房号冷却时间",
         "type": "int",
-        "default": 10
-    },
-    "show_players": {
-        "description": "是否显示玩家列表（默认关闭，避免解析不稳定）",
+        "default": 10,
+        "min": 0,
+        "max": 3600,
+        "hint": "单位秒，默认 10。同一房号在该时间内不重复查询，避免有人连发多遍。0 表示关闭。",
+        "obvious_hint": true
+      },
+      "冷却提示": {
+        "description": "冷却中是否提示",
         "type": "bool",
-        "default": false
-    },
-    "retry_times": {
-        "description": "探针名字被过滤时自动重试次数（0-10，默认3）",
+        "default": false,
+        "hint": "开启后，房号仍在冷却时回一条提示。默认关闭＝完全静默，避免英文聊天里出现无端响应。",
+        "obvious_hint": true
+      },
+      "probe_max_per_msg": {
+        "description": "单条消息最多召唤探针数",
+        "type": "int",
+        "default": 5,
+        "min": 1,
+        "max": 20,
+        "hint": "一条消息里写了多个房号时，最多同时查几个。防止刷屏与过量占用。"
+      },
+      "探针名前缀": {
+        "description": "探针名前缀",
+        "type": "string",
+        "default": "ABAB",
+        "hint": "探针在游戏里的名字形如「ABAB探针01_xxxxx」，这里改的就是「ABAB」那段。限 1-4 个字符，只允许中文、字母、数字、下划线、连字符。超长或含特殊字符会被自动清理，避免房间列表里名字过长或乱码导致进房失败。",
+        "obvious_hint": true
+      },
+      "retry_times": {
+        "description": "探针名被过滤时的重试次数",
         "type": "int",
         "default": 3,
         "min": 0,
-        "max": 10
-    },
-    "list_max_display": {
-        "description": "房间列表指令最多显示的房间数（默认20，避免消息过长）",
+        "max": 10,
+        "hint": "服务器可能过滤探针名导致进房失败，此时会自动改名重试。0 表示不重试。"
+      },
+      "show_players": {
+        "description": "显示玩家列表",
+        "type": "bool",
+        "default": false,
+        "hint": "默认关闭（解析可能不稳定）。开启后查房结果会附带玩家名单。"
+      },
+      "max_players_display": {
+        "description": "玩家列表最多显示人数",
         "type": "int",
-        "default": 20,
-        "min": 1,
-        "max": 100
-    },
-    "list_page_size": {
-        "description": "房间列表每页显示数量（默认5）",
+        "default": 10,
+        "hint": "超过该人数则折叠显示，避免消息过长。"
+      }
+    }
+  },
+  "进房推广": {
+    "type": "object",
+    "description": "进房推广：探针进房后自动发一条推广消息（如仓库链接）",
+    "items": {
+      "推广开关": {
+        "description": "启用进房推广",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，探针每次成功进房都会在公共频道发一条固定文案（含项目地址）。文案不可配置。默认关闭。",
+        "obvious_hint": true
+      },
+      "推广冷却秒": {
+        "description": "同一房间推广冷却",
+        "type": "int",
+        "default": 180,
+        "min": 0,
+        "max": 86400,
+        "hint": "同一房间在该时间内不重复推广，默认 180 秒（3 分钟）。冷却按房间记，换房间立刻可发。0 表示每次都发（不推荐）。",
+        "obvious_hint": true
+      }
+    }
+  },
+  "房间列表": {
+    "type": "object",
+    "description": "房间列表：分页与筛选",
+    "items": {
+      "list_page_size": {
+        "description": "列表每页显示数量",
         "type": "int",
         "default": 5,
         "min": 1,
-        "max": 30
-    },
-    "list_default_full": {
-        "description": "房间列表默认人数筛选: 空=全部 / hide=隐藏人满房间",
+        "max": 30,
+        "hint": "翻页时每页展示几条。"
+      },
+      "list_default_full": {
+        "description": "列表默认人数筛选",
         "type": "string",
         "default": "",
-        "options": ["", "hide"]
-    },
-    "probe_max_per_msg": {
-        "description": "单条消息最多召唤的探针数（默认5）",
-        "type": "int",
-        "default": 5,
-        "min": 1,
-        "max": 20
-    },
-    "bin_cleanup_enabled": {
-        "description": "是否在插件运行期间定时清理 bin 缓存（server_info_*.bin）",
+        "options": [
+          "",
+          "hide"
+        ],
+        "hint": "空=全部显示；hide=默认隐藏人满房间。"
+      }
+    }
+  },
+  "消息撤回": {
+    "type": "object",
+    "description": "消息撤回：查房结果自动撤回（可选，写入即启用）",
+    "items": {
+      "撤回": {
+        "description": "撤回配置列表",
+        "type": "list",
+        "default": [],
+        "hint": "格式 key:延迟秒，写入即启用、删掉即关闭。key 用前缀区分：#群号 / @用户ID / *（全局默认，仅群聊）。例 #123456:60、@3856554669:30、*:60。也可在群里用 /铁锈撤回 指令增删。"
+      }
+    }
+  },
+  "缓存清理": {
+    "type": "object",
+    "description": "缓存清理：定期删除 server_info_*.bin 探针缓存",
+    "items": {
+      "bin_cleanup_enabled": {
+        "description": "启用缓存自动清理",
         "type": "bool",
-        "default": true
-    },
-    "bin_cleanup_interval_hours": {
-        "description": "清理检查间隔（小时，默认24=一天一次，最小1）",
+        "default": true,
+        "hint": "插件运行期间定时清理探针产生的 bin 缓存文件。"
+      },
+      "bin_cleanup_interval_hours": {
+        "description": "清理检查间隔",
         "type": "int",
         "default": 24,
         "min": 1,
-        "max": 720
-    },
-    "bin_cleanup_max_age_hours": {
-        "description": "只清理超过该小时数的 bin 缓存（默认1小时）",
+        "max": 720,
+        "hint": "单位小时，默认 24（一天一次），最小 1。"
+      },
+      "bin_cleanup_max_age_hours": {
+        "description": "只清理超过该时长的缓存",
         "type": "int",
         "default": 1,
         "min": 1,
-        "max": 720
-    },
-    "群撤回": {
-        "description": "每个群独立的撤回配置，格式 \"#群号:开:延迟\"（开=1/0），例 \"#123456:1:60\"",
-        "type": "list",
-        "default": []
-    },
-    "私聊撤回": {
-        "description": "每个用户独立的撤回配置，格式 \"@用户ID:开:延迟\"（开=1/0），例 \"@3856554669:1:60\"",
-        "type": "list",
-        "default": []
+        "max": 720,
+        "hint": "单位小时，默认 1。较新的缓存会被保留，避免正在使用的文件被删。"
+      }
     }
+  }
 }

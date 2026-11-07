@@ -51,7 +51,8 @@ read_frame  = 读 8 字节头 → int32 长度 + int32 类型 → 读 payload
 | **110** | C→S | REGISTER | 注册进房间（关键：带哈希挑战应答） |
 | **106** | S→C | SERVER_INFO | **房间信息**（地图/资金/迷雾/禁核/单位/人数...） |
 | **115** | S→C | TEAMS | 队伍/玩家列表 |
-| **141** | S→C | CHAT | 房间聊天 |
+| **140** | C→S | CHAT_SEND | 客户端发聊天（UTF 内容 + Int32 频道） |
+| **141** | S→C | CHAT | 房间聊天（UTF 内容 + Byte 频道 + NullableStr 发送者） |
 | **150** | S→C | KICK | 被踢（utf 原因） |
 | **151** | S→C | RELAY_CHALLENGE | 中继挑战（防滥用） |
 | **152** | C→S | RELAY_ACK | 中继挑战应答 |
@@ -144,7 +145,7 @@ int32 reg_ver = 5
 int32 ver      ← 服务器 e 或客户端版本
 int32 ver
 utf  name
-nullable_str password_hash  ← hash_f(password) = md5(sha256(pass))，无密码传 null
+nullable_str password_hash  ← 仅密码房使用，无密码传 null（本探针不支持密码房）
 utf  magic
 utf  sha256_hex(network_client_id + server_id)   ← 身份校验
 int32 unit_checksum       ← 单位校验和，失败换 0/-1/1 重试
@@ -160,8 +161,9 @@ utf  hash_e_int(w_challenge)    ← 颜色挑战应答 = "#%06X" & 0xFFFFFF
 
 ```python
 sha256_hex(s)  = sha256(s).hexdigest().upper()        # 64位大写hex
-md5_lower(s)   = md5(s).hexdigest()                   # 32位小写hex
-hash_f(s)      = md5_lower(sha256_hex(s))             # 密码哈希
+# 密码哈希：hash_f(s) = md5(sha256_hex(s))，仅作协议说明。
+# 本探针不支持密码房，注册包 password 恒为 null，
+# 因此代码中不实现该函数。
 f_c(s)         = sha256(s).hexdigest().upper()[:14]   # 前14位大写hex
 hash_e_int(i)  = "#%06X" % (i & 0xFFFFFF)             # 颜色挑战
 
@@ -173,7 +175,7 @@ challenge_e(i):  # 信用挑战 → 拼接13段
 
 > CREDITS_MAP = {0:4000, 1:0, 2:1000, 3:2000, 4:5000, 5:10000, 6:50000, 7:100000, 8:200000}
 > `java_int32` 模拟 Java int 溢出（>0x7FFFFFFF 减 0x100000000）。
-> 注意：上面 `challenge_e` 中 `0..8` 段实际代码为 `d[k]* (11+k) * i` 或 `d[k]*(11+k)+i`（奇偶不同），实现以 room_info.py 第 215-225 行为准。
+`0..8` 段：**偶数 k 用乘法、奇数 k 用加法** —— `k` 偶数时为 `d[k]*(11+k)*i`，`k` 奇数时为 `d[k]*(11+k)+i`。
 
 ---
 
@@ -223,7 +225,7 @@ int32 seed
 ```
 外层: int32 own_player_id + [版本>=141] bool full_load + int32 team_count
       + readUTF("teams") + int32 block_len + gzip块
-块内: 每条玩家记录以分隔符 ff ff d8 f1 切分, 每条记录格式:
+块内(标准协议): 按偏移连续解析每条玩家记录, 记录格式:
       boolean exists + int32 is_ai + byte slot + int32 credits
       + int32 team + nullable_str name + boolean X
 ```
@@ -231,9 +233,10 @@ int32 seed
 解析要点：
 - **`own_player_id`**：服务器告诉本探针的槽位号，用于过滤自己的探针记录。
 - **记录格式**（7 字段）：`exists(1) + is_ai(4) + slot(1) + credits(4) + team(4) = 14 字节头 + nullable name + bool X`。
+- **主方案**：按偏移连续解析（`_parse_115_offset`），适用标准协议服务器。
+- **回退方案（RCN 畸形数据）**：RCN 服务器记录间以分隔符 `ff ff d8 f1` 切分，且段内开头可能含不定长 `00` 填充。若整块逐字节滑动扫描会误匹配填充里的"假记录头"（exists=1 但 name=None、team 错位），导致**真人房主丢失**（只剩 AI）。修复：**按分隔符切段，每段只取名字非空且字段合法的真实记录**。
 - **AI 识别**：`_classify_name` 区分真人/AI/ID-only。AI 名形如 `"- Hard"`/`"AI - Impossible"`。
 - **Emoji 容错**：玩家名解码用 `_decode_lenient`，处理游戏端 UTF-16 代理对误当 UTF-8 的乱码。
-- **坑（r12345 实测）**：段内开头可能含不定长 `00` 填充。若整块逐字节滑动扫描会误匹配填充里的"假记录头"（exists=1 但 name=None、team 错位），导致**真人房主丢失**（只剩 AI）。修复：**按分隔符切段，每段只取名字非空且字段合法的真实记录**。
 
 **显示**：槽位标签 `队伍字母(A-J)+编号`；AI/ID-only 标记显示在槽位后、名字前（如 `B2 (AI): AI - Impossible`）。
 
@@ -274,7 +277,7 @@ int32 seed
 5. 收包:
    - 106 → SERVER_INFO (解析§8) + 记 last_server_info
    - 115 → TEAMS (解析§9)
-   - 141 → 聊天（忽略）
+   - 141 → 聊天（**解析 sender + content**，用于被动捕获房间短号，见 §15）
    - 113 → 需要密码
    - 150 → KICKED: 原因
    - 151 → 继续应答152
@@ -359,7 +362,7 @@ Headers: User-Agent: rw android 176 en, Language: en
 > 注意：早期文档把第 7 列标成 `SERVER/CLIENT`，是错的。它是房主名，
 > 中继入口标识 `RELAY-CN 入口` 就出现在这一列。
 
-### 13.3 A 字段（协议层，插件不使用）
+### 13.3 A 字段（插件解析但面向用户不展示）
 
 CSV 第 21 列 `A` 决定客户端如何加入，见 `MultiplayerLobbyActivity/gl.java`：
 
@@ -372,7 +375,7 @@ else              str = "get|" + fVar2.b + "|" + fVar2.A + "|" + fVar2.m + "|" +
 换取真实地址，挑战码由 `A` 经 `gameFramework/j/m.java` 的 `a(int i)` 推导
 （`MD5("x"+A)[:10]` 起，按 `A` 的量级切换前缀与长度）。
 
-**插件实现了这条链路。** 官方列表里 `A != 0` 的房间绝大多数共用同一个
+**插件实现了这条链路**（早期为 `resolve_official_addr` / `_challenge_code`，现重构为 `_resolve_relay_addr` / `_relay_challenge`，功能保留）。官方列表里 `A != 0` 的房间绝大多数共用同一个
 UPList 注册入口（实测 `18.216.139.119:5158`，占比约 2/3），那只是注册端口，
 直连会被踢 `Your client is newer then the server`。
 
@@ -461,7 +464,82 @@ if (str.contains("/")) {
 
 ---
 
-## 15. 注意事项
+## 15. 聊天与房间短号（140 / 141）
+
+### 15.1 包结构
+
+| 方向 | mtype | 字段 |
+|---|---|---|
+| C→S | **140** | `UTF(聊天内容)` + `Int32(频道)` |
+| S→C | **141** | `UTF(聊天内容)` + `Byte(频道)` + `NullableStr(发送者)` |
+
+字段顺序严格对齐客户端 `j/ae.smali` 的 `k(String)`（约 23483 行）：
+先 `writeUTF(内容)`，再 `writeInt(频道)`，`0` = 公共频道。
+
+**注意收发不对称**：发送用 `Int32` 频道，接收用 `Byte` 频道。
+照抄其中一个去打另一个会解析错位。
+
+### 15.2 服务端把聊天当命令解析
+
+服务端只认三种前缀：`-`、`.`、`_`。原版客户端内置命令只有
+`t` / `surrender` / `i` / `qc`，**没有 `id`** ——
+`.id` 是服务端（rwpp / IronCore 等）自己实现的扩展命令。
+
+### 15.3 `.id` 的回复
+
+实测（s5132，RELAY-CN）：
+
+```
+C→S  140  ".id"
+S→C  141  sender="RELAY-CN"  content="S5132"
+```
+
+回复是**纯房号**，既没有 `SERVER:` 前缀也不带方括号。
+提取规则用 `\b([A-Za-z])(\d{2,8})\b`，能兼容纯房号、
+`[S5132]`、`SERVER: S5132` 等多种形态。
+
+### 15.4 被动捕获（优先于主动询问）
+
+部分中继进房后会主动推送房间短号，无需发 `.id`：
+
+```
+S→C  141  sender="RELAY_CN-ADMIN"
+     content="当前服务器ID是 您可以凭本ID在IP栏内重连 [S5132]"
+```
+
+**关键实现细节**：这条推送的落点不固定。
+
+```
+relay_session(<中继>)
+  └─ 178 跳转 → return _follow_jump(...)     ← 中继在这里就撒手
+      └─ node_session(<节点>)
+          └─ 141 聊天包在这里才收到
+```
+
+`s5132` 属于后者 —— 中继只做路由，真正的聊天落在**节点连接**上。
+所以 `relay_session` 和 `node_session` 两条循环都必须处理 141，
+只写在其中一个会漏（早期版本就漏在了 `relay_session`，导致捕获从未生效）。
+
+### 15.5 单位校验：`.id` 走不通的场景
+
+直连官方分配中心（如 `18.216.139.119:5158`）时会被单位校验拦住：
+
+| 客户端版本 | 带 UUID | 结果 |
+|---|---|---|
+| 176 | 是 / 否 | `Your client is newer then the server` |
+| 131 | 是 / 否 | `Your units are different to the server's units` |
+
+`CK = 678359601` 是官方 1.15 的固定值，与 131 版服务端的单位表不匹配，
+校验在服务端完成，客户端无法绕过。
+
+因此：**走中继能查到房间且能拿到短号；直连节点会被拦，`.id` 发不出去**。
+
+地址形式说明：官方列表里所有真人房都指向同一个分配中心，
+格式为 `IP:端口/房间UUID`，必须带 UUID 才能路由到目标房间。
+
+---
+
+## 16. 注意事项
 
 - 所有 int 均为**大端有符号**
 - utf 字符串长度前缀 **uint16 大端**
