@@ -19,6 +19,7 @@ import socket
 import ssl
 import struct
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -36,7 +37,7 @@ import zlib
 # 纯内部修复（解析优化、bug 修复）不必递增，插件不用因此重新下载。
 #
 # 插件侧对应常量 ROOM_INFO_API_REQUIRED（见 main.py）。
-ROOM_INFO_API = 2
+ROOM_INFO_API = 3
 
 # 全局安静模式（插件调用时设为 True，屏蔽调试输出）
 # 命令行直接运行时自动关闭静默（否则 --list 等模式看不到最终结果）
@@ -203,6 +204,17 @@ class NetWriter:
         return bytes(self.buf)
 
 
+def _dprint(*a, **kw):
+    """诊断输出一律走 stderr。
+
+    stdout 的契约只有一个：成功时是房间信息正文，失败时是
+    `[房间查询失败] …`。调试行混进 stdout 会让父进程把错误行当成
+    噪音过滤掉，最后只剩一句「未获取到房间信息」。
+    """
+    kw.setdefault("file", sys.stderr)
+    print(*a, **kw)
+
+
 def pack_frame(mtype: int, payload: bytes) -> bytes:
     return struct.pack(">ii", len(payload), mtype) + payload
 
@@ -220,7 +232,9 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 def read_frame(sock: socket.socket, timeout: float = 15.0):
     sock.settimeout(timeout)
     length, mtype = struct.unpack(">ii", _recv_exact(sock, 8))
-    if length < 0 or length > 50_000_000:
+    # 上限 2MB：房间信息帧实际只有几百字节到几 KB。原来放 50MB，
+    # 一旦帧边界错位（半帧被当成新长度）就会一直等一个永远收不满的大包。
+    if length < 0 or length > 2_000_000:
         raise ValueError(f"bad packet length {length} (type {mtype})")
     payload = _recv_exact(sock, length) if length > 0 else b""
     return mtype, payload
@@ -331,7 +345,7 @@ class RWProbe:
 
     def log(self, *a):
         if self.verbose:
-            print("[probe]", *a)
+            _dprint("[probe]", *a)
 
 
     def _wait_161(self):
@@ -355,7 +369,7 @@ class RWProbe:
             except OSError:
                 break
             if self.verbose:
-                print(f"[DBG] recv mtype={mtype} len={len(payload)}")
+                _dprint(f"[DBG] recv mtype={mtype} len={len(payload)}")
             if mtype == 161:
                 self._parse_161(payload)
                 return
@@ -416,7 +430,7 @@ class RWProbe:
                 v10 = r.int32()
 
             if DEBUG_MODE:
-                print(f"151 relay: v7={v7} v8={v8} bf_i={bf_i} bf_j={bf_j} "
+                _dprint(f"151 relay: v7={v7} v8={v8} bf_i={bf_i} bf_j={bf_j} "
                       f"s1={s1!r} s2={s2!r} v10={v10}")
 
             v0 = ""
@@ -443,14 +457,14 @@ class RWProbe:
                             if f_c(prefix + str(i)) == s1:
                                 v0 = str(i)
                                 if DEBUG_MODE:
-                                    print(f"[151] POW solved: i={i} ({time.time()-t_pow:.1f}s)")
+                                    _dprint(f"[151] POW solved: i={i} ({time.time()-t_pow:.1f}s)")
                                 break
                             if time.time() - t_pow > POW_TIMEOUT:
                                 if DEBUG_MODE:
-                                    print(f"[151] POW超时({POW_TIMEOUT}s), 发-1")
+                                    _dprint(f"[151] POW超时({POW_TIMEOUT}s), 发-1")
                                 break
                             if i > 0 and i % 2_000_000 == 0 and DEBUG_MODE:
-                                print(f"[151] POW进度: {i}/{v10} ({time.time()-t_pow:.0f}s)", flush=True)
+                                _dprint(f"[151] POW进度: {i}/{v10} ({time.time()-t_pow:.0f}s)", flush=True)
             else:
                 v0 = "max"
 
@@ -463,7 +477,15 @@ class RWProbe:
             self._ack_sent = True
             self.log(f"152 sent (v8={v8}, v0={v0!r})")
         except Exception as e:
+            # 151 是挑战应答，失败就没法继续进房。log() 只在 verbose 时打印，
+            # 插件调用全是 verbose=False，所以这里必须同时写 stderr，
+            # 否则父进程只能看到「未收到房间信息」这种没法排查的结论。
             self.log(f"151 parse err: {e}")
+            try:
+                _dprint(f"[151] 挑战应答失败（{type(e).__name__}）：{e}",
+                      file=sys.stderr, flush=True)
+            except Exception:
+                pass
 
     def _parse_161(self, payload: bytes):
         r = NetReader(payload)
@@ -616,7 +638,7 @@ _NAME_ARG = _find_arg("--name")
 if "--debug" in sys.argv:
     QUIET = False
     DEBUG_MODE = True
-    print("[DEBUG] 调试模式已启用")
+    _dprint("[DEBUG] 调试模式已启用")
 
 _MAX_PLAYERS_DISPLAY = 10
 if "--max-players" in sys.argv:
@@ -918,19 +940,19 @@ def fetch_qroom_list(timeout=None) -> list:
                     pass
     except Exception as e:
         if not QUIET:
-            print(f"[qroom] 请求失败: {e}")
+            _dprint(f"[qroom] 请求失败: {e}")
         return []
 
     try:
         obj = json.loads(data.decode("utf-8", "replace"))
     except (ValueError, UnicodeDecodeError):
         if not QUIET:
-            print("[qroom] JSON 解析失败")
+            _dprint("[qroom] JSON 解析失败")
         return []
 
     if not isinstance(obj, dict) or obj.get("status") != "success":
         if not QUIET:
-            print(f"[qroom] 状态异常: {str(obj)[:80]}")
+            _dprint(f"[qroom] 状态异常: {str(obj)[:80]}")
         return []
 
     rooms = []
@@ -976,7 +998,7 @@ def masterserver_request(params: dict) -> list:
                 return resp.read().decode("utf-8", "replace").splitlines()
         except Exception as e:
             if not QUIET:
-                print(f"[master] {base} 失败: {e}")
+                _dprint(f"[master] {base} 失败: {e}")
     return []
 
 
@@ -1396,7 +1418,7 @@ def room_list(source: str = "all", include_all: bool = False,
               only_joinable: bool = False, keyword: str = "",
               status: str = "", full: str = "") -> list:
     if not QUIET:
-        print("[list] 获取房间列表...")
+        _dprint("[list] 获取房间列表...")
     rooms = fetch_rooms(source=source, include_all=include_all,
                         only_joinable=only_joinable, keyword=keyword,
                         status=status, full=full)
@@ -1514,7 +1536,7 @@ def parse_106(data):
             except (EOFError, struct.error):
                 # 单位解析中途失败: 放弃块内容, 但确保跳到块尾, 后续字段不错位
                 if DEBUG_MODE:
-                    print(f"[DEBUG] customUnits 块解析中断: cur={r.buf.tell()} block_start={block_start} block_len={block_len}")
+                    _dprint(f"[DEBUG] customUnits 块解析中断: cur={r.buf.tell()} block_start={block_start} block_len={block_len}")
             # 跳过整个块内容 (单位定义列表)
             end = block_start + block_len
             if end > len(data):
@@ -1535,14 +1557,14 @@ def parse_106(data):
             info.setdefault(k, None)
 
     if DEBUG_MODE:
-        print(f"[DEBUG] 106解析: app_ver={info.get('app_ver')} mode={info.get('mode')} mapname={info.get('mapname')!r}")
-        print(f"[DEBUG] 106解析: credits={info.get('credits')} fog={info.get('fog')} revealed={info.get('revealed')} ai={info.get('ai_diff')} subVer={info.get('sub_ver')}")
-        print(f"[DEBUG] 106解析: units={info.get('units')} multiplier={info.get('multiplier')} noNukes={info.get('no_nukes')} teamLock={info.get('teamlock')}")
-        print(f"[DEBUG] 106解析: shared={info.get('shared')}, shared2={info.get('shared2')}, "
+        _dprint(f"[DEBUG] 106解析: app_ver={info.get('app_ver')} mode={info.get('mode')} mapname={info.get('mapname')!r}")
+        _dprint(f"[DEBUG] 106解析: credits={info.get('credits')} fog={info.get('fog')} revealed={info.get('revealed')} ai={info.get('ai_diff')} subVer={info.get('sub_ver')}")
+        _dprint(f"[DEBUG] 106解析: units={info.get('units')} multiplier={info.get('multiplier')} noNukes={info.get('no_nukes')} teamLock={info.get('teamlock')}")
+        _dprint(f"[DEBUG] 106解析: shared={info.get('shared')}, shared2={info.get('shared2')}, "
               f"spectators={info.get('spectators')}, teamlock={info.get('teamlock')}, "
               f"force2team={info.get('force2team')}, roomlock={info.get('roomlock')}, seed={info.get('seed')}")
-        print(f"[DEBUG] 自定义单位数量: {info.get('custom_unit_count', 0)}")
-        print(f"[DEBUG] 自定义单位列表: {info.get('custom_unit_list', [])[:10]}{'...' if len(info.get('custom_unit_list', [])) > 10 else ''}")
+        _dprint(f"[DEBUG] 自定义单位数量: {info.get('custom_unit_count', 0)}")
+        _dprint(f"[DEBUG] 自定义单位列表: {info.get('custom_unit_list', [])[:10]}{'...' if len(info.get('custom_unit_list', [])) > 10 else ''}")
 
     return info
 
@@ -2102,10 +2124,10 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
                 block_body += _d.flush()
             except (OSError, EOFError, zlib.error):
                 if DEBUG_MODE:
-                    print("[DEBUG] teams块gzip解压失败, 按明文处理")
+                    _dprint("[DEBUG] teams块gzip解压失败, 按明文处理")
 
         if DEBUG_MODE:
-            print(f"[DEBUG] 115: own_id={own_id} full_load={full_load} teams={team_count} "
+            _dprint(f"[DEBUG] 115: own_id={own_id} full_load={full_load} teams={team_count} "
                   f"block='{block_name}' len={block_len} body={len(block_body)}")
 
         # ---- 首选: 纯偏移解析(标准协议) ----
@@ -2114,10 +2136,10 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
         if ok and players:
             result['players'] = players
             if DEBUG_MODE:
-                print(f"[DEBUG] 纯偏移解析成功: {len(players)} 个玩家")
+                _dprint(f"[DEBUG] 纯偏移解析成功: {len(players)} 个玩家")
             return result
         if DEBUG_MODE:
-            print(f"[DEBUG] 纯偏移解析失败/为空(ok={ok} n={len(players)}), 回退启发式")
+            _dprint(f"[DEBUG] 纯偏移解析失败/为空(ok={ok} n={len(players)}), 回退启发式")
 
         # ---- 回退: 启发式扫描(RCN 畸形数据) ----
         sep = b'\xff\xff\xd8\xf1'
@@ -2216,16 +2238,16 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
         players.sort(key=lambda p: (p['team'], p['num']))
 
         if DEBUG_MODE:
-            print(f"[DEBUG] 解析出 {len(players)} 个玩家 (队伍+编号排序)")
+            _dprint(f"[DEBUG] 解析出 {len(players)} 个玩家 (队伍+编号排序)")
             for p in players:
-                print(f"  {chr(ord('A')+p['team'])}{p['num']} name={p['name']!r} "
+                _dprint(f"  {chr(ord('A')+p['team'])}{p['num']} name={p['name']!r} "
                       f"ai={p['is_ai']} id_only={p['is_id_only']}")
 
         return result
 
     except Exception as e:
         if DEBUG_MODE:
-            print(f"[DEBUG] parse_115 异常: {e}")
+            _dprint(f"[DEBUG] parse_115 异常: {e}")
             import traceback
             traceback.print_exc()
         return result
@@ -2249,7 +2271,7 @@ def cleanup_old_bin_files(max_age_seconds=3600, verbose=False):
         names = os.listdir(BIN_DIR)
     except OSError as e:
         if verbose or DEBUG_MODE:
-            print(f"[清理] 无法列出目录 {BIN_DIR}: {e}")
+            _dprint(f"[清理] 无法列出目录 {BIN_DIR}: {e}")
         return deleted, kept
     for fname in names:
         if not (fname.startswith('server_info_') and fname.endswith('.bin')):
@@ -2260,15 +2282,15 @@ def cleanup_old_bin_files(max_age_seconds=3600, verbose=False):
                 os.remove(fpath)
                 deleted += 1
                 if verbose or DEBUG_MODE:
-                    print(f"[清理] 删除过期文件: {fname}")
+                    _dprint(f"[清理] 删除过期文件: {fname}")
             else:
                 kept += 1
         except OSError as e:
             # 单文件失败(被占用/权限)不影响其他文件
             if verbose or DEBUG_MODE:
-                print(f"[清理] 跳过 {fname}: {e}")
+                _dprint(f"[清理] 跳过 {fname}: {e}")
     if verbose or DEBUG_MODE:
-        print(f"[清理] 完成: 删除 {deleted} 个, 保留 {kept} 个 (阈值 {max_age_seconds}s)")
+        _dprint(f"[清理] 完成: 删除 {deleted} 个, 保留 {kept} 个 (阈值 {max_age_seconds}s)")
     return deleted, kept
 
 
@@ -2294,7 +2316,7 @@ def _ask_room_id_on_106(sock, probe, rid, tag=""):
         # ① 已经通过被动捕获拿到房号 -> 不再发，避免多余消息
         if _LAST_ROOM_ID:
             if DEBUG_MODE:
-                print(f"{tag}    已有房间号 {_LAST_ROOM_ID}（被动捕获），跳过 .id")
+                _dprint(f"{tag}    已有房间号 {_LAST_ROOM_ID}（被动捕获），跳过 .id")
             return
         # ② 本来就是短号进房 -> 无需询问
         if re.match(r'^[A-Za-z]\d{2,8}$', str(rid or "")):
@@ -2303,7 +2325,7 @@ def _ask_room_id_on_106(sock, probe, rid, tag=""):
         if not send_chat(sock, ".id"):
             return
         if DEBUG_MODE:
-            print(f"{tag}    未捕获到房号，改发 .id 询问...")
+            _dprint(f"{tag}    未捕获到房号，改发 .id 询问...")
         deadline = time.time() + 3
         while time.time() < deadline:
             try:
@@ -2315,16 +2337,16 @@ def _ask_room_id_on_106(sock, probe, rid, tag=""):
             if mt == 141:
                 sender, message = parse_141(pl)
                 if DEBUG_MODE:
-                    print(f"{tag}    [id回复] {sender}: {message!r}")
+                    _dprint(f"{tag}    [id回复] {sender}: {message!r}")
                 got = extract_room_id_from_chat(message)
                 if got:
                     _LAST_ROOM_ID = got
                     if DEBUG_MODE:
-                        print(f"{tag}    => 房间号 {got}")
+                        _dprint(f"{tag}    => 房间号 {got}")
                     return
             elif mt == 150:
                 if DEBUG_MODE:
-                    print(f"{tag}    .id 后被踢: {NetReader(pl).utf()}")
+                    _dprint(f"{tag}    .id 后被踢: {NetReader(pl).utf()}")
                 return
             elif mt == 151:
                 probe._handle_relay_151(pl)
@@ -2335,7 +2357,7 @@ def _ask_room_id_on_106(sock, probe, rid, tag=""):
                 sock.sendall(pack_frame(109, r.output()))
     except Exception as e:
         if DEBUG_MODE:
-            print(f"{tag}    .id 流程异常(忽略): {e}")
+            _dprint(f"{tag}    .id 流程异常(忽略): {e}")
 
 
 def _handle_chat_packet(payload, tag=""):
@@ -2355,14 +2377,35 @@ def _handle_chat_packet(payload, tag=""):
     global _LAST_ROOM_ID
     sender, message = parse_141(payload)
     if DEBUG_MODE:
-        print(f"[聊天] {sender}: {message}" if sender else f"[聊天] {message}")
+        _dprint(f"[聊天] {sender}: {message}" if sender else f"[聊天] {message}")
     if _LAST_ROOM_ID:
         return
     got = extract_room_id_from_chat(message)
     if got:
         _LAST_ROOM_ID = got
         if DEBUG_MODE:
-            print(f"{tag}    => 从聊天捕获房间号 {got}")
+            _dprint(f"{tag}    => 从聊天捕获房间号 {got}")
+
+
+def _drain_115(sock, got_106, got_115, timeout=1.0):
+    """收到 106 后补收 115（玩家/队伍信息）。
+
+    有的中继先发 106 再发 115；以前收到 106 立刻收尾，115 永远读不到，
+    表现成「当前人数：0」或玩家列表为空，和「确实没玩家」分不清。
+    """
+    if got_106 is None or got_115 is not None:
+        return got_115
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            mtype, payload = read_frame(sock, 1)
+        except (socket.timeout, OSError):
+            break
+        if mtype == 115:
+            return payload
+        if mtype == 150:
+            break
+    return got_115
 
 
 def _finalize_room(sock, got_106, got_115, probe, rid, tag=""):
@@ -2409,7 +2452,9 @@ def finish_report(sock, got_106, got_115, target):
     else:
         current_players = 0
 
-    print()
+    # 空行只是人类看 CLI 时舒服一点；插件拿 stdout 时它没有意义，
+    # 放在正文之前还会让 `out.find("房间版本：")` 之前多一行空白。
+    _dprint()
     # ---- 展示用的房号：优先用 `.id` 从服务端拿到的中继短号 ----
     # 从「房间列表」点进来的房间，target 是 UUID（一长串十六进制），
     # 用户看到它没法告诉别人怎么进。`.id` 返回的才是 s5132 这种短号。
@@ -2454,12 +2499,12 @@ def direct_main():
             port = int(port or 5123)
         except ValueError:
             print(f"[房间查询失败] 端口无效: {target}")
-            sys.exit(0)
+            sys.exit(EXIT_NET)
     else:
         ip, port = target, 5123
     if DEBUG_MODE:
         _u = f" UUID={room_uuid}" if room_uuid else ""
-        print(f"=== 直连 {ip}:{port}{_u} (客户端 1.15) ===")
+        _dprint(f"=== 直连 {ip}:{port}{_u} (客户端 1.15) ===")
 
     # 统一走 node_session: 它会处理 161 之前的 178 跳转、151 挑战、106/115。
     # 早期这里另写了一套 connect_and_161 流程, 只认 161, 遇到节点先回 178
@@ -2470,12 +2515,12 @@ def direct_main():
         if kind == "KICKED":
             _handle_kicked(msg)
         if DEBUG_MODE:
-            print(f"!! {msg}")
+            _dprint(f"!! {msg}")
         print(f"[房间查询失败] {msg}")
-        sys.exit(1 if kind in ("LOOP", "CAPTCHA") else 0)
+        sys.exit(_exit_code_for_failure(msg))
     if result is None:
         print("[房间查询失败] 房间不存在或已关闭")
-        sys.exit(1)
+        sys.exit(EXIT_NO_ROOM)
     got_106, got_115 = result
     # 展示用 target：带 UUID 时保留完整形式，便于用户回看
     finish_report(None, got_106, got_115, DIRECT_TARGET)
@@ -2493,11 +2538,11 @@ def _follow_jump(addr, rid, depth, seen, tag=""):
     """
     if not addr:
         if DEBUG_MODE:
-            print(f"{tag}!! 178地址为空")
+            _dprint(f"{tag}!! 178地址为空")
         return ("FAILED", "中继跳转地址为空，房间可能刚关闭")
     addr = re.sub(r'^\[(TCP|UDP)\]\s*', '', addr.strip())
     if DEBUG_MODE:
-        print(f"{tag}[3] 收到178跳转: {addr!r}")
+        _dprint(f"{tag}[3] 收到178跳转: {addr!r}")
     if "/" in addr:
         hp, _, rid2 = addr.partition("/")
         rid2 = rid2.strip()
@@ -2507,7 +2552,7 @@ def _follow_jump(addr, rid, depth, seen, tag=""):
         else:
             h2, p2 = hp, 5123
         if DEBUG_MODE:
-            print(f"{tag}[3] 跳转到中继 {h2}:{p2} 房间 {rid2}")
+            _dprint(f"{tag}[3] 跳转到中继 {h2}:{p2} 房间 {rid2}")
         return relay_session(h2, p2, rid2, depth + 1, seen)
     if ":" in addr:
         h2, _, p2 = addr.rpartition(":")
@@ -2515,7 +2560,7 @@ def _follow_jump(addr, rid, depth, seen, tag=""):
     else:
         h2, p2 = addr, 5123
     if DEBUG_MODE:
-        print(f"{tag}[3] 跳转到节点 {h2}:{p2}")
+        _dprint(f"{tag}[3] 跳转到节点 {h2}:{p2}")
     return node_session(h2, p2, rid, depth + 1, seen)
 
 
@@ -2528,29 +2573,29 @@ def relay_session(host, port, rid, depth=0, seen=None):
     node_key = (str(host).lower(), int(port), str(rid).lower())
     if node_key in seen:
         if DEBUG_MODE:
-            print(f"{tag}!! 检测到跳转环路 {host}:{port} rid={rid}，已中止")
+            _dprint(f"{tag}!! 检测到跳转环路 {host}:{port} rid={rid}，已中止")
         return ("LOOP", f"跳转环路: {host}:{port}/{rid}")
     seen.add(node_key)
     if depth > 6:
         if DEBUG_MODE:
-            print(f"{tag}!! 跳转层级过深({depth})，已中止")
+            _dprint(f"{tag}!! 跳转层级过深({depth})，已中止")
         return ("LOOP", "跳转层级过深")
     if DEBUG_MODE:
-        print(f"{tag}=== 中继会话 {rid} @ {host}:{port} (depth={depth}) ===")
+        _dprint(f"{tag}=== 中继会话 {rid} @ {host}:{port} (depth={depth}) ===")
     # 连接失败必须显式报告: 该首字母的中继未开通端口(c/g/j/v)时会在此抛出
     try:
         s, probe = connect_and_161(host, port, rid)
     except OSError as e:
         if DEBUG_MODE:
-            print(f"{tag}!! 连接中继失败: {e}")
+            _dprint(f"{tag}!! 连接中继失败: {e}")
         return ("FAILED", f"无法连接中继 {host}:{port}（该首字母的中继未开放或网络不通）")
     except Exception as e:
         if DEBUG_MODE:
-            print(f"{tag}!! 握手异常: {e}")
+            _dprint(f"{tag}!! 握手异常: {e}")
         return ("FAILED", f"中继握手异常: {type(e).__name__}")
     sid = probe.server_id
     if DEBUG_MODE:
-        print(f"{tag}[1] 中继161: sid={sid!r} conn={probe.conn_id} chal={probe.challenge_y}")
+        _dprint(f"{tag}[1] 中继161: sid={sid!r} conn={probe.conn_id} chal={probe.challenge_y}")
     # 中继可能直接回 178 跳转(而不是先回 161): 房号存在时 q/s 这类 RWHPS 中继就是如此
     jump_now = getattr(probe, "jump_addr", None)
     if jump_now:
@@ -2558,13 +2603,13 @@ def relay_session(host, port, rid, depth=0, seen=None):
         return _follow_jump(jump_now, rid, depth, seen, tag)
     if not sid:
         if DEBUG_MODE:
-            print(f"{tag}!! 握手失败，未收到房间服务器响应")
+            _dprint(f"{tag}!! 握手失败，未收到房间服务器响应")
         s.close()
         return ("FAILED", f"中继 {host}:{port} 未响应握手（房间不存在或中继繁忙）")
 
     send_110(s, sid, CK, probe.conn_id, probe.challenge_y)
     if DEBUG_MODE:
-        print(f"{tag}[2] 110已发送，等待验证/跳转/房间信息...")
+        _dprint(f"{tag}[2] 110已发送，等待验证/跳转/房间信息...")
 
     got_106 = None
     got_115 = None
@@ -2575,25 +2620,29 @@ def relay_session(host, port, rid, depth=0, seen=None):
             mtype, payload = read_frame(s, 3)
         except socket.timeout:
             continue
+        except ValueError as e:
+            # 帧长度非法 = 连接被中途截断或数据错乱（半帧重读会一直错位）
+            s.close()
+            return ("FAILED", f"中继返回的数据不完整（{e}），连接可能被中途断开")
         except OSError:
             break
         if mtype == 161:
             probe._parse_161(payload)
             if DEBUG_MODE:
-                print(f"{tag}    收到游戏服务器161: sid={probe.server_id!r} conn={probe.conn_id}")
+                _dprint(f"{tag}    收到游戏服务器161: sid={probe.server_id!r} conn={probe.conn_id}")
             if probe.server_id:
                 send_110(s, probe.server_id, CK, probe.conn_id, probe.challenge_y)
                 if DEBUG_MODE:
-                    print(f"{tag}    已重新发送110到游戏服务器")
+                    _dprint(f"{tag}    已重新发送110到游戏服务器")
         elif mtype == 163:
             r = NetReader(payload)
             r.byte(); relay_ver = r.int32(); r.int32(); r.boolean()
             if DEBUG_MODE:
-                print(f"{tag}    163 relay_ver={relay_ver}")
+                _dprint(f"{tag}    163 relay_ver={relay_ver}")
         elif mtype == 151:
             probe._handle_relay_151(payload)
             if DEBUG_MODE:
-                print(f"{tag}    已应答151挑战")
+                _dprint(f"{tag}    已应答151挑战")
         elif mtype == 178:
             addr = probe._handle_178(payload)
             s.close()
@@ -2601,22 +2650,22 @@ def relay_session(host, port, rid, depth=0, seen=None):
         elif mtype == 106:
             got_106 = payload
             if DEBUG_MODE:
-                print(f"{tag}[4] 收到106 SERVER_INFO ({len(payload)}B)")
+                _dprint(f"{tag}[4] 收到106 SERVER_INFO ({len(payload)}B)")
         elif mtype == 115:
             got_115 = payload
             if DEBUG_MODE:
-                print(f"{tag}[4] 收到115 teams ({len(payload)}B)")
+                _dprint(f"{tag}[4] 收到115 teams ({len(payload)}B)")
         elif mtype == 108:
             r = NetWriter(); r.int64(NetReader(payload).int64()); r.byte(1)
             s.sendall(pack_frame(109, r.output()))
         elif mtype == 150:
             kick_reason = NetReader(payload).utf()
             if DEBUG_MODE:
-                print(f"{tag}KICKED:", kick_reason)
+                _dprint(f"{tag}KICKED:", kick_reason)
             break
         elif mtype == 111:
             if DEBUG_MODE:
-                print(f"{tag}DISCONNECT")
+                _dprint(f"{tag}DISCONNECT")
             break
         elif mtype == 117:
             # 服务器提示消息: byte 1 + int32 类型 + utf(文本)
@@ -2628,21 +2677,22 @@ def relay_session(host, port, rid, depth=0, seen=None):
             except Exception:
                 hint = ""
             if DEBUG_MODE:
-                print(f"{tag}[117] {hint!r}")
+                _dprint(f"{tag}[117] {hint!r}")
             if hint:
                 return ("KICKED", hint)
         elif mtype == 141:
             _handle_chat_packet(payload, tag)
         else:
             if DEBUG_MODE:
-                print(f"{tag}    未处理消息 mtype={mtype} len={len(payload)} hex={payload.hex()[:80]}")
+                _dprint(f"{tag}    未处理消息 mtype={mtype} len={len(payload)} hex={payload.hex()[:80]}")
         if got_106 is not None:
+            got_115 = _drain_115(s, got_106, got_115)
             return _finalize_room(s, got_106, got_115, probe, rid, tag)
     s.close()
     if kick_reason:
         return ("KICKED", kick_reason)
     if got_106 is None and DEBUG_MODE:
-        print(f"{tag}!! 未收到106（房间可能不存在/已关闭/需要密码）")
+        _dprint(f"{tag}!! 未收到106（房间可能不存在/已关闭/需要密码）")
     # 静默模式也需要让调用方知道失败原因, 不能返回 None 让插件"无输出"
     return ("FAILED", f"未收到房间信息（中继 {host}:{port} 无响应）")
 
@@ -2661,14 +2711,14 @@ def _follow_node_jump(addr, rid, depth=0, seen=None):
         seen = set()
     if depth > 6:
         if DEBUG_MODE:
-            print(f"!! 节点跳转层级过深({depth})")
+            _dprint(f"!! 节点跳转层级过深({depth})")
         return ("LOOP", "节点跳转层级过深")
     raw = (addr or "").strip()
     if not raw:
         return ("FAILED", "节点跳转地址为空")
     raw = re.sub(r'^\[(TCP|UDP)\]\s*', '', raw)
     if DEBUG_MODE:
-        print(f"[*] 跟随节点178: {raw!r} (depth={depth})")
+        _dprint(f"[*] 跟随节点178: {raw!r} (depth={depth})")
 
     # 客户端 ae.smali 的地址归一化(必须照做, 否则短代号全部连不上):
     #   · 以 ".relay" 结尾            -> 补 ".corrodinggames.com"
@@ -2680,12 +2730,12 @@ def _follow_node_jump(addr, rid, depth=0, seen=None):
           and "/" not in raw and "\\" not in raw and raw != "localhost"):
         raw = f"{raw[0]}.relay.corrodinggames.com/{raw}"
         if DEBUG_MODE:
-            print(f"[*] 短代号转域名: {raw!r}")
+            _dprint(f"[*] 短代号转域名: {raw!r}")
 
     key = raw.lower()
     if key in seen:
         if DEBUG_MODE:
-            print(f"!! 节点跳转环路 {raw}")
+            _dprint(f"!! 节点跳转环路 {raw}")
         return ("LOOP", f"节点跳转环路: {raw}")
     seen.add(key)
 
@@ -2723,13 +2773,13 @@ def node_session(host, port, rid=None, depth=0, seen=None):
     if seen is None:
         seen = set()
     if DEBUG_MODE:
-        print(f"[4] 连接节点: {host}:{port} (房间 {rid or '-'})")
+        _dprint(f"[4] 连接节点: {host}:{port} (房间 {rid or '-'})")
     try:
         s2 = socket.create_connection((host, port), timeout=8)
         s2.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     except Exception as e:
         if DEBUG_MODE:
-            print(f"!! 节点连接失败: {e}")
+            _dprint(f"!! 节点连接失败: {e}")
         return ("FAILED", f"无法连接游戏节点 {host}:{port}")
     w = NetWriter()
     w.utf(PROTO_MAGIC)
@@ -2744,7 +2794,7 @@ def node_session(host, port, rid=None, depth=0, seen=None):
     probe2._wait_161()
     sid2 = probe2.server_id
     if DEBUG_MODE:
-        print(f"[5] 节点161: sid={sid2!r} conn={probe2.conn_id}")
+        _dprint(f"[5] 节点161: sid={sid2!r} conn={probe2.conn_id}")
     # 有些节点在握手阶段就直接回 178(连 161 都不发): RELAY-CN / Tiexiu 的
     # 分配节点就是这样, 回包形如 "[TCP]h1.example:5123/RA"。客户端收到后
     # 会关掉连接继续跟随, 早期这里只认 161, 于是全部报"未响应握手"。
@@ -2752,11 +2802,11 @@ def node_session(host, port, rid=None, depth=0, seen=None):
     if jump_now:
         s2.close()
         if DEBUG_MODE:
-            print(f"[5] 节点握手即178: {jump_now!r}")
+            _dprint(f"[5] 节点握手即178: {jump_now!r}")
         return _follow_node_jump(jump_now, rid, depth + 1, seen)
     if not sid2:
         if DEBUG_MODE:
-            print("!! 节点握手失败")
+            _dprint("!! 节点握手失败")
         s2.close()
         return ("FAILED", f"游戏节点 {host}:{port} 未响应握手")
     send_110(s2, sid2, CK, probe2.conn_id, probe2.challenge_y)
@@ -2769,38 +2819,41 @@ def node_session(host, port, rid=None, depth=0, seen=None):
             mtype, payload = read_frame(s2, 2)
         except socket.timeout:
             continue
+        except ValueError as e:
+            s2.close()
+            return ("FAILED", f"游戏节点返回的数据不完整（{e}），连接可能被中途断开")
         except OSError:
             break
         if mtype == 161:
             probe2._parse_161(payload)
             if DEBUG_MODE:
-                print(f"[6] 收到游戏服务器161: sid={probe2.server_id!r} conn={probe2.conn_id}")
+                _dprint(f"[6] 收到游戏服务器161: sid={probe2.server_id!r} conn={probe2.conn_id}")
             if probe2.server_id:
                 send_110(s2, probe2.server_id, CK, probe2.conn_id, probe2.challenge_y)
                 if DEBUG_MODE:
-                    print(f"[6] 已重新发送110到游戏服务器")
+                    _dprint(f"[6] 已重新发送110到游戏服务器")
         elif mtype == 163:
             r = NetReader(payload)
             r.byte(); relay_ver = r.int32(); r.int32(); r.boolean()
             if DEBUG_MODE:
-                print(f"[6] 163 relay_ver={relay_ver}")
+                _dprint(f"[6] 163 relay_ver={relay_ver}")
         elif mtype == 151:
             probe2._handle_relay_151(payload)
         elif mtype == 106:
             got_106 = payload
             if DEBUG_MODE:
-                print(f"[6] 收到106 SERVER_INFO ({len(payload)}B)")
+                _dprint(f"[6] 收到106 SERVER_INFO ({len(payload)}B)")
         elif mtype == 115:
             got_115 = payload
             if DEBUG_MODE:
-                print(f"[6] 收到115 teams ({len(payload)}B)")
+                _dprint(f"[6] 收到115 teams ({len(payload)}B)")
         elif mtype == 108:
             r = NetWriter(); r.int64(NetReader(payload).int64()); r.byte(1)
             s2.sendall(pack_frame(109, r.output()))
         elif mtype == 150:
             kick_reason = NetReader(payload).utf()
             if DEBUG_MODE:
-                print("KICKED:", kick_reason)
+                _dprint("KICKED:", kick_reason)
             break
         elif mtype == 141:
             _handle_chat_packet(payload, "[6]")
@@ -2814,7 +2867,7 @@ def node_session(host, port, rid=None, depth=0, seen=None):
             except Exception:
                 hint = ""
             if DEBUG_MODE:
-                print(f"[7] 节点提示: {hint!r}")
+                _dprint(f"[7] 节点提示: {hint!r}")
             if hint:
                 kick_reason = hint
                 break
@@ -2823,21 +2876,65 @@ def node_session(host, port, rid=None, depth=0, seen=None):
             # (如 62.234.56.66:5126/RB), 客户端收到后关掉当前连接继续跟随。
             addr = probe2._handle_178(payload)
             if DEBUG_MODE:
-                print(f"[6] 节点178跳转: {addr!r}")
+                _dprint(f"[6] 节点178跳转: {addr!r}")
             s2.close()
             return _follow_node_jump(addr, rid, depth + 1, seen)
         else:
             if DEBUG_MODE:
-                print(f"[6] 未处理消息 mtype={mtype} len={len(payload)} hex={payload.hex()[:80]}")
+                _dprint(f"[6] 未处理消息 mtype={mtype} len={len(payload)} hex={payload.hex()[:80]}")
         if got_106 is not None:
+            got_115 = _drain_115(s2, got_106, got_115)
             return _finalize_room(s2, got_106, got_115, probe2,
                                   rid or f"{host}:{port}")
     s2.close()
     if kick_reason:
         return ("KICKED", kick_reason)
     if got_106 is None and DEBUG_MODE:
-        print("!! 未收到106")
+        _dprint("!! 未收到106")
     return ("FAILED", f"游戏节点 {host}:{port} 未返回房间信息")
+
+
+# 查询总预算：多跳中继每跳都有独立的连接/握手超时，最坏能叠到 200 秒以上，
+# 而父进程 120 秒就 kill 了 —— 被 kill 时一行都吐不出来，用户只看到「无响应」。
+# 看门狗在这里兜底：到点先打印原因，再退出（退出码走 EXIT_PROTO）。
+WATCHDOG_SECONDS = 90
+
+
+def _start_watchdog(seconds=WATCHDOG_SECONDS):
+    def _fire():
+        time.sleep(seconds)
+        try:
+            msg = (f"[房间查询失败] 查询超过 {seconds} 秒仍未完成"
+                   f"（中继跳转过多或网络卡住），已主动中止")
+            _dprint(msg, flush=True)
+            _dprint(msg, file=sys.stderr, flush=True)
+        finally:
+            os._exit(EXIT_PROTO)
+    t = threading.Thread(target=_fire, name="rwinfo-watchdog", daemon=True)
+    t.start()
+
+
+# 退出码分档：父进程(main.py)靠它区分「房间问题」还是「探针所在机器的网络问题」。
+# 增加或调整语义时必须同步升 ROOM_INFO_API，否则老插件会把新码当成失败。
+EXIT_OK = 0          # 成功
+EXIT_UNKNOWN = 1     # 未归类
+EXIT_NET = 2         # DNS/连接失败：bot 所在机器到中继不通
+EXIT_NO_ROOM = 3     # 房间不存在或已关闭
+EXIT_ROOM_BUSY = 4   # 房间已满 / 游戏已经开始
+EXIT_PROTO = 5       # 协议或链路异常（跳转环、解析失败、虚拟房号等）
+
+
+def _exit_code_for_failure(msg: str) -> int:
+    """把失败文案归类成退出码（文案见各处 [房间查询失败] 前缀行）。"""
+    m = str(msg or "")
+    if ("无法连接中继" in m or "连接中继失败" in m
+            or "网络不通" in m or "DNS" in m or "端口无效" in m):
+        return EXIT_NET
+    if "房间不存在" in m or "找不到这个服务器" in m or "已关闭" in m:
+        return EXIT_NO_ROOM
+    if "房间已满" in m or "游戏已经开始" in m:
+        return EXIT_ROOM_BUSY
+    return EXIT_PROTO
 
 
 def _handle_kicked(reason, sock=None):
@@ -2845,51 +2942,56 @@ def _handle_kicked(reason, sock=None):
     reason = (reason or "").strip()
     if "No free slots" in reason:
         print("[房间查询失败] 房间已满，无法加入")
+        code = EXIT_ROOM_BUSY
     elif "游戏已经开始" in reason or "game already started" in reason.lower():
         # RELAY-CN 走错房间(节点默认房)时也会返回这句, 需加提示
         print("[房间查询失败] 游戏已经开始，无法加入")
+        code = EXIT_ROOM_BUSY
     elif "绕过ID分配中心" in reason:
         # 178 跳到节点后节点拒绝: 房间已迁移/需走分配中心, 探针无法直连
         print("[房间查询失败] 该房间当前无法直接查询（RELAY-CN 节点限制，请稍后重试或联系房主）")
+        code = EXIT_PROTO
     elif "找不到这个服务器" in reason or "cant find this server" in reason.lower():
         print("[房间查询失败] 房间不存在或已关闭")
+        code = EXIT_NO_ROOM
     else:
         print(f"[房间查询失败] {reason}")
+        code = EXIT_UNKNOWN
     if sock is not None:
         sock.close()
-    sys.exit(0)
+    sys.exit(code)
 
 def relay_main():
     host = relay_host(RID)
     if DEBUG_MODE:
-        print(f"=== 查询房间 {RID} (客户端 1.15) ===")
+        _dprint(f"=== 查询房间 {RID} (客户端 1.15) ===")
         try:
-            print(f"[0] 中继: {host}:5123 (DNS={socket.gethostbyname(host)})")
+            _dprint(f"[0] 中继: {host}:5123 (DNS={socket.gethostbyname(host)})")
         except OSError as e:
-            print(f"[0] 中继: {host}:5123 (DNS解析失败: {e})")
+            _dprint(f"[0] 中继: {host}:5123 (DNS解析失败: {e})")
     # 中继服务器不可达: 该首字母的中继未开通 (如 c/g/j/v 有域名但端口关闭)
     try:
         socket.gethostbyname(host)
     except OSError:
         print(f"[房间查询失败] 房号 {RID.upper()} 所属中继({host})不存在，请检查房号首字母")
-        sys.exit(0)
+        sys.exit(EXIT_NET)
     result = relay_session(host, 5123, RID)
     if isinstance(result, tuple) and result[0] == "KICKED":
         _handle_kicked(result[1])
     if isinstance(result, tuple) and result[0] == "CAPTCHA":
         print(f"[房间查询失败] {result[1]}")
-        sys.exit(1)
+        sys.exit(_exit_code_for_failure(result[1]))
     if isinstance(result, tuple) and result[0] == "LOOP":
         if DEBUG_MODE:
-            print(f"!! {result[1]}")
+            _dprint(f"!! {result[1]}")
         print("[房间查询失败] 房间查询链路异常（跳转环路），该房间当前无法查询")
-        sys.exit(1)
+        sys.exit(EXIT_PROTO)
     if isinstance(result, tuple) and result[0] == "FAILED":
         print(f"[房间查询失败] {result[1]}")
-        sys.exit(1)
+        sys.exit(_exit_code_for_failure(result[1]))
     if result is None:
         print("[房间查询失败] 房间不存在或已关闭")
-        sys.exit(1)
+        sys.exit(EXIT_NO_ROOM)
     got_106, got_115 = result
     finish_report(None, got_106, got_115, RID)
 
@@ -2905,13 +3007,17 @@ def main():
         except (TypeError, ValueError):
             pass
         deleted, kept = cleanup_old_bin_files(max_age, verbose=True)
-        print(f"[清理] 目录: {BIN_DIR}")
+        _dprint(f"[清理] 目录: {BIN_DIR}")
         sys.exit(0)
     cleanup_old_bin_files()
     if LIST_JSON:
-        rooms = fetch_rooms(source=LIST_SOURCE, include_all=LIST_ALL,
-                            only_joinable=LIST_JOINABLE, keyword=LIST_KEYWORD,
-                            status=LIST_STATUS, full=LIST_FULL)
+        # 抓取过程中会 print 各种 [qroom]/[master]/[DEBUG] 诊断行；
+        # 这些一律改投 stderr，stdout 只留一行 JSON，否则父进程 json 解析必炸。
+        import contextlib
+        with contextlib.redirect_stdout(sys.stderr):
+            rooms = fetch_rooms(source=LIST_SOURCE, include_all=LIST_ALL,
+                                only_joinable=LIST_JOINABLE, keyword=LIST_KEYWORD,
+                                status=LIST_STATUS, full=LIST_FULL)
         print(json.dumps(rooms, ensure_ascii=False, default=str))
         return
     if LIST_MODE:
@@ -2925,13 +3031,17 @@ def main():
     # 每次查询前清空上次的 `.id` 结果，避免串到下一次查询
     global _LAST_ROOM_ID
     _LAST_ROOM_ID = ""
+    _start_watchdog()
     if DIRECT_TARGET:
         direct_main()
         return
     if RID.startswith("u_"):
-        if DEBUG_MODE:
-            print("!! u_房间(Auto Server)请先用 --list 找到该房的 IP:端口 再直连")
-        return
+        # u_ 是列表接口给 Auto Server 房用的虚拟房号，没有真实房间 ID，
+        # 探针拿它进不了房。这里以前静默 return —— 父进程只看到「零输出」，
+        # 只能回一句「查房无响应」，把「用错房号」误报成「网络故障」。
+        print(f"[房间查询失败] {RID} 是列表里的虚拟房号（Auto Server 房），"
+              f"没有真实房号可用；请用 /铁锈列表 的序号查，或直连它的 IP:端口")
+        sys.exit(EXIT_PROTO)
     # 所有中继房间统一走 relay_main (含 h.relay.* 国际中继)
     relay_main()
 

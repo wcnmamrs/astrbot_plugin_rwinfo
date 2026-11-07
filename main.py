@@ -798,8 +798,29 @@ def sanitize_probe_prefix(raw) -> str:
     return s or PROBE_PREFIX_DEFAULT
 
 
+# 两类失败必须分开：前者是「房间/网络/探针脚本」的问题，
+# 后者是「插件自己的代码炸了」。混在一起就会出现
+# 「AttributeError 被当成查房无响应」这种误导。
+ROOM_ERR_PREFIX = "[房间查询失败]"
+PLUGIN_ERR_PREFIX = "[插件错误]"
+
+
+def first_error_line(text: str) -> str:
+    """从输出里找出第一行错误说明。
+
+    探针开 debug 时会先打印 `[DEBUG] …`，再打印 `[房间查询失败] …`，
+    错误行不一定在第一行 —— 只看首行会把整段错误当噪音丢掉，
+    最后只剩下「未获取到房间信息」这种没有信息量的兜底。
+    """
+    for ln in str(text or "").splitlines():
+        s = ln.strip()
+        if s.startswith(ROOM_ERR_PREFIX) or s.startswith(PLUGIN_ERR_PREFIX):
+            return s
+    return ""
+
+
 def is_error_info(text: str) -> bool:
-    return text.startswith("[房间查询失败]")
+    return bool(first_error_line(text))
 
 # 服务器错误信息 -> 中文翻译
 ERROR_TRANSLATIONS = [
@@ -814,22 +835,20 @@ ERROR_TRANSLATIONS = [
 ]
 
 def translate_error(text: str) -> str:
-    """翻译服务器错误信息为中文 (匹配到关键词时替换整条错误句)"""
+    """给服务器错误说明补一句中文（只补注，不替换原文）。
+
+    早先是「命中关键词就把整条说明替换成固定中文」，实测会制造
+    错误结论：退出码 4 的文案是「房间已满或游戏已经开始」，命中
+    「游戏已经开始」后被替换成「游戏已经开始」，把「房间满了」
+    误报成「等游戏结束」，还顺手丢掉了退出码与 stderr 尾巴。
+    """
+    head = first_error_line(text) or str(text or "").strip()
     for eng, zh in ERROR_TRANSLATIONS:
-        if eng in text:
-            # 替换从 [房间查询失败] 后的整段英文错误描述
-            prefix = "[房间查询失败]"
-            if text.startswith(prefix):
-                rest = text[len(prefix):].strip()
-                # 截取到句号/换行前 (只保留第一个错误句)
-                for sep in (".", "\n"):
-                    idx = rest.find(sep)
-                    if idx != -1:
-                        rest = rest[:idx]
-                        break
-                return f"{prefix} {zh}"
-            return text.replace(eng, zh)
-    return text
+        if eng in head:
+            if zh in head:
+                return head
+            return f"{head}（{zh}）"
+    return head
 
 def is_name_check_error(text: str) -> bool:
     """判断是否为探针名字被过滤错误 (可重试)"""
@@ -900,6 +919,10 @@ class RWInfoPlugin(Star):
                 "%(message)s", datefmt="%H:%M:%S"))
             self.logger.addHandler(_h)
         self.config = config or self._default_config()
+        # 最近一次配置写盘失败的原因（空 = 正常）。
+        # _send_text 会在下一条消息末尾附一句提示，避免「回执说已设置、
+        # 重启后却全部还原」这种查不出原因的现象。
+        self._save_failed = ""
 
         # 配置读取视图：AstrBot 嵌套结构不动顶层，业务统一读 self.cfg
         self._conf_groups = self._schema_groups()
@@ -909,6 +932,7 @@ class RWInfoPlugin(Star):
         # 版本够则 ensure_room_info 秒返回 True，开销可忽略；
         # 过旧则真正走「从仓库补齐」。
         # 若初始就置 True，接口过旧的旧脚本永远得不到补齐。
+        self._room_info_ok = False
         # 启动自检：扫被截断的官方机器人哈希群号并点名
         self._migrate_broken_list_entries()
 
@@ -1057,6 +1081,17 @@ class RWInfoPlugin(Star):
                     pass
                 self.logger.warning("[清理] 清理子进程超时(>60s), 已终止")
                 return
+            except Exception as e:
+                # communicate() 其它异常（管道断了等）：子进程可能还活着，
+                # 不 kill 会留一个僵尸进程，而这里每天只跑一次，攒几个月才显形。
+                try:
+                    proc.kill()
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except Exception:
+                    pass
+                self.logger.warning(
+                    f"[清理] 读取清理子进程输出异常: {type(e).__name__}: {e}")
+                return
         except Exception as e:
             self.logger.warning(f"[清理] 启动清理子进程失败: {e}")
             return
@@ -1143,8 +1178,19 @@ class RWInfoPlugin(Star):
                 self.config.save_config()          # AstrBot 的 AstrBotConfig
             elif hasattr(self, "_config_saver"):
                 self._config_saver()
+            else:
+                # 两个分支都不命中 = 配置根本写不回去。原来这里什么也不做，
+                # 调用方却照样回「已设置」，用户重启后发现全被还原。
+                self._save_failed = "config 对象不支持写盘（既无 save_config 也无 _config_saver）"
+                self.logger.error(
+                    "保存配置失败：config 对象既没有 save_config()，也没有 _config_saver")
+                return False
+            self._save_failed = ""
+            return True
         except Exception as e:
-            self.logger.warning(f"保存配置失败: {e}")
+            self._save_failed = f"{type(e).__name__}: {e}"
+            self.logger.error(f"保存配置失败: {type(e).__name__}: {e}")
+            return False
 
     def _sync_config_from_view(self):
         """把 self.cfg 中的值同步回 self.config（分组结构）。
@@ -1309,7 +1355,9 @@ class RWInfoPlugin(Star):
                 self.logger.debug(traceback.format_exc())
             except Exception:
                 pass
-        if cache:
+        # 读失败（data 为空）不写缓存：schema 文件补上/修好之后
+        # 至少下次调用能重新读，而不是整个进程都按 {} 走。
+        if cache and data:
             self._schema_cache = data
         return data
 
@@ -1425,6 +1473,11 @@ class RWInfoPlugin(Star):
     def _migrate_list(self, key: str):
         """旧配置迁移: 无前缀的纯数字条目转成 #群号; 清理 @@/##/混合前缀的脏数据."""
         lst = self.cfg.get(key, [])
+        if not isinstance(lst, list):
+            # 面板/手工把名单改成了字符串或 null。这里在 __init__ 里跑，
+            # 抛 TypeError 会让插件整个加载失败（用户只看到「插件没起来」），
+            # 所以直接跳过迁移，让后面的读取路径各自兜底。
+            return
         changed = False
         for i, item in enumerate(lst):
             if isinstance(item, (int, float)):
@@ -1750,6 +1803,10 @@ class RWInfoPlugin(Star):
                 if old_key in self.config:
                     self.config.pop(old_key, None)
                     changed = True
+                # self.cfg 里也要删：_sync_config_from_view 会把 cfg 的键逐个写回
+                # 磁盘顶层，只删 self.config 的话下次启动旧键又回来了 ——
+                # 用户删掉的「群撤回」条目会每次重启复活。
+                self.cfg.pop(old_key, None)
                 continue
             for entry in entries:
                 cfg = self._recall_parse(entry)
@@ -1761,6 +1818,7 @@ class RWInfoPlugin(Star):
                     merged.append(new_entry)
                 changed = True
             self.config.pop(old_key, None)
+            self.cfg.pop(old_key, None)
             changed = True
 
         if changed:
@@ -2429,7 +2487,14 @@ class RWInfoPlugin(Star):
             self.logger.info(f"[合并转发] 已发送 {len(nodes)} 条 node, mid={mid}")
             return True, mid, ""
         except Exception as e:
-            # 先用简写格式再试一次（部分 OneBot 实现只认这个）
+            # 先用简写格式再试一次（部分 OneBot 实现只认这个）。
+            # 但只有「参数格式不被接受」才值得重试：网络超时/连接重置时
+            # 第一张卡片可能已经送到，再发一次就是群里两条重复的查房结果。
+            if not isinstance(e, (TypeError, KeyError, AttributeError)):
+                reason = f"{type(e).__name__}: {e}"
+                self.logger.warning(
+                    f"[合并转发] 发送异常，可能已送达，不再重试: {reason}")
+                return False, None, reason
             try:
                 simple = [{"name": n["data"]["name"], "uin": n["data"]["uin"],
                            "content": n["data"]["content"]} for n in nodes]
@@ -2443,6 +2508,36 @@ class RWInfoPlugin(Star):
                     f"[合并转发] 两种格式都失败，降级纯文本: {reason}"
                 )
                 return False, None, reason
+
+    @staticmethod
+    def _int_or(value, default: int = 1) -> int:
+        """把 KV/配置里的脏值转成正整数，转不动回默认值。
+
+        页码和总数存在 KV 里，可能是旧版本或别的插件写坏的字符串；
+        直接 int() 抛 ValueError，而调用点全在翻页/序号查房这类高频路径，
+        抛出去的表现就是「发指令一点反应都没有」。
+        """
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            return default
+        return n if n > 0 else default
+
+    def _cfg_len(self, key: str) -> str:
+        """名单条目数；被面板改成字符串/None 时显示 (非列表)。"""
+        v = self.cfg.get(key)
+        return str(len(v)) if isinstance(v, list) else "(非列表)"
+
+    @staticmethod
+    def _send_retry_safe(e: BaseException) -> bool:
+        """发送抛异常后能不能安全重发。
+
+        只有「确定一个字节都没发出去」的异常才重试：参数/格式错误在本地
+        就抛了，连接被拒说明根本没连上。超时、连接重置可能已经送达，
+        重发会让群里出现两条一模一样的消息。
+        """
+        return isinstance(e, (TypeError, ValueError, AttributeError,
+                              KeyError, ConnectionError))
 
     def _want_markdown(self, event=None) -> bool:
         """本条消息是否该走官方 Markdown 通道。
@@ -2580,6 +2675,9 @@ class RWInfoPlugin(Star):
                     result = await fn(payload)
                     call_desc = "单参payload风格"
             mid = self._extract_message_id(result)
+            # 成功就把上次的异常清掉：调试菜单读的是这个字段，
+            # 不清的话一次偶发失败会让菜单永远显示「上次发送异常」。
+            self._last_md_error = None
             self.logger.info(
                 f"[官机] markdown 已发送 [{call_desc}] mid={mid} "
                 f"返回类型={type(result).__name__}"
@@ -2599,14 +2697,20 @@ class RWInfoPlugin(Star):
             self._last_md_error = f"{type(e).__name__}: {e}"
             return False, None
         except Exception as e:
-            # 其它异常（网络超时、回包解析失败）可能发生在消息**已送达之后**，
-            # 此时再发纯文本群里就有两条。保守处理：不重发，只记录。
+            # 其它异常分两种：
+            #  · 超时/连接类：基本可以确定没送达 → 返回 False，让上层降级重发；
+            #  · 其它（可能发生在消息已送达之后）：不重发，只记录。
+            # 早先一律返回 True（"已发送"），官Q 通道一超时用户就一条消息都收不到，
+            # 日志里也只有一行 error —— 看起来像「房间查不到」。
+            uncertain = not isinstance(
+                e, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError))
             self.logger.error(
-                f"[官机] markdown 发送异常(不重发, 可能已送达): "
+                f"[官机] markdown 发送异常"
+                f"{'(可能已送达, 不重发)' if uncertain else '(未送达, 降级重发)'}: "
                 f"{type(e).__name__}: {e}"
             )
             self._last_md_error = f"{type(e).__name__}: {e}"
-            return True, None
+            return uncertain, None
 
     def _passive_msg_id(self, event):
         """取本条消息的 msg_id，用于官方被动回复。取不到返回 None。"""
@@ -3072,6 +3176,12 @@ async for _r in _ag:
         改走合并转发卡片（真正的一条消息折叠，点开才展开）。
         合并转发不可用时降级为完整纯文本，并附一句简短提示。
         """
+        # 上一次改配置没写进磁盘：在下一条消息末尾提示一次，然后清掉。
+        # 否则用户看到的是「已设置」，重启后发现全被还原。
+        _save_err = getattr(self, "_save_failed", "")
+        if _save_err:
+            self._save_failed = ""
+            text = f"{text}\n\n⚠️ 配置写盘失败（重启后会还原）：{_save_err}"
         s = self._render_text(text, event, kind)
         if not s:
             return
@@ -3399,7 +3509,19 @@ async for _r in _ag:
             try:
                 await event.send(self._pr(event, text))
             except Exception as e:
-                self.logger.warning(f"发送消息失败: {e}")
+                # 只记 warning 的话，这条消息就彻底消失了，而且唯一的
+                # 症状是「查房卡片不出现，其他指令都正常」—— 极难排查。
+                if not self._send_retry_safe(e):
+                    self.logger.error(
+                        f"[发送] 发送失败且可能已送达，不重试: {type(e).__name__}: {e}")
+                    return None
+                self.logger.warning(
+                    f"发送消息失败, 降级纯文本重试: {type(e).__name__}: {e}")
+                try:
+                    await event.send(event.plain_result(text))
+                except Exception as e2:
+                    self.logger.error(
+                        f"[发送] 纯文本兜底仍失败: {type(e2).__name__}: {e2}")
             return None
         mid = None
         bot = getattr(event, "bot", None)
@@ -3461,8 +3583,19 @@ async for _r in _ag:
                 send_result = await event.send(self._pr(event, text))
                 mid = self._extract_message_id(send_result)
             except Exception as e:
-                self.logger.warning(f"发送消息失败: {e}")
-                return None
+                if not self._send_retry_safe(e):
+                    self.logger.error(
+                        f"[发送] 发送失败且可能已送达，不重试: {type(e).__name__}: {e}")
+                    return None
+                self.logger.warning(
+                    f"发送消息失败, 降级纯文本重试: {type(e).__name__}: {e}")
+                try:
+                    send_result = await event.send(event.plain_result(text))
+                    mid = self._extract_message_id(send_result)
+                except Exception as e2:
+                    self.logger.error(
+                        f"[发送] 纯文本兜底仍失败: {type(e2).__name__}: {e2}")
+                    return None
 
         if mid is None:
             # 消息已发出, 但拿不到 message_id → 无法撤回。
@@ -3786,18 +3919,25 @@ async for _r in _ag:
                           explain: bool = False) -> str:
         # 探针脚本缺失 / 接口过旧 -> 从仓库补齐（仅这两种情况，不做自动更新）。
         # 放到线程里跑：里面会起子进程探测版本 + 网络下载，不能阻塞事件循环。
-        if not os.path.exists(ROOM_INFO_PY) or not self._room_info_ok:
+        if not os.path.exists(ROOM_INFO_PY) or not getattr(self, "_room_info_ok", False):
             ok, err = await _run_in_thread(ensure_room_info, True)
             self._room_info_ok = ok
             if not ok:
+                # 这是「整机查房功能挂了」级别的问题，必须留 error 日志；
+                # 也不能用 is_error_info 不认识的前缀，否则自动路径会把它
+                # 当成「无有效信息」静默丢弃，表现和「房间不存在」一模一样。
+                self.logger.error(f"[探针] room_info.py 不可用：{err}")
                 if explain:
                     return f"[房间查询失败] 探针脚本不可用：{err}"
-                return f"[rwinfo] 探针脚本不可用：{err}"
+                return f"[插件错误] 探针脚本不可用：{err}"
         python = sys.executable
         if not python or not os.path.exists(python):
             python = "python3"
         cmd_args = [
             python,
+            # -u：stdout 不缓冲。探针被超时 kill 时，不带 -u 会连已打印的
+            # 失败原因一起丢掉，父进程只能看到「零输出」。
+            "-u",
             ROOM_INFO_PY,
             rid,
             "--name", probe_name,
@@ -3824,9 +3964,17 @@ async for _r in _ag:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=ROOM_INFO_DIR,
             )
+        except FileNotFoundError:
+            self.logger.error(f"启动探针失败: 解释器不存在 {python}")
+            return (f"[房间查询失败] 找不到用来跑探针的 Python：{python}"
+                    f"\n通常是插件运行环境的问题（容器里没有 python3，或路径被改过）")
+        except PermissionError as e:
+            self.logger.error(f"启动探针失败: 没有执行权限 {python}: {e}")
+            return (f"[房间查询失败] 没有权限执行 {python}：{e}"
+                    f"\n检查该文件是否可执行、是否被安全策略拦截")
         except Exception as e:
-            self.logger.error(f"启动探针失败 (python={python}): {e}")
-            return f"[房间查询失败] 探针启动失败: {e}"
+            self.logger.exception("启动探针进程失败")
+            return f"[插件错误] 启动探针进程失败（{type(e).__name__}）：{e}"
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=QUERY_TIMEOUT)
         except asyncio.TimeoutError:
@@ -3849,13 +3997,19 @@ async for _r in _ag:
                 pass
             raise
         except Exception as e:
-            # 通信阶段其他异常: 同样回收子进程后透传
+            # 通信阶段其他异常: 同样回收子进程。
+            # 这类异常几乎都是插件自身的问题（管道读失败、事件循环异常……），
+            # 不能再当成「房间不存在」静默掉——显式查房时要把原因说出来。
             try:
                 proc.kill()
                 await asyncio.wait_for(proc.wait(), timeout=5)
             except Exception:
                 pass
-            raise e
+            self.logger.exception(f"[查房] {rid} 与探针进程通信异常")
+            if explain:
+                return (f"[插件错误] 读取探针输出时异常（{type(e).__name__}）：{e}"
+                        f"\n这是插件 bug，不是房间问题；日志里有完整堆栈")
+            raise
         out = stdout.decode("utf-8", "replace").strip()
         err = stderr.decode("utf-8", "replace").strip()
         rc = proc.returncode
@@ -3873,9 +4027,21 @@ async for _r in _ag:
                 # 「进程没起来 / 网络不通 / 脚本自己崩了」三种情况。
                 tail = [ln.strip() for ln in (err or "").splitlines() if ln.strip()][-3:]
                 detail = "；".join(tail)[:240]
-                msg = (f"[房间查询失败] 探针没有任何输出（退出码 {rc}）。"
-                       f"常见原因：本机到中继不通、DNS 解析失败，"
-                       f"或插件目录里的 room_info.py 与运行环境不匹配")
+                # 退出码是 room_info.py 的分类（EXIT_NET/NO_ROOM/ROOM_BUSY/PROTO），
+                # 能直接说清是哪一类问题，比「无响应」有用得多。
+                rc_hint = {
+                    2: "探针连不上中继（DNS 解析失败或端口不通），"
+                       "这是机器人所在机器的网络问题，不是房号写错",
+                    3: "房间不存在或已关闭",
+                    4: "房间已满或游戏已经开始，探针进不去",
+                    5: "房间信息解析或查询链路异常（房间可能刚开或在迁移，稍后重试）",
+                }.get(rc)
+                if rc_hint:
+                    msg = f"[房间查询失败] {rc_hint}（退出码 {rc}）"
+                else:
+                    msg = (f"[房间查询失败] 探针没有任何输出（退出码 {rc}）。"
+                           f"常见原因：本机到中继不通、DNS 解析失败，"
+                           f"或插件目录里的 room_info.py 与运行环境不匹配")
                 if detail:
                     msg += f"\n脚本输出：{detail}"
                 else:
@@ -3970,8 +4136,10 @@ async for _r in _ag:
             if self._list_hit(mwl, "@", uid):
                 return True   # 用户在混合白名单 -> 放
             # 用户不在两名单: 跟随配置的私聊默认策略
-            policy = self.cfg.get("混合_私聊策略", "white")
-            return policy != "white"  # white=不在白->拦(False); black=在黑才拦->放(True)
+            # 只认明确的 black；None/拼错/大小写不符一律按 white 处理。
+            # 原来是 `policy != "white"`，配置被改坏时会 fail-open（谁都放行）。
+            policy = str(self.cfg.get("混合_私聊策略") or "white").strip().lower()
+            return policy == "black"  # white=不在白->拦(False); black=在黑才拦->放(True)
         # 群聊
         if self._list_hit(mbl, "@", uid):
             return False  # 用户黑名单优先(即使群在白名单) -> 拦
@@ -4490,7 +4658,7 @@ async for _r in _ag:
             st = await self._state_load(event)
         if not st:
             return False
-        page = int(st.get("page", 1) or 1)
+        page = self._int_or(st.get("page"), 1)
         keyword = st.get("keyword", "") or ""
         status = st.get("status", "") or ""
         full = st.get("full", "") or ""
@@ -4500,9 +4668,11 @@ async for _r in _ag:
             rooms_all, _cached = await self._list_fetch(force=False)
         except Exception as e:
             self.logger.warning(f"[查房] 重建 addrs 失败: {type(e).__name__}: {e}")
-            return False
+            return f"[插件错误] 重建序号表时异常（{type(e).__name__}）：{e}"
         if not rooms_all:
-            return False
+            # 把 _list_fetch 记下的真实原因带出去：
+            # 「探针不可用 / 超时 / 解析失败」不能都笼统说成「列表数据暂时不可用」
+            return self._last_list_error or "列表数据暂时不可用"
 
         def match(r):
             rst = (r.get("status") or "").lower()
@@ -4562,7 +4732,12 @@ async for _r in _ag:
             states.pop(k, None)
 
     async def _list_fetch(self, force: bool = False):
-        """拉取房间列表(带滑动过期缓存)。force=True 强制刷新。"""
+        """拉取房间列表(带滑动过期缓存)。force=True 强制刷新。
+
+        失败原因记到 self._last_list_error：调用方据此区分
+        「代码错误」和「网络超时」，不要一律回「请稍后重试」。
+        """
+        self._last_list_error = ""
         cache = self._list_cache()
         now = time.time()
         if not force and cache["rooms"] and (now - cache["ts"]) < self.LIST_CACHE_TTL:
@@ -4574,11 +4749,12 @@ async for _r in _ag:
         # 与 _query_room 同一套门控：缺失或接口过旧都触发补齐，
         # 失败时直接返回错误信息，不能落进 create_subprocess_exec
         # （文件不存在会抛 FileNotFoundError，具体原因就被吞掉了）
-        if not os.path.exists(ROOM_INFO_PY) or not self._room_info_ok:
+        if not os.path.exists(ROOM_INFO_PY) or not getattr(self, "_room_info_ok", False):
             ok, err = await _run_in_thread(ensure_room_info, True)
             self._room_info_ok = ok
             if not ok:
                 self.logger.error(f"[列表] 探针脚本不可用: {err}")
+                self._last_list_error = f"[房间查询失败] 探针脚本不可用：{err}"
                 return None, False
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -4591,11 +4767,19 @@ async for _r in _ag:
         except asyncio.TimeoutError:
             try:
                 proc.kill()
+                # 不等回收会留下僵尸进程（长时间运行会越积越多）
+                await proc.wait()
             except Exception:
                 pass
+            self._last_list_error = ("[房间查询失败] 房间列表获取超时（90 秒）——"
+                                     "探针进程没有返回，通常是到官方列表服务器的连接卡住了")
             return None, False
         except Exception as e:
-            self.logger.error(f"房间列表获取失败: {e}")
+            # 这里是插件自身的代码/环境错误，不能跟「网络超时」混为一谈
+            self.logger.exception("房间列表获取异常（插件内部）")
+            self._last_list_error = (f"[插件错误] 房间列表获取异常"
+                                     f"（{type(e).__name__}）：{e}"
+                                     f"\n这是插件 bug，不是网络问题；日志里有完整堆栈")
             return None, False
 
         out = (stdout or b"").decode("utf-8", "replace").strip()
@@ -4608,8 +4792,16 @@ async for _r in _ag:
                     break
                 except json.JSONDecodeError:
                     continue
-        if rooms is None:
+        # stdout 里可能是一行 JSON，但结构未必是房间数组（版本不匹配/报错对象）。
+        # 直接往下走会让 cmd_list 对 dict 调 .get 抛 AttributeError，指令无回复。
+        if not isinstance(rooms, list):
+            self.logger.warning(
+                f"[列表] 返回的不是房间数组（{type(rooms).__name__}），已忽略")
             rooms = []
+        rooms = [r for r in rooms if isinstance(r, dict)]
+        if not rooms:
+            self._last_list_error = ("[房间查询失败] 列表接口没有返回可解析的数据"
+                                     "（返回长度 " f"{len(out)} 字节）")
         cache["rooms"] = rooms
         cache["ts"] = time.time()
         return rooms, False
@@ -4744,12 +4936,19 @@ async for _r in _ag:
             elif t in REFRESH:
                 force = True
             elif t in RETAIN:
-                # "搜索 关键词" 或 "搜索关键词"；关键词可含空格，取到末尾全部
-                kw = ""
-                if idx + 1 < len(toks):
+                # "搜索 关键词" 或 "搜索关键词"：关键词允许含空格，
+                # 但遇到筛选词、页码、刷新/清空就停下 ——
+                # 否则「搜索 生存 不满」会拿整串「生存 不满」去搜，白搜一场。
+                kw_parts = []
+                while idx + 1 < len(toks):
+                    nxt = toks[idx + 1]
+                    if (nxt in FILTER_WORDS or nxt in RETAIN
+                            or nxt in RESET_STATE or nxt in REFRESH
+                            or nxt.isdigit()):
+                        break
                     idx += 1
-                    kw = " ".join(toks[idx:])
-                    idx = len(toks)          # 剩余 token 已并入关键词
+                    kw_parts.append(nxt)
+                kw = " ".join(kw_parts)
                 if not kw:
                     _ag = self._send_text(event, "用法：/铁锈列表 搜索 <关键词>")
                     async for _r in _ag:
@@ -4810,13 +5009,18 @@ async for _r in _ag:
             source = st.get("source", "all")
 
         rooms_all, cached = await self._list_fetch(force=force)
+        _lerr = getattr(self, "_last_list_error", "") or ""
         if rooms_all is None:
-            _ag = self._send_text(event, "房间列表获取超时，请稍后重试")
+            # 有具体原因就说具体原因：超时、探针脚本缺失、插件代码异常
+            # 是三种完全不同的故障，统一回一句「请稍后重试」只会浪费排查时间。
+            msg = _lerr or "房间列表获取超时（90 秒无响应）。多为到官方列表服务器的连接卡住，可稍后重试"
+            _ag = self._send_text(event, msg)
             async for _r in _ag:
                 yield _r
             return
         if not rooms_all:
-            _ag = self._send_text(event, "没有获取到房间数据，请稍后重试")
+            msg = _lerr or "官方列表返回了空结果。多半是列表服务临时异常，稍后重试一次；连续为空再查网络"
+            _ag = self._send_text(event, msg)
             async for _r in _ag:
                 yield _r
             return
@@ -4984,8 +5188,8 @@ async for _r in _ag:
             async for r in self._as_async_iter(_src):
                 yield r
             return
-        cur = int(st.get("page", 1) or 1)
-        total = int(st.get("total", 0) or 0)
+        cur = self._int_or(st.get("page"), 1)
+        total = self._int_or(st.get("total"), 0)
         if total and cur >= total:
             _ag = self._send_text(event, f"已经是最后一页了（第 {cur}/{total} 页）")
             async for _r in _ag:
@@ -5020,7 +5224,7 @@ async for _r in _ag:
             async for r in self._as_async_iter(_src):
                 yield r
             return
-        cur = int(st.get("page", 1) or 1)
+        cur = self._int_or(st.get("page"), 1)
         if cur <= 1:
             _ag = self._send_text(event, "已经是第一页了")
             async for _r in _ag:
@@ -5105,11 +5309,13 @@ async for _r in _ag:
                 st = await self._state_load(event)
             items = self._state_addrs(event)
             if not items:
-                if await self._refill_addrs(event):
+                _refill_err = await self._refill_addrs(event)
+                if not _refill_err:
                     items = self._state_addrs(event)
                 if not items:
+                    _reason = _refill_err or "列表数据暂时不可用"
                     _ag = self._send_text(event,
-                        "取不到列表序号对应的房间（列表数据暂时不可用）。\n"
+                        f"取不到列表序号对应的房间。\n原因是：{_reason}\n"
                         "可直接用房号查询：{0}铁锈查房 r5132".format(self._prefix_of(event) or "/"))
                     async for _r in _ag:
                         yield _r
@@ -5136,8 +5342,20 @@ async for _r in _ag:
                     join_a = 0
                 uuid_ = str(item.get("uuid") or "").strip()
                 if join_a and uuid_ and not str(item.get("room_id") or "").strip():
-                    real = await asyncio.to_thread(
-                        self._resolve_relay_addr, uuid_, join_a)
+                    try:
+                        # 必须走 _run_in_thread：本文件兼容 Python 3.8，
+                        # 没有 asyncio.to_thread；直接调会在 3.8 上抛
+                        # AttributeError，整条指令无任何回复。
+                        real = await _run_in_thread(
+                            self._resolve_relay_addr, uuid_, join_a)
+                    except Exception as e:
+                        self.logger.exception("解析中继房真实地址异常")
+                        _ag = self._send_text(event,
+                            f"[插件错误] 解析第 {n} 条 {label} 的真实地址时异常"
+                            f"（{type(e).__name__}）：{e}")
+                        async for _r in _ag:
+                            yield _r
+                        return
                     if real:
                         target = real
                     else:
@@ -5201,10 +5419,15 @@ async for _r in _ag:
                         timeout=QUERY_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    result = ""
+                    result = (f"[房间查询失败] 查询超时（超过 {QUERY_TIMEOUT} 秒）——"
+                              f"探针进程没有按期返回，通常是到中继的连接卡住了")
                 except Exception as e:
-                    self.logger.error(f"[查房] {target} 查询异常: {e}")
-                    result = ""
+                    # 代码错误 ≠ 房间问题。以前两者都落到「查房无响应」，
+                    # 结果真出 bug 时反而更难查（要翻日志才知道是 AttributeError）。
+                    self.logger.exception(f"[查房] {target} 插件内部异常")
+                    result = (f"[插件错误] 查询 {target} 时插件内部抛异常"
+                              f"（{type(e).__name__}）：{e}"
+                              f"\n这是插件 bug，不是房间问题；日志里有完整堆栈")
                 if is_room_info(result):
                     break
                 if not is_name_check_error(result):
@@ -5323,7 +5546,10 @@ async for _r in _ag:
         NAME = {"white": "白名单(仅名单内放行)", "black": "黑名单(名单内禁用)", "mixed": "混合模式(@用户优先于#群)"}
         if not arg:
             mode = self.cfg.get("mode", "black")
-            _ag = self._send_text(event, f"当前模式：{NAME[mode]}")
+            # 配置里可能是历史值 / 大小写不一致（"White"），NAME[mode] 会 KeyError，
+            # 表现为「/铁锈模式 完全没反应」。
+            _ag = self._send_text(event,
+                f"当前模式：{NAME.get(mode, f'未知模式（{mode}）')}")
             async for _r in _ag:
                 yield _r
             return
@@ -5716,10 +5942,10 @@ async for _r in _ag:
                      f"重试：{self.cfg.get('retry_times')}")
             L.append(f"每页 {self.cfg.get('list_page_size', 5)} 条（总数不限）")
             L.append(
-                f"白名单 {len(self.cfg.get('白名单', []))}、"
-                f"黑名单 {len(self.cfg.get('黑名单', []))}、"
-                f"混合白 {len(self.cfg.get('混合_白名单', []))}、"
-                f"混合黑 {len(self.cfg.get('混合_黑名单', []))}"
+                f"白名单 {self._cfg_len('白名单')}、"
+                f"黑名单 {self._cfg_len('黑名单')}、"
+                f"混合白 {self._cfg_len('混合_白名单')}、"
+                f"混合黑 {self._cfg_len('混合_黑名单')}"
             )
             L.append(f"房号冷却：{_human_secs(self._cooldown_secs())}")
             L.append(f"冷却提示：{'开' if self.cfg.get('冷却提示') else '关'}　"
@@ -7069,8 +7295,11 @@ async for _r in _ag:
             for rid in to_query:
                 idx = self._acquire_probe()
                 if idx is None:
-                    # 所有探针均被占用: 跳过该房号本轮查询(保持冷却中, 下轮消息再触发)
+                    # 所有探针均被占用。冷却占位是在拿到探针之前写的，
+                    # 这里必须撤掉：否则用户再发一次会被当成「刚查过」静默丢掉，
+                    # 而实际上一次都没查。
                     self.logger.debug(f"探针池已满, 跳过房号 {rid}")
+                    self.room_cooldown.pop(f"{sess}|{rid}", None)
                     continue
                 base_name = f"{self._probe_prefix()}探针{idx:02d}"
                 # 短时间标识: 编码"月日时分秒"为5位base36, 可逆解回, 避免过长的数字后缀被过滤
@@ -7096,7 +7325,11 @@ async for _r in _ag:
                             try:
                                 result = task.result()
                             except Exception as e:
-                                self.logger.error(f"查询 {rid} 异常: {e}")
+                                # 自动路径对群里保持静默（英文单词误报不能刷屏），
+                                # 但日志必须带堆栈 —— 代码错误和网络失败要能区分。
+                                self.logger.exception(
+                                    f"[查房] {rid} 插件内部异常（自动触发，未回传）: "
+                                    f"{type(e).__name__}: {e}")
                                 result = ""
                             if is_room_info(result):
                                 self.logger.info(f"房间 {rid} 查询成功, 回传")
@@ -7129,6 +7362,13 @@ async for _r in _ag:
                                         retry_result = await asyncio.wait_for(retry_task, timeout=QUERY_TIMEOUT)
                                     except asyncio.TimeoutError:
                                         retry_result = ""
+                                    except Exception as e:
+                                        # 其它异常若直接抛出，会中断 while remaining，
+                                        # 同一批里其它房号已查到的结果也不会再回。
+                                        self.logger.warning(
+                                            f"房间 {rid} 重试任务异常: "
+                                            f"{type(e).__name__}: {e}")
+                                        retry_result = f"[插件错误] {rid} 重试时异常（{type(e).__name__}）：{e}"
                                     finally:
                                         # 确保重试任务被取消并回收, 避免协程泄漏
                                         if retry_task is not None and not retry_task.done():
@@ -7190,6 +7430,14 @@ async for _r in _ag:
                             await task
                         except (asyncio.CancelledError, Exception):
                             pass
+                    else:
+                        # 已完成但带异常的任务没人取 result：CPython 会在 GC 时
+                        # 打印 "Task exception was never retrieved"，看起来像插件崩了。
+                        if not task.cancelled():
+                            try:
+                                task.exception()
+                            except Exception:
+                                pass
                     if idx not in released:
                         self._release_probe(idx)
                         released.add(idx)
