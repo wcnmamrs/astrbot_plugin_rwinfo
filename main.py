@@ -5543,6 +5543,44 @@ async for _r in _ag:
             L.append(f"管理员：{'是' if is_admin is True else '否'}　"
                      f"（本插件判定：{'是' if self._is_admin(event) else '否'}）")
             L.append(f"撤回配置匹配键：{_human_key(key) if key else '(未识别)'}")
+            # 自动查房判定：把「这条消息里的房号会不会被处理」的三个闸门一次列清。
+            # 「名单是空的，为什么还不解析房间」是最常被问的一句，
+            # 有了这三行就不必翻代码猜配置（名单 → 全局开关 → 私聊开关）。
+            try:
+                _allowed = self._is_allowed(
+                    bool(is_priv), normalize_gid(uid_raw), normalize_gid(gid_raw))
+            except Exception:
+                _allowed = False
+            _mode = self.cfg.get("mode", "black")
+            _mode_name = {"white": "白名单（仅名单内放行）",
+                          "black": "黑名单（名单外都放行）",
+                          "mixed": "混合（@用户优先于 #群）"}.get(
+                              _mode, f"未知：{_mode!r}")
+
+            def _cnt(_k):
+                _v = self.cfg.get(_k)
+                return len(_v) if isinstance(_v, list) else -1
+
+            _global_on = bool(self.cfg.get("global_enabled", True))
+            _priv_on = bool(self.cfg.get("私聊启用", True))
+            _why = []
+            if not _allowed:
+                _why.append("名单未放行")
+            if not _global_on:
+                _why.append("全局解析开关=关")
+            if is_priv and not _priv_on:
+                _why.append("私聊查房=关")
+            L.append("自动查房：" + ("放行" if not _why else "拦截 —— " + "、".join(_why)))
+            L.append(f"　模式：{_mode_name}")
+            _fmt = lambda v: "(非列表)" if v < 0 else f"{v} 条"
+            L.append(f"　名单：白 {_fmt(_cnt('白名单'))}　黑 {_fmt(_cnt('黑名单'))}"
+                     f"　混合白 {_fmt(_cnt('混合_白名单'))}　混合黑 {_fmt(_cnt('混合_黑名单'))}")
+            if _mode == "black" and _cnt("黑名单") == 0:
+                L.append("　说明：黑名单为空 = 名单外一律放行，不会拦任何群/人")
+            elif _mode == "white" and _cnt("白名单") == 0:
+                L.append("　说明：白名单为空 = 谁都不会触发，先加 /铁锈白名 +#群号")
+            elif _mode == "mixed" and _cnt("混合_白名单") > 0:
+                L.append("　说明：混合白名单非空时，名单外的群默认拦截")
 
         # ---- 2. 撤回配置 ----
         cfg = self._get_recall_cfg(event)
