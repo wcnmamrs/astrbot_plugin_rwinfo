@@ -78,7 +78,8 @@ Two permission tiers:
 | `/铁锈查房帮助` | Everyone | Show command menu. Aliases `/铁锈查房菜单` `/铁锈帮助` `/rwhelp` |
 | `/铁锈列表 [args]` | Allowlist | Paged room list. Aliases `/房间列表` `/铁锈房列表` `/rwlist` |
 | `/铁锈下一页` `/铁锈上一页` | Allowlist | Page navigation |
-| `/铁锈查房 <index\|roomID\|IP:port>` | Allowlist | Explicit lookup. Index comes from the latest list, room ID like `r5132` / `hytvvi`, or a raw `IP` / `IP:port` |
+| `/铁锈查房 <index\|roomID\|IP:port>` | Allowlist | Explicit lookup, including CNKD K rooms such as `RKC497`, or a raw `IP` / `IP:port` |
+| `/铁锈查房 状态` | Everyone | Today's query count, success rate, failure categories, latency and K-room success rate |
 | `/铁锈全局解析 开\|关` | Admin | Global parsing switch, default on |
 | `/铁锈模式 白\|黑\|混合` | Admin | List mode, default black. In mixed mode `@` takes precedence over `#`, same name is exclusive |
 | `/铁锈白名 +@userID` `/铁锈白名 +#groupID` | Admin | Whitelist add/remove, prints list with no args |
@@ -150,7 +151,16 @@ column 7 is the host name).
 | index | Number from the latest `/铁锈列表` result (per current page; mapping valid 10 min, auto-rebuilt silently when stale) | `/铁锈查房 2` |
 | numeric room | `o` `q` `r` `s` + digits, at least 3 chars | `/铁锈查房 r5132` |
 | alphabetic room | Other letters, pure alphabetic, at least 3 chars | `/铁锈查房 hytvvi` |
+| K room | CNKD share ID `RKC` / `KC` + 2–8 digits, or a full share link | `/铁锈查房 RKC497` |
 | direct | `IP` or `IP:port` (port defaults to 5123) | `/铁锈查房 45.76.27.30:5125` |
+
+**Daily query statistics**
+
+`/铁锈查房 状态` (also `统计` or `status`) reports today's total, successes,
+failures, success rate, average latency, K-room success rate, failure categories
+and probe usage. Explicit and automatic lookups are included; probe-name retries
+are counted as actual probe attempts. Data is stored in `.rwinfo_stats.json`
+inside the plugin directory, survives reloads, and resets on the next local day.
 
 **Permissions**
 

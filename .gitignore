@@ -8,8 +8,11 @@ dist/
 .venv/
 venv/
 
-# 运行时缓存
+# 运行时缓存与本地统计
 server_info_*.bin
+.rwinfo_stats.json
+.rwinfo_stats.json.*.tmp
+.promote_state.json
 
 # 编辑器
 .vscode/

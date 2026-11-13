@@ -4,6 +4,7 @@
 AstrBot 插件: 铁锈战争房间查询 (rwinfo)
 """
 import asyncio
+import datetime as _datetime
 import hashlib
 import io
 import json
@@ -37,7 +38,7 @@ COOLDOWN = 10
 PROBE_MIN, PROBE_MAX = 1, 99
 
 # 插件版本（菜单与元数据展示用，与 metadata.yaml 的 version 保持一致）
-PLUGIN_VERSION = "2.0.0"
+PLUGIN_VERSION = "2.0.1"
 
 # ---- 协议侧常量（与 room_info.py 保持一致）----
 # 官方 masterserver 列表。插件侧解析中继房真实地址时要用，
@@ -521,6 +522,12 @@ def _relay_priority(rid: str) -> int:
 #   · r5132r5132  -> 房号连写两遍，归一化后去重 -> 一个 r5132
 #   · s1024r5132  -> 两个不同房号连写（中间无空格）-> 都识别
 # 因此正则不再锚定边界，改为在 extract_room_ids 里逐个检查左边界。
+# CNKD K 服分享号：RKC497 / KC497。必须在普通 o/q/r/s 房号之前提取，
+# 否则字母房正则会从 URL 里捞出 rkc、kc 之类的残片。
+K_ROOM_RE = re.compile(
+    r'(?<![A-Za-z0-9._:@=\-?#&])R?KC\d{2,8}(?![A-Za-z0-9._:/@=\-?#&])',
+    re.IGNORECASE)
+
 RELAY_NUM_LOOSE_RE = re.compile(r'[oqrsOQRS]+\d{2,}')
 _RELAY_NUM_HEAD_RE = re.compile(r'^([oqrsOQRS]+)(\d+)$')
 # 字母房号: 非 oqrs 的字母开头 + 纯字母 (整串 >= 3 字符)
@@ -612,6 +619,7 @@ def extract_room_ids(text: str):
     """从文本中提取所有房间号, 按出现顺序去重返回(小写)。
 
     支持的房号形式(按中继区分, 实测):
+      0. K 服: RKC/KC + 2~8 位数字（如 RKC497），及 cnkd.fun 分享链接
       1. 数字房: o/q/r/s + 2 位以上数字, 整串 >= 3 字符
          如 r5132 / s1024 / o9999 / q7777
       2. 字母房: 非 o/q/r/s 的字母开头 + 纯字母, 整串 >= 3 字符
@@ -630,12 +638,25 @@ def extract_room_ids(text: str):
     seen = set()
 
     def add(rid):
-        rid = str(rid or "").lower()
+        rid = str(rid or "").strip()
+        if rid.upper().startswith(("RKC", "KC")):
+            rid = rid.upper()
+            if rid.startswith("KC"):
+                rid = "R" + rid
+        else:
+            rid = rid.lower()
         if rid and rid not in seen:
             seen.add(rid)
             ids.append(rid)
 
     rest = text or ""
+
+    # 0) CNKD K 服：RKC497 / KC497，以及 www.cnkd.fun/RKC497 分享链接。
+    # 归一化为大写 RKC 形式；探针与官方 r 中继对大小写均兼容。
+    for m in K_ROOM_RE.finditer(rest):
+        token = m.group(0).upper()
+        add(token if token.startswith("RKC") else "R" + token)
+    rest = K_ROOM_RE.sub(" ", rest)
 
     # 1) 数字房(oqrs + 数字)：宽松匹配，再归一化拆分
     for m in RELAY_NUM_LOOSE_RE.finditer(rest):
@@ -1028,9 +1049,120 @@ class RWInfoPlugin(Star):
         self.pending_recall_tasks = set()
         # 撤回任务明细: {id(task): {"key","mid","due","delay"}}, 供调试指令展示
         self._recall_meta = {}
+        # 今日查房统计：按插件运行环境的本地日期归档，持久化到插件目录，
+        # 重载/重启后今日数据不丢。跨天时旧记录保留在文件里，页面只展示今日。
+        self._stats_path = os.path.join(_PLUGIN_DIR, ".rwinfo_stats.json")
+        self._stats = self._load_stats()
         # bin 缓存定时清理任务(插件启动后开始循环)
         self._bin_cleanup_task = None
         self._start_bin_cleanup()
+
+    # ================================================================ 今日查房统计
+    @staticmethod
+    def _stats_day(ts=None):
+        """本地日期键；与「今日」的用户直觉一致，不用 UTC 日期。"""
+        return _datetime.datetime.fromtimestamp(
+            time.time() if ts is None else ts).strftime("%Y-%m-%d")
+
+    def _load_stats(self):
+        """读取统计文件；损坏/字段异常时归零，不影响插件加载。"""
+        empty = {"date": self._stats_day(), "total": 0, "success": 0,
+                 "failure": 0, "errors": {}, "k_total": 0, "k_success": 0,
+                 "total_seconds": 0.0, "success_seconds": 0.0}
+        try:
+            with open(self._stats_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if not isinstance(raw, dict) or raw.get("date") != empty["date"]:
+                return empty
+            for k in ("total", "success", "failure", "k_total", "k_success"):
+                v = raw.get(k, 0)
+                empty[k] = max(0, int(v)) if isinstance(v, (int, float)) else 0
+            for k in ("total_seconds", "success_seconds"):
+                v = raw.get(k, 0.0)
+                empty[k] = max(0.0, float(v)) if isinstance(v, (int, float)) else 0.0
+            errors = raw.get("errors", {})
+            if isinstance(errors, dict):
+                empty["errors"] = {str(k)[:80]: max(0, int(v))
+                                   for k, v in errors.items()
+                                   if isinstance(v, (int, float))}
+        except (OSError, ValueError, TypeError):
+            pass
+        return empty
+
+    def _save_stats(self):
+        """原子写入，避免多个查询同时结束时把 JSON 写坏。"""
+        try:
+            tmp = f"{self._stats_path}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._stats, f, ensure_ascii=False)
+            os.replace(tmp, self._stats_path)
+        except OSError as e:
+            self.logger.warning(f"[统计] 写盘失败（仅本次统计丢失）: {e}")
+
+    def _stats_text(self):
+        st = self._stats
+        if st.get("date") != self._stats_day():
+            self._stats = st = self._load_stats()
+        total = st["total"]
+        success = st["success"]
+        rate = (success * 100.0 / total) if total else 0.0
+        avg = (st["total_seconds"] / total) if total else 0.0
+        ok_avg = (st["success_seconds"] / success) if success else 0.0
+        k_total, k_success = st["k_total"], st["k_success"]
+        k_rate = (k_success * 100.0 / k_total) if k_total else 0.0
+        lines = [
+            "【今日查房状态】",
+            f"日期：{st['date']}（本地时间）",
+            f"查询总数：{total} 次",
+            f"成功：{success} 次　失败：{st['failure']} 次",
+            f"成功率：{rate:.1f}%",
+            f"平均耗时：{avg:.1f} 秒　成功平均：{ok_avg:.1f} 秒",
+            f"K 房：{k_total} 次，成功 {k_success} 次（{k_rate:.1f}%）",
+            f"探针当前占用：{len(self.probe_used)}　待执行任务：{len(self.pending_tasks)}",
+        ]
+        if st["errors"]:
+            top = sorted(st["errors"].items(), key=lambda kv: kv[1], reverse=True)[:3]
+            lines.append("失败分类：" + "；".join(f"{k} {v} 次" for k, v in top))
+        lines.append("统计范围：显式指令与自动触发；按实际探针查询次数统计")
+        return "\n".join(lines)
+
+    def _record_query(self, rid, started, result):
+        """在 _query_room 的统一出口记账，覆盖显式/自动/重试路径。"""
+        try:
+            if self._stats.get("date") != self._stats_day():
+                self._stats = self._load_stats()
+            st = self._stats
+            elapsed = max(0.0, time.time() - started)
+            ok = is_room_info(result)
+            st["total"] += 1
+            st["total_seconds"] += elapsed
+            if ok:
+                st["success"] += 1
+                st["success_seconds"] += elapsed
+            else:
+                st["failure"] += 1
+                text = str(result or "")
+                if text.startswith(PLUGIN_ERR_PREFIX):
+                    kind = "插件错误"
+                elif "超时" in text:
+                    kind = "超时"
+                elif "房间已满" in text or "游戏已经开始" in text:
+                    kind = "房间不可加入"
+                elif "房间不存在" in text or "已关闭" in text or not text:
+                    kind = "无房间/无响应"
+                elif "中继" in text or "网络" in text or "连接" in text:
+                    kind = "网络/中继"
+                else:
+                    kind = "其他失败"
+                st["errors"][kind] = st["errors"].get(kind, 0) + 1
+            if str(rid or "").upper().startswith(("RKC", "KC")):
+                st["k_total"] += 1
+                if ok:
+                    st["k_success"] += 1
+            self._save_stats()
+        except Exception as e:
+            # 统计不能反过来影响查房；但日志要留原因，不能静默吞 bug。
+            self.logger.warning(f"[统计] 记录失败（不影响查房）: {e}")
 
     # ================================================================ bin 缓存清理
     def _bin_cleanup_conf(self):
@@ -4000,6 +4132,23 @@ async for _r in _ag:
 
     async def _query_room(self, rid: str, probe_name: str, gid: str = "",
                           explain: bool = False) -> str:
+        started = time.time()
+        try:
+            result = await self._query_room_impl(rid, probe_name, gid, explain)
+            self._record_query(rid, started, result)
+            return result
+        except asyncio.CancelledError:
+            # 卸载/取消不是「查询失败」，但仍是一次已发起的查询。
+            self._record_query(rid, started, "[房间查询失败] 查询被取消")
+            raise
+        except Exception as e:
+            # 兜底也要记账；原有上层异常处理与错误文案不变。
+            self._record_query(rid, started,
+                               f"[插件错误] {type(e).__name__}: {e}")
+            raise
+
+    async def _query_room_impl(self, rid: str, probe_name: str, gid: str = "",
+                               explain: bool = False) -> str:
         # 探针脚本缺失 / 接口过旧 -> 从仓库补齐（仅这两种情况，不做自动更新）。
         # 放到线程里跑：里面会起子进程探测版本 + 网络下载，不能阻塞事件循环。
         if not os.path.exists(ROOM_INFO_PY) or not getattr(self, "_room_info_ok", False):
@@ -4444,6 +4593,7 @@ async for _r in _ag:
             "",
             "—— 查房 ——",
             "/铁锈查房 <序号|房号>　群里直接发房号也行",
+            "/铁锈查房 状态　今日查询数、成功率与耗时",
             "",
             "—— 房间列表 ——",
             "/铁锈列表 [页码] [筛选] [搜索 关键词] [刷新]",
@@ -4467,7 +4617,7 @@ async for _r in _ag:
             "",
             "—— 自动触发 ——",
             "群聊/私聊发房号自动查房，无需指令",
-            "支持 o/q/r/s+数字 与 纯字母两类，均需 3 位以上",
+            "支持 o/q/r/s+数字、纯字母、RKC/KC+数字（K 服）",
             "官方机器人需群主开启「允许获取群消息」与「自动回复」",
             "别名：/铁锈查房菜单　/铁锈帮助　/rwhelp",
         ]
@@ -5329,6 +5479,7 @@ async for _r in _ag:
           /铁锈查房 2              查列表里第 2 号房间（需先发 /铁锈列表）
           /铁锈查房 r5132          直接按房号查询
           /铁锈查房 1.2.3.4:5123   按 IP:端口 直连查询
+          /铁锈查房 状态           查看今日查房统计
 
         输出包含：房名、房号、地图、当前/最大人数、房主、收入倍率、
         初始资金、迷雾、游戏模式、初始单位、是否禁核、共享控制、
@@ -5341,7 +5492,14 @@ async for _r in _ag:
         遇到验证码房会提示「验证码房无法继续」。这是官方中继的反机器人
         验证机制，硬闯会导致 IP 被封，因此不做重试。
         使用「序号」形式时，若列表缓存已过期，会提示先重新发一次列表。
+        另：/铁锈查房 状态 查看今日查询统计。
         """
+        # 状态命令走原始参数补全，避免不同框架版本对空格参数分派不一致。
+        _raw_arg = self._raw_args(event, arg, "铁锈查房")
+        if str(_raw_arg or arg or "").strip().lower() in ("状态", "统计", "status"):
+            async for _r in self._send_text(event, self._stats_text()):
+                yield _r
+            return
         _why = self._session_blocked(event)
         if _why:
             _ag = self._send_text(event, _why)
@@ -5372,7 +5530,7 @@ async for _r in _ag:
         USAGE = (
             "用法：/铁锈查房 <序号|房号>\n"
             "序号 - 先发 /铁锈列表，再填列表里的序号（如 /铁锈查房 2）\n"
-            "房号 - r5132 / s1024 / Q12345 / hytvvi"
+            "房号 - r5132 / s1024 / Q12345 / hytvvi / RKC497"
         )
         if not arg:
             # 不带参数只给用法

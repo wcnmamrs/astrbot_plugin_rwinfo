@@ -867,6 +867,39 @@ _ID_REPLY_RE = re.compile(r'\b([A-Za-z])(\d{2,8})\b')
 # 为什么用模块级变量而不是改返回值：relay_session/node_session 的返回值
 # 被多处解包（got_106, got_115 = result），改结构会牵连所有调用点。
 _LAST_ROOM_ID = ""
+# CNKD K 服的「分享房号 / 优先分享房号 / 当前人数」是展示层权威信息。
+# 115 的队伍数是地图槽位数（如 Crossing Large 固定 10），不是 K 服房间的
+# 人数上限（可设为 50）；地图名里的 [z;p10] 也只是内部地图标签。
+# 这些信息只在本进程的单次查询内使用，不写配置、不跨进程共享。
+_K_ROOM_ID = ""
+_K_ROOM_CAPACITY = None
+_K_ROOM_PLAYERS = None
+
+
+def extract_k_room_id_from_chat(message):
+    """从 CNKD 系统聊天里提取对外分享房号，如 RKC497。
+
+    只接受「分享房号 / 优先分享房号 / 加入链接」这三种明确字段，
+    不能见到 K+数字 就认：欢迎页示例、内部编号、地图标签都可能带数字。
+    """
+    text = str(message or "")
+    m = re.search(r'(?:优先)?分享房号\s*[：:]\s*(R?KC\d{2,8})\b', text, re.I)
+    if not m:
+        m = re.search(r'(?:https?://)?(?:www\.)?cnkd\.fun/(R?KC\d{2,8})\b',
+                      text, re.I)
+    return m.group(1).upper() if m else ""
+
+
+def _update_k_room_status(message):
+    """缓存 K 服状态广播中的人数与上限（如「当前人数: 2/50」）。"""
+    global _K_ROOM_CAPACITY, _K_ROOM_PLAYERS
+    text = str(message or "")
+    m = re.search(r'(?:当前人数|玩家)\s*[：:]\s*(\d+)\s*/\s*(\d+)', text)
+    if m:
+        current, capacity = int(m.group(1)), int(m.group(2))
+        if 0 <= current <= capacity <= 10000:
+            _K_ROOM_PLAYERS = current
+            _K_ROOM_CAPACITY = capacity
 
 
 def extract_room_id_from_chat(message):
@@ -1831,7 +1864,9 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
     lines.append(f"允许旁观：{_spec_str}")
     lines.append(f"队伍锁定：{_lock_str}")
 
-    maxp = capacity if capacity else 0
+    # K 服的状态广播给出的是实际房间人数上限；115 的 team_count 只是
+    # 地图槽位数，不能拿它覆盖 /50 这类真实上限。普通房仍走原逻辑。
+    maxp = _K_ROOM_CAPACITY or (capacity if capacity else 0)
     if not maxp:
         m = _re.search(r'\((\d+)p\)', info.get('mapname', ''))
         if m:
@@ -1839,6 +1874,10 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
         elif '10p' in info.get('mapname', ''):
             maxp = 10
     count = player_count if player_count is not None else len(players)
+    if _K_ROOM_PLAYERS is not None:
+        # 广播先于 106/115 到达时，探针自己可能尚未计入；以服务端最新
+        # 状态为准，避免同一房间显示 1/50 与 2/50 来回跳。
+        count = _K_ROOM_PLAYERS
     lines.append(f"当前人数：{count}/{maxp if maxp else '?'}")
 
     # 只展示房号类标识(Q57390 / r5132 / u_xxx), 不展示 IP 形式的目标地址
@@ -2379,10 +2418,15 @@ def _handle_chat_packet(payload, tag=""):
     即使本次查询用的就是短号，也照样捕获：用短号查 ≠ 进的就是那个房，
     以服务端推送的为准。
     """
-    global _LAST_ROOM_ID
+    global _LAST_ROOM_ID, _K_ROOM_ID
     sender, message = parse_141(payload)
     if DEBUG_MODE:
         _dprint(f"[聊天] {sender}: {message}" if sender else f"[聊天] {message}")
+    # 先读 K 服状态，即使已经拿到过普通房号也要继续更新人数。
+    _update_k_room_status(message)
+    krid = extract_k_room_id_from_chat(message)
+    if krid:
+        _K_ROOM_ID = krid
     if _LAST_ROOM_ID:
         return
     got = extract_room_id_from_chat(message)
@@ -2466,6 +2510,9 @@ def finish_report(sock, got_106, got_115, target):
     _disp_target = target
     if _LAST_ROOM_ID:
         _disp_target = _LAST_ROOM_ID
+    # K 房必须展示 RKC 分享号，不能被 [z;p10] 或 KC497 内部号覆盖。
+    if _K_ROOM_ID:
+        _disp_target = _K_ROOM_ID
     print(format_room(info, _disp_target, players_names, capacity, players_detail, _MAX_PLAYERS_DISPLAY, player_count=current_players, show_players=SHOW_PLAYERS))
 
     timestamp = int(time.time())
@@ -3033,9 +3080,12 @@ def main():
     if not RID:
         print(HELP_TEXT)
         return
-    # 每次查询前清空上次的 `.id` 结果，避免串到下一次查询
-    global _LAST_ROOM_ID
+    # 每次查询前清空上次的 `.id` / K 服状态，避免串到下一次查询
+    global _LAST_ROOM_ID, _K_ROOM_ID, _K_ROOM_CAPACITY, _K_ROOM_PLAYERS
     _LAST_ROOM_ID = ""
+    _K_ROOM_ID = ""
+    _K_ROOM_CAPACITY = None
+    _K_ROOM_PLAYERS = None
     _start_watchdog()
     if DIRECT_TARGET:
         direct_main()
