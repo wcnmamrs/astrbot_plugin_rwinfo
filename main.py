@@ -179,7 +179,7 @@ CMD_DEDUP_WINDOW = 10
 PROBE_MIN, PROBE_MAX = 1, 99
 
 # 插件版本（菜单与元数据展示用，与 metadata.yaml 的 version 保持一致）
-PLUGIN_VERSION = "2.0.4"
+PLUGIN_VERSION = "2.0.5"
 
 # ---- 协议侧常量（与 room_info.py 保持一致）----
 # 官方 masterserver 列表。插件侧解析中继房真实地址时要用，
@@ -232,7 +232,7 @@ _DOWNLOAD_SOURCES = (
 # 最后一环交给镜像运营者，等于把机器人的执行权外包出去。
 # 校验值随插件一起发布，用途是「恢复与本版本一模一样的探针」——
 # 不是「升级到最新探针」，所以哈希不匹配一律拒收，宁可让用户重装插件。
-ROOM_INFO_SHA256 = "921e2b9eeb75c91a527ecc3849595a18c3f20545111771dd8cc6683d9f43a35c"
+ROOM_INFO_SHA256 = "2de6f952db68c8d1aaa0cebb55375224fbf8a2f416a8db6f64fb759af6d5640c"
 _DOWNLOAD_TIMEOUT = 15
 
 

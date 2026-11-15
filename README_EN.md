@@ -131,7 +131,7 @@ e.g. /铁锈列表 房间中 真人 2
 | `/铁锈列表` (no arguments) | Fresh query, all filters cleared |
 | `/铁锈列表 2` (page only) | Reuse last filters, jump to page 2 |
 | `/铁锈下一页` / `/铁锈上一页` | Reuse last filters when paging |
-| `/铁锈列表 模组` (with filters) | Replace all old filters with this query's |
+| `/铁锈列表 房间中` (with filters) | Replace all old filters with this query's |
 
 Filter state is isolated per "group + user"; **page number never expires**
 and survives a plugin restart via AstrBot KV persistence.
@@ -312,6 +312,7 @@ The bot replies:
 共享控制：否
 允许旁观：是
 队伍锁定：否
+使用模组：原版
 当前人数：2/10
 ID：hlbifz
  玩家列表:

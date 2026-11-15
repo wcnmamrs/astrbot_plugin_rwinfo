@@ -42,6 +42,12 @@ import zlib
 # 插件侧对应常量 ROOM_INFO_API_REQUIRED（见 main.py）。
 ROOM_INFO_API = 4
 
+# 原版（1.15 / 客户端 176）的 106 一定带 121 个内置单位：实测原版房 s74788
+# （Small_Island 2p）custom_unit_count=121，而且这 121 个单位都没有显示名。
+# 模组房会在这个基础上塞进自定义单位（实测 Q29059 是 1277 个）。所以
+# 「数量多于原版」能判定装了模组，「单位显示名」能反推模组名。
+VANILLA_UNIT_COUNT = 121
+
 # 全局安静模式（插件调用时设为 True，屏蔽调试输出）
 # 命令行直接运行时自动关闭静默（否则 --list 等模式看不到最终结果）
 #
@@ -1757,10 +1763,12 @@ def parse_106(data):
         # 初始化 customUnits 相关字段
         # 注: customUnits 块与"是否使用 Mod"无关 —— 发送端 l.a(bg) 是无条件调用
         # (aj.smali:746), 遍历全局单位表 l.d, 任何房间(含原版)都会带 121 个内置单位。
-        # 因此这里只保留「默认单位」展示所需的列表, 不再推测 mod 名。
+        # 但「单位数多于原版」能说明房间装了模组，单位显示名又能反推模组名，
+        # 所以照样把这些收集起来，由 format_room 决定展示成什么样。
         info['custom_unit_count'] = 0
         info['custom_units'] = []
         info['custom_unit_list'] = []  # 自定义单位显示名列表, 索引0对应ID=100
+        info['mod_names'] = []  # 模组名候选: 自定义单位的显示名
         if info.get('has_custom', False):
             # customUnits 块: readUTF("customUnits") + int32块长 + 块内容
             # 块内容结构 (l.a(j) 接收端, custom/l.java 980-1010):
@@ -1788,6 +1796,10 @@ def parse_106(data):
                     i32()  # l.H
                     boolean()
                     dname = nullable_str()  # 显示名 l.t()
+                    if dname:
+                        _dn = dname.strip()
+                        if _dn and _dn != unit_id and _dn not in info['mod_names']:
+                            info['mod_names'].append(_dn)
                     int64()  # checksum J.i
                     int64()
                     if z:
@@ -1835,6 +1847,7 @@ def parse_106(data):
             f"force2team={info.get('force2team')}, roomlock={info.get('roomlock')}, seed={info.get('seed')}"
         )
         _dprint(f"[DEBUG] 自定义单位数量: {info.get('custom_unit_count', 0)}")
+        _dprint(f"[DEBUG] 模组名候选: {info.get('mod_names', [])[:8]}")
         _dprint(
             f"[DEBUG] 自定义单位列表: {info.get('custom_unit_list', [])[:10]}{'...' if len(info.get('custom_unit_list', [])) > 10 else ''}"
         )
@@ -2071,6 +2084,30 @@ def clean_mapname(raw):
     return name or str(raw or "").strip()
 
 
+def _mod_line(info) -> str:
+    """拼「使用模组：…」这一行；说不清时返回空串（宁可不显示，也不猜）。
+
+    两个信号各有边界，所以文案要能看出我们到底看到了什么：
+      · 单位显示名（dname）：模组作者给自定义单位起的名字，通常就含模组名。
+        原版 121 个内置单位都没有显示名，所以这里一旦有值就说明装了模组。
+      · 单位数量：超过原版 121 个说明装了模组，但可能摸不到名字。
+    只改数值、不加单位的模组两个信号都没有，只能显示「原版」—— 这是协议
+    给的信息上限，不是解析失败。
+    """
+    names = [n for n in (info.get("mod_names") or []) if n]
+    count = info.get("custom_unit_count") or 0
+    if names:
+        shown = "、".join(names[:3])
+        more = f" 等 {len(names)} 个" if len(names) > 3 else ""
+        return f"使用模组：{shown}{more}"
+    if count > VANILLA_UNIT_COUNT:
+        return f"使用模组：有（自定义单位 {count} 个，未上报名称）"
+    if count == 0:
+        # 连 customUnits 块都没读到（解析中断/老版本），不表态
+        return ""
+    return "使用模组：原版"
+
+
 def format_room(
     info,
     rid,
@@ -2160,6 +2197,13 @@ def format_room(
     lines.append(f"允许旁观：{_spec_str}")
     lines.append(f"队伍锁定：{_lock_str}")
 
+    # 模组信息只在 106 里有据可查时才显示：原版房间带 121 个内置单位、都没有
+    # 显示名，模组房会多出单位并带显示名。列表第 21 列的 mod 名字段依旧不采信
+    # （房主客户端自己上报，"只改数值不改单位"的模组那一列是空的）。
+    mod_line = _mod_line(info)
+    if mod_line:
+        lines.append(mod_line)
+
     # K 服的状态广播给出的是实际房间人数上限；115 的 team_count 只是
     # 地图槽位数，不能拿它覆盖 /50 这类真实上限。普通房仍走原逻辑。
     maxp = _K_ROOM_CAPACITY or (capacity if capacity else 0)
@@ -2177,10 +2221,6 @@ def format_room(
     lines.append(f"当前人数：{count}/{maxp if maxp else '?'}")
 
     # 只展示房号类标识(Q57390 / r5132 / u_xxx), 不展示 IP 形式的目标地址
-    # 注: 原先这里还展示「使用Mod」, 已移除。列表第 21 列的 mod 名由房主客户端
-    # 自己上报, 装"只改数值不改单位"的 mod 时为空 -> 误判原版; 106 包里
-    # customUnits 块则与 mod 无关(发送端无条件调用, 任何房间都带内置单位)。
-    # 两个来源都不稳定且会误导用户, 故整体取消 mod 解析与展示。
     _rid_s = str(rid or "").strip()
     if _rid_s and not re.fullmatch(r"[\d.]+:\d+", _rid_s):
         lines.append(f"ID：{_rid_s}")
