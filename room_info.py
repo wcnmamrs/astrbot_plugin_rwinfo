@@ -3628,7 +3628,11 @@ def interactive_shell():
                     _dprint("用法：query <房号> [选项]")
                 else:
                     _repl_query(_target, _rest)
-            elif _DIRECT_RE.match(cmd) or re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", cmd):
+            elif _DIRECT_RE.match(cmd) or re.fullmatch(
+                    r"[A-Za-z][A-Za-z0-9_\u4e00-\u9fff]{0,23}", cmd):
+                # 裸房号直查：字母房 r5132 / hytvvi，也支持自定义房号
+                # （中继字母 + 汉字，如 s九一大魔王）。这里只做形态过滤，
+                # 合法性由探针判断。
                 # 裸房号 / 裸地址：最常见的用法，不要求 query 前缀。
                 # 全字母的词（foobar）也可能是房号（hytvvi 就是），所以不能按形态拒绝，
                 # 只能等它查失败了再提示一句「输入 help」。

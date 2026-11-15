@@ -17,6 +17,13 @@ Protocol notes in [PROTOCOL.md](PROTOCOL.md), version history in [CHANGELOG.md](
 - **Auto room-ID detection**, try everything and send only on success, silently drop on failure, no filter wordlist needed
   - Numeric rooms: `o` `q` `r` `s` + digits, e.g. `r5132`, `s1024`, `o9999`, `q7777`
   - Alphabetic rooms: other leading letters + pure letters, e.g. `hytvvi`, `aabcde`, `babc`
+  - Custom rooms: relay letter + CJK characters, e.g. `s九一大魔王`. **Explicit command only** —
+    auto-parsing never picks these up, because the shape can't be enumerated and would
+    misfire on ordinary sentences (letter + Chinese) and burn probe slots.
+  - The two paths are deliberately asymmetric: auto-parsing keeps the fixed regexes above
+    (rather miss than misfire); `/铁锈查房` **force-parses** — a single letter-leading word is
+    queried as-is, and the probe explains the failure (no such room / already started / timeout).
+    If nothing can be parsed the command says so explicitly instead of staying silent.
   - Both forms require the whole token to be ≥ 3 chars; bare digits, mixed forms (`a1b2c3`), URL fragments and `u_` prefixes are rejected
 - **Room list**: `/铁锈列表` paged browser
 - **Look up straight from the list**: `/铁锈查房 <index>` reuses the last list result
@@ -151,6 +158,8 @@ column 7 is the host name).
 | index | Number from the latest `/铁锈列表` result (per current page; mapping valid 10 min, auto-rebuilt silently when stale) | `/铁锈查房 2` |
 | numeric room | `o` `q` `r` `s` + digits, at least 3 chars | `/铁锈查房 r5132` |
 | alphabetic room | Other letters, pure alphabetic, at least 3 chars | `/铁锈查房 hytvvi` |
+| custom room (explicit only) | Relay letter + CJK characters (letters/digits allowed), 3–24 chars | `/铁锈查房 s九一大魔王` |
+| any custom shape (explicit only) | A single word starting with a letter (`rsh`, `abc123`, `s4932XYZ`, …) | `/铁锈查房 rsh` |
 | K room | CNKD share ID `RKC` / `KC` + 2–8 digits, or a full share link | `/铁锈查房 RKC497` |
 | direct | `IP` or `IP:port` (port defaults to 5123) | `/铁锈查房 45.76.27.30:5125` |
 

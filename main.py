@@ -35,10 +35,77 @@ ROOM_INFO_PY = os.path.join(_PLUGIN_DIR, "room_info.py")
 
 QUERY_TIMEOUT = 120
 COOLDOWN = 10
+# 全部已注册指令名（`@filter.command(...)` 的原文，一条一条抄在这里）。
+#
+# 用途：判断「这条消息是不是在使唤插件」。只看首字符靠不住 —— 用户常常先
+# @机器人 再写指令，唤醒词也可能被改成 `>`、`!`，指令还可能写在句子中间。
+# 只要正文里出现下面任何一个名字，就不再从这条消息里自动提取房号。
+#
+# **加指令/改指令名时必须同步这里**：`harness_commands.py` 会拿源码里的
+# `@filter.command(指令名)` 与实际集合做双向比对，漏一个就会报错。
+COMMAND_NAMES = frozenset({
+    "铁锈查房帮助",
+    "铁锈查房菜单",
+    "铁锈帮助",
+    "rwhelp",
+    "铁锈列表",
+    "房间列表",
+    "铁锈房列表",
+    "rwlist",
+    "铁锈下一页",
+    "铁锈上一页",
+    "铁锈查房",
+    "铁锈全局解析",
+    "铁锈模式",
+    "铁锈玩家列表",
+    "铁锈白名",
+    "铁锈黑名",
+    "铁锈重试",
+    "铁锈忽略",
+    "铁锈查房调试",
+    "铁锈查房调试菜单",
+    "铁锈压缩",
+    "铁锈官机探测",
+    "铁锈官机测试",
+    "铁锈探针时解",
+    "铁锈撤回",
+    "铁锈私聊策略",
+    "铁锈私聊开关",
+})
+
+# 一次性编译好，供 `command_in_text()` 用：名字按长度倒序，保证
+# 「铁锈查房调试菜单」先于「铁锈查房」被尝试匹配。
+_COMMAND_ALT = "|".join(re.escape(n) for n in sorted(COMMAND_NAMES, key=len, reverse=True))
+# 边界用「反向排除」而不是白名单：只要名字两侧不是 ASCII 字母/数字/下划线，
+# 就算命中。白名单会漏掉 `／铁锈查房`（全角斜杠）、`【铁锈列表】里的`、
+# `铁锈查房状态怎样`、`()铁锈查房`、`帮我铁锈查房` 这些真实写法；
+# 反向排除法一次覆盖，且不会把 `s5132` 这类房号误认成指令名。
+_COMMAND_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:" + _COMMAND_ALT + r")(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+
+
+def command_in_text(text: str) -> str:
+    """正文里出现的第一条已注册指令名；没有则返回空串。
+
+    宁可多拦：一条消息里出现指令名，说明用户在跟插件说话，
+    这时再从同一句话里抽房号去查，只会多一条重复回复、多占一个探针。
+    """
+    if not text:
+        return ""
+    m = _COMMAND_RE.search(str(text))
+    return m.group(0) if m else ""
+
+
+# 显式指令刚查过的房号，在这几秒内不再被「自动解析」重复查。
+# 指令和自动解析可能同时命中同一条消息（用户先 @机器人 再写指令），
+# 不去重就会：探针白占一次 + 群里两条一模一样的回复。
+CMD_DEDUP_WINDOW = 10
 PROBE_MIN, PROBE_MAX = 1, 99
 
 # 插件版本（菜单与元数据展示用，与 metadata.yaml 的 version 保持一致）
-PLUGIN_VERSION = "2.0.1"
+PLUGIN_VERSION = "2.0.2"
 
 # ---- 协议侧常量（与 room_info.py 保持一致）----
 # 官方 masterserver 列表。插件侧解析中继房真实地址时要用，
@@ -540,6 +607,18 @@ RELAY_ALPHA_RE = re.compile(
     r'(?<![A-Za-z0-9._:/@=\-?#&])(?![oqrsOQRS])[A-Za-z]{3,}'
     r'(?![A-Za-z0-9._:/@=\-?#&])')
 
+# 自定义房号: 中继前缀字母 + 汉字（可夹字母/数字），如 `s九一大魔王`。
+# RW 允许玩家自定义房号，实测 `s九一大魔王` 能连上并返回「游戏已经开始」。
+# 只认「单个 ASCII 字母 + 至少一个汉字 + 至少一个后续字符」：
+#   · 只在显式 `/铁锈查房` 里启用（extract_room_ids(allow_custom=True)），
+#     自动解析一律不认，避免把普通句子里的「字母+汉字」当房号；
+#   · 前缀限制成 1 个字母，`game已经开始了` / `bug已修复` 这类句子不会被当房号；
+#   · 必须有汉字，纯字母仍走上面的 RELAY_ALPHA_RE，不会重复匹配。
+CUSTOM_ROOM_RE = re.compile(
+    r'(?<![A-Za-z0-9._:/@=\-?#&])[A-Za-z][\u4e00-\u9fff]'
+    r'[A-Za-z0-9_\u4e00-\u9fff]{1,23}'
+    r'(?![A-Za-z0-9._:/@=\-?#&])')
+
 # 不识别纯数字房号(如 5232): 首字符为数字的中继主机无 DNS, 无法查询。
 # 不识别混合格式(如 a1b2c3): 不在实测的两种形态内, 排除以防误报。
 # 不识别 IP 直连: 自动触发时不连 IP(无法判断是 Web 还是游戏服务器);
@@ -615,8 +694,29 @@ def _split_relay_run(head: str, digits: str):
     return out
 
 
-def extract_room_ids(text: str):
+def normalize_room_id(rid) -> str:
+    """房号归一化: K 服(RKC/ KC) 转大写并补 R 前缀, 其余转小写。
+
+    中继域名是 `<首字母>.relay.corrodinggames.com`，小写为主；
+    CNKD 的 K 房走官方 r 中继并靠 `RKC497` 这种大写形式被服务器识别。
+    """
+    rid = str(rid or "").strip()
+    if rid.upper().startswith(("RKC", "KC")):
+        rid = rid.upper()
+        if rid.startswith("KC"):
+            rid = "R" + rid
+    else:
+        rid = rid.lower()
+    return rid
+
+
+def extract_room_ids(text: str, allow_custom: bool = False):
     """从文本中提取所有房间号, 按出现顺序去重返回(小写)。
+
+    `allow_custom` 控制是否识别「自定义房号」（中继字母 + 汉字，如 `s九一大魔王`）。
+    **默认关闭**：这种房号形态无法穷举，混进自动解析只会制造误判
+    （普通句子里夹着字母 + 汉字就可能被当成房号，白占探针）。
+    只有显式 `/铁锈查房 <房号>` 这条路径才传 True。
 
     支持的房号形式(按中继区分, 实测):
       0. K 服: RKC/KC + 2~8 位数字（如 RKC497），及 cnkd.fun 分享链接
@@ -624,6 +724,7 @@ def extract_room_ids(text: str):
          如 r5132 / s1024 / o9999 / q7777
       2. 字母房: 非 o/q/r/s 的字母开头 + 纯字母, 整串 >= 3 字符
          如 hytvvi / aabcde / babc / cabcde
+      3. 自定义房号: 中继字母 + 汉字（可夹字母数字），如 s九一大魔王
 
     **兼容用户手滑的连写/重复写法**:
       · r5132r5132  -> r5132（同一房号连写两遍，去重）
@@ -638,13 +739,7 @@ def extract_room_ids(text: str):
     seen = set()
 
     def add(rid):
-        rid = str(rid or "").strip()
-        if rid.upper().startswith(("RKC", "KC")):
-            rid = rid.upper()
-            if rid.startswith("KC"):
-                rid = "R" + rid
-        else:
-            rid = rid.lower()
+        rid = normalize_room_id(rid)
         if rid and rid not in seen:
             seen.add(rid)
             ids.append(rid)
@@ -686,6 +781,13 @@ def extract_room_ids(text: str):
     # 2) 字母房(非 oqrs 开头的纯字母)
     for m in RELAY_ALPHA_RE.finditer(rest):
         add(m.group(0))
+
+    # 3) 自定义房号: 单字母前缀 + 汉字，如 s九一大魔王
+    #    只在显式查房时启用：玩家可以自定义任意房号，形态无法穷举，
+    #    放进自动解析只会误判（字母+汉字的普通句子），白白占用探针。
+    if allow_custom:
+        for m in CUSTOM_ROOM_RE.finditer(rest):
+            add(m.group(0))
 
     return ids
 
@@ -1038,6 +1140,8 @@ class RWInfoPlugin(Star):
         # 冷却提示只认这个 —— 英文单词 game/hello 查不到信息，
         # 永远不会被记录，因此永远不会触发提示。
         self._room_ok = {}
+        # 刚被显式指令查过的房号: {"会话|房号": ts}，用途见 CMD_DEDUP_WINDOW
+        self._recent_cmd = {}
         self._last_cleanup = None
         # 本机 QQ 号（合并转发消息需要 uin，取不到则用占位值）
         self._self_qq = ""
@@ -4635,7 +4739,7 @@ async for _r in _ag:
             "群聊/私聊发房号自动查房，无需指令",
             "支持 o/q/r/s+数字、纯字母、RKC/KC+数字（K 服）",
             "官方机器人需群主开启「允许获取群消息」与「自动回复」",
-            "别名：/铁锈查房菜单　/铁锈帮助　/rwhelp",
+            "别名：/铁锈查房菜单　/铁锈帮助　/铁锈查房帮助　/rwhelp",
         ]
 
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -4649,9 +4753,15 @@ async for _r in _ag:
         """
         text = ""
         try:
-            text = (event.message_str or "").strip()
+            # 与 on_all_message 同源：message_str 只是适配器渲染结果，
+            # 合并转发/卡片消息上会丢正文，两个 handler 用不同文本源
+            # 会出现「自动路径不认、帮助兜底也不认」的静默。
+            text = extract_text_from_event(event, event.message_str or "").strip()
         except Exception:
             return
+        # 同样要剥 @提及：`@机器人 /铁锈查房X`（打错字）在 AstrBot 里会落到这里，
+        # 不剥的话前缀判不出来，用户连帮助兜底都看不到。
+        text = self._strip_leading_mentions(text).strip()
         if not text:
             return
         # 剥掉唤醒词：命中配置的前缀 或 `/` 都算
@@ -4670,21 +4780,9 @@ async for _r in _ag:
         # 且过期插件不该在无关群里刷屏。
         if self._session_blocked(event):
             return
-        known = {
-            "铁锈查房帮助", "铁锈查房菜单", "铁锈帮助", "rwhelp",
-            "铁锈列表", "房间列表", "铁锈房列表", "rwlist",
-            "铁锈下一页", "铁锈上一页", "铁锈查房",
-            "铁锈全局解析", "铁锈模式", "铁锈白名", "铁锈黑名",
-            "铁锈私聊策略", "铁锈私聊开关", "铁锈玩家列表",
-            "铁锈重试", "铁锈撤回", "铁锈查房调试",
-            "铁锈查房调试菜单",
-            "铁锈探针时解",
-            "铁锈官机探测",
-            "铁锈官机测试",
-            "铁锈压缩",
-            "铁锈忽略",
-        }
-        if cmd in known:
+        # 直接引用 COMMAND_NAMES，不再手抄一份：两份清单迟早漂移，
+        # 而漂移的后果是「已知指令被当成未知指令，回一屏帮助」。
+        if cmd in COMMAND_NAMES:
             return
         _ag = self._send_text(event, 
             f"未知指令：/{cmd}\n\n" + "\n".join(self._help_text_lines())
@@ -5546,7 +5644,8 @@ async for _r in _ag:
         USAGE = (
             "用法：/铁锈查房 <序号|房号>\n"
             "序号 - 先发 /铁锈列表，再填列表里的序号（如 /铁锈查房 2）\n"
-            "房号 - r5132 / s1024 / Q12345 / hytvvi / RKC497"
+            "房号 - r5132 / s1024 / Q12345 / hytvvi / RKC497 / s九一大魔王\n"
+            "      房号形态不设限：以字母开头的单个词都会原样拿去查，查不到会说明原因"
         )
         if not arg:
             # 不带参数只给用法
@@ -5558,6 +5657,7 @@ async for _r in _ag:
         # ---- 解析目标 ----
         target = ""
         desc = ""
+        _extra_rids = []   # 同一条指令里被忽略的其它房号（见下方说明）
         if IP_QUERY_RE.match(arg):
             target = arg
             desc = arg
@@ -5638,16 +5738,46 @@ async for _r in _ag:
                 return
             desc = f"第 {n} 条 {label}".strip()
         else:
-            rids = extract_room_ids(arg)
+            # 显式查房：强制解析。
+            # 玩家能自定义房号，形态穷举不完（r5132 / hytvvi / RKC497 / s九一大魔王 /
+            # rsh / abc123 …），所以自动解析只认那几条固定正则（宁可漏，不可误判），
+            # **这个指令**则反过来：正则认不出就把整个参数当房号原样去查，
+            # 查不到由探针回错误（房间不存在 / 无响应 / 已开局…），不再静默。
+            # 强制解析：整个参数就是房号（去掉引号/书名号）时直接用它，
+            # 不交给正则拆 —— 否则 `s4932XYZ` 会被拆出一个不相干的 `xyz`。
+            _raw = arg.strip().strip('"\'“”‘’「」『』()（）【】')
+            # 「一个词」的判据不限定字符集：房号是玩家随便起的，汉字、假名、
+            # 连字符、下划线都可能出现，形态穷举不完。只排除会改变语义的分隔符
+            # （空白、逗号顿号分号、冒号斜杠 @ #），那些交给正则去拆。
+            _single = (bool(_raw)
+                       and bool(re.fullmatch(
+                           r"[A-Za-z][^\s,，、;；:/@#]{0,31}", _raw)))
+            if _single:
+                rids = [normalize_room_id(_raw)]
+            else:
+                rids = extract_room_ids(arg, allow_custom=True)
             if not rids:
-                _ag = self._send_text(event, 
-                    f"无法识别的房号：{arg}\n\n" + USAGE
+                _ag = self._send_text(event,
+                    f"无法识别的房号：{arg}\n\n"
+                    "房号必须以中继字母开头（如 r5132 / hytvvi / RKC497 / s九一大魔王），"
+                    "不能带空格。\n\n" + USAGE
                 )
                 async for _r in _ag:
                     yield _r
                 return
             target = rids[0]
             desc = target
+            # 一句话里写了多个房号：只查第一个（一次指令一条结果）。
+            # 但必须把「其余没查」讲出来 —— 指令消息现在一律不参与自动
+            # 解析，被丢掉的房号不会有人捡，静默丢弃等于吞掉用户请求。
+            _extra_rids = [r for r in rids[1:] if r != target]
+
+        # 记账：同一条消息若还命中了「自动解析」路径，靠这条时间戳把它挡掉
+        # （避免探针被白占一次、群里出现两条一样的回复）
+        try:
+            self._recent_cmd[f"{self._dedup_key(event)}|{target}"] = time.time()
+        except Exception as e:
+            self.logger.debug(f"[查房] 记录指令查询时间失败(忽略): {e}")
 
         # ---- 分配探针并查询 ----
         idx = self._acquire_probe()
@@ -5698,6 +5828,11 @@ async for _r in _ag:
             self._release_probe(idx)
 
         # ---- 回传(显式查房不静默, 必须给出原因) ----
+        _extra_note = ""
+        if _extra_rids:
+            _extra_note = ("\n\n（这条指令里还有 " + "、".join(_extra_rids)
+                           + "，本次只查了 " + target + "；要查请单独发一条）")
+            result = (result or "") + _extra_note if is_room_info(result) else result
         if is_room_info(result):
             # 记住「这个会话上次查的是哪个房」，供刷新/复述使用。
             # 与翻页状态同源（内存 + KV），重启后仍然有效。
@@ -5712,11 +5847,12 @@ async for _r in _ag:
         if not result:
             _ag = self._send_text(event, 
                 f"{desc} 查房无响应（房间不存在、中继繁忙或地址不可达）"
+                + _extra_note
             )
             async for _r in _ag:
                 yield _r
         elif is_error_info(result):
-            _ag = self._send_text(event, translate_error(result))
+            _ag = self._send_text(event, translate_error(result) + _extra_note)
             async for _r in _ag:
                 yield _r
         else:
@@ -7530,6 +7666,26 @@ async for _r in _ag:
             self._save_config()
         return "\n".join(results)
 
+    @staticmethod
+    def _strip_leading_mentions(text: str) -> str:
+        """去掉正文开头的 @提及，只留真正的用户输入。
+
+        QQ 里最常见的用法是「先 @机器人，再写指令」，适配器给回来的正文是
+        `@不知道~ /铁锈查房 s5132`；官方适配器则可能是 `<@123>`，
+        aiocqhttp 的裸文本里还会出现 `[CQ:at,qq=123]`。
+        这些前缀不剥掉，后面的「这条是不是指令消息」就判不出来。
+        """
+        s = str(text or "").lstrip()
+        while True:
+            before = s
+            s = s.lstrip()
+            s = re.sub(r"^\[CQ:at,[^\]]*\]\s*", "", s)
+            s = re.sub(r"^<@[!&]?[^>]*>\s*", "", s)
+            s = re.sub(r"^@\S+[\s\u3000]+", "", s)
+            if s == before:
+                break
+        return s
+
     # ---- 消息监听 ----
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_all_message(self, event: AstrMessageEvent):
@@ -7540,6 +7696,11 @@ async for _r in _ag:
             # 对方开了消息压缩时正文被包进「聊天记录」卡片，甚至会整个丢失。
             # 这里会同时尝试 message_str 和原始消息段，取信息量最大的那份。
             text = extract_text_from_event(event, event.message_str or "")
+            if not text.strip():
+                return
+            # 先剥掉开头的 @提及：`@机器人 /铁锈查房 s5132` 以前判不出是指令，
+            # 于是显式指令查一次、自动解析又查一次，群里出现两条一样的回复。
+            text = self._strip_leading_mentions(text)
             if not text.strip():
                 return
             # 指令消息不参与自动查房：按配置的唤醒词判断，不能用硬编码 "/"。
@@ -7553,6 +7714,15 @@ async for _r in _ag:
             if _pfx and text.strip().startswith(_pfx):
                 return
             if text.strip().startswith("/"):
+                return
+            # 兜底：正文**任何位置**出现已注册的指令名，都算「在使唤插件」，
+            # 一律不从这句话里抽房号。上面两条只覆盖「以指令开头」的写法，
+            # 而实际群里会出现 `@机器人 /铁锈查房 s5132`、`帮我 /铁锈列表 一下`、
+            # `。铁锈查房 r5132` 这些形态 —— 以前每一种都会多查一次房。
+            _cmd = command_in_text(text)
+            if _cmd:
+                self.logger.debug(
+                    f"[自动查房] 正文含指令「{_cmd}」，跳过房号解析")
                 return
 
             # 群聊按 #群号, 私聊按 @用户ID, 各自进黑/白名单判定
@@ -7640,6 +7810,9 @@ async for _r in _ag:
                 for k in [k for k, ts in self._room_ok.items()
                           if now - ts > max(cooldown * 2, 60)]:
                     del self._room_ok[k]
+                for k in [k for k, ts in self._recent_cmd.items()
+                          if now - ts > CMD_DEDUP_WINDOW * 3]:
+                    del self._recent_cmd[k]
                 self._last_cleanup = now
             to_query = []
             try:
@@ -7653,6 +7826,13 @@ async for _r in _ag:
             cooling = []          # 被冷却挡下、且**确实查到过房间**的房号（用于提示）
             for rid in rids:
                 ck = f"{sess}|{rid}"
+                # 兜底去重：同一条消息若已被显式指令查过，这里绝不再查一遍。
+                # 剥 @提及 已经堵住了主因，但唤醒词/前缀格式千奇百怪，
+                # 这一层不依赖文本解析，按「会话+房号」直接记账判定。
+                if now - self._recent_cmd.get(ck, 0) < CMD_DEDUP_WINDOW:
+                    self.logger.debug(
+                        f"房号 {rid} 刚被指令查询过, 跳过自动查房")
+                    continue
                 last = self.room_cooldown.get(ck, 0)
                 hit = False
                 if now - last < cooldown:
