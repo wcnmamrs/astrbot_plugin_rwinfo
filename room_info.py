@@ -11,6 +11,7 @@ room_info.py - 铁锈战争房间信息查询工具（一体化, 1.15）
   python3 room_info.py R5132 --debug        # 开启调试输出
   python3 room_info.py R5132 --show-players # 显示玩家列表
 """
+
 import gzip
 import hashlib
 import io
@@ -27,7 +28,6 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
-import random
 import zlib
 
 # ================================================================ 接口版本
@@ -40,7 +40,7 @@ import zlib
 # 纯内部修复（解析优化、bug 修复）不必递增，插件不用因此重新下载。
 #
 # 插件侧对应常量 ROOM_INFO_API_REQUIRED（见 main.py）。
-ROOM_INFO_API = 3
+ROOM_INFO_API = 4
 
 # 全局安静模式（插件调用时设为 True，屏蔽调试输出）
 # 命令行直接运行时自动关闭静默（否则 --list 等模式看不到最终结果）
@@ -68,10 +68,10 @@ MASTERSERVERS = [
     "http://gs4.corrodinggames.net/masterserver/1.4",
 ]
 
-CREDITS_MAP = {0: 4000, 1: 0, 2: 1000, 3: 2000, 4: 5000,
-               5: 10000, 6: 50000, 7: 100000, 8: 200000}
+CREDITS_MAP = {0: 4000, 1: 0, 2: 1000, 3: 2000, 4: 5000, 5: 10000, 6: 50000, 7: 100000, 8: 200000}
 
 # ================================================================ 二进制协议工具
+
 
 def _decode_lenient(b: bytes) -> str:
     """容错解码: 处理游戏端把 UTF-16 代理对误当 UTF-8 发送的情况.
@@ -90,18 +90,29 @@ def _decode_lenient(b: bytes) -> str:
             i += 1
             continue
         # 2 字节 UTF-8
-        if 0xC2 <= c <= 0xDF and i + 1 < n and 0x80 <= b[i+1] <= 0xBF:
-            cp = ((c & 0x1F) << 6) | (b[i+1] & 0x3F)
+        if 0xC2 <= c <= 0xDF and i + 1 < n and 0x80 <= b[i + 1] <= 0xBF:
+            cp = ((c & 0x1F) << 6) | (b[i + 1] & 0x3F)
             out.append(chr(cp))
             i += 2
             continue
         # 3 字节 UTF-8
-        if 0xE0 <= c <= 0xEF and i + 2 < n and 0x80 <= b[i+1] <= 0xBF and 0x80 <= b[i+2] <= 0xBF:
-            cp = ((c & 0x0F) << 12) | ((b[i+1] & 0x3F) << 6) | (b[i+2] & 0x3F)
+        if (
+            0xE0 <= c <= 0xEF
+            and i + 2 < n
+            and 0x80 <= b[i + 1] <= 0xBF
+            and 0x80 <= b[i + 2] <= 0xBF
+        ):
+            cp = ((c & 0x0F) << 12) | ((b[i + 1] & 0x3F) << 6) | (b[i + 2] & 0x3F)
             # 代理区 (U+D800-DFFF): 非法单字符, 视为代理对的一部分
-            if 0xD800 <= cp <= 0xDBFF and i + 3 < n and 0xED <= b[i+3] <= 0xED and 0x80 <= b[i+4] <= 0xBF and 0x80 <= b[i+5] <= 0xBF:
+            if (
+                0xD800 <= cp <= 0xDBFF
+                and i + 3 < n
+                and 0xED <= b[i + 3] <= 0xED
+                and 0x80 <= b[i + 4] <= 0xBF
+                and 0x80 <= b[i + 5] <= 0xBF
+            ):
                 # 完整代理对: 高代理 + 低代理
-                lo_cp = ((b[i+3] & 0x0F) << 12) | ((b[i+4] & 0x3F) << 6) | (b[i+5] & 0x3F)
+                lo_cp = ((b[i + 3] & 0x0F) << 12) | ((b[i + 4] & 0x3F) << 6) | (b[i + 5] & 0x3F)
                 if 0xDC00 <= lo_cp <= 0xDFFF:
                     # 组合成 Unicode 码点
                     combined = 0x10000 + ((cp - 0xD800) << 10) + (lo_cp - 0xDC00)
@@ -118,8 +129,19 @@ def _decode_lenient(b: bytes) -> str:
             i += 3
             continue
         # 4 字节 UTF-8 (正常 Emoji)
-        if 0xF0 <= c <= 0xF4 and i + 3 < n and 0x80 <= b[i+1] <= 0xBF and 0x80 <= b[i+2] <= 0xBF and 0x80 <= b[i+3] <= 0xBF:
-            cp = ((c & 0x07) << 18) | ((b[i+1] & 0x3F) << 12) | ((b[i+2] & 0x3F) << 6) | (b[i+3] & 0x3F)
+        if (
+            0xF0 <= c <= 0xF4
+            and i + 3 < n
+            and 0x80 <= b[i + 1] <= 0xBF
+            and 0x80 <= b[i + 2] <= 0xBF
+            and 0x80 <= b[i + 3] <= 0xBF
+        ):
+            cp = (
+                ((c & 0x07) << 18)
+                | ((b[i + 1] & 0x3F) << 12)
+                | ((b[i + 2] & 0x3F) << 6)
+                | (b[i + 3] & 0x3F)
+            )
             out.append(chr(cp))
             i += 4
             continue
@@ -242,11 +264,12 @@ def read_frame(sock: socket.socket, timeout: float = 15.0):
     payload = _recv_exact(sock, length) if length > 0 else b""
     return mtype, payload
 
+
 # ================================================================ 官方哈希/挑战算法
+
 
 def sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest().upper()
-
 
 
 def f_c(s: str) -> str:
@@ -263,7 +286,7 @@ def java_int32(v: int) -> int:
 
 
 def java_double_str(v: float) -> str:
-    if v != v:
+    if v != v:  # noqa: PLR0124  自比较，判 NaN
         return "NaN"
     if v == float("inf"):
         return "Infinity"
@@ -304,23 +327,40 @@ def java_double_str(v: float) -> str:
 
 def challenge_e(i: int) -> str:
     d = CREDITS_MAP
-    return "".join([
-        f"c:{i}", f"m:{java_int32((i * 87) + 24)}",
-        f"0:{java_int32(d[0] * 11 * i)}", f"1:{java_int32((d[1] * 12) + i)}",
-        f"2:{java_int32(d[2] * 13 * i)}", f"3:{java_int32((d[3] * 14) + i)}",
-        f"4:{java_int32(d[4] * 15 * i)}", f"5:{java_int32((d[5] * 16) + i)}",
-        f"6:{java_int32(d[6] * 17 * i)}", f"7:{java_int32(d[7] * 18 * i)}",
-        f"8:{java_int32(d[8] * 19 * i)}", f"t1:{java_double_str(4000.0 * 11.0 * i)}",
-        f"d:{java_int32(i * 5)}",
-    ])
+    return "".join(
+        [
+            f"c:{i}",
+            f"m:{java_int32((i * 87) + 24)}",
+            f"0:{java_int32(d[0] * 11 * i)}",
+            f"1:{java_int32((d[1] * 12) + i)}",
+            f"2:{java_int32(d[2] * 13 * i)}",
+            f"3:{java_int32((d[3] * 14) + i)}",
+            f"4:{java_int32(d[4] * 15 * i)}",
+            f"5:{java_int32((d[5] * 16) + i)}",
+            f"6:{java_int32(d[6] * 17 * i)}",
+            f"7:{java_int32(d[7] * 18 * i)}",
+            f"8:{java_int32(d[8] * 19 * i)}",
+            f"t1:{java_double_str(4000.0 * 11.0 * i)}",
+            f"d:{java_int32(i * 5)}",
+        ]
+    )
 
 
 # ================================================================ 协议客户端
 
+
 class RWProbe:
-    def __init__(self, host, port=DEFAULT_PORT, name=DEFAULT_NAME,
-                 unit_checksum=0, password=None, client_version=DEFAULT_VER,
-                 verbose=False, magic=None):
+    def __init__(
+        self,
+        host,
+        port=DEFAULT_PORT,
+        name=DEFAULT_NAME,
+        unit_checksum=0,
+        password=None,
+        client_version=DEFAULT_VER,
+        verbose=False,
+        magic=None,
+    ):
         self.host = host
         self.port = port
         self.name = name
@@ -349,7 +389,6 @@ class RWProbe:
     def log(self, *a):
         if self.verbose:
             _dprint("[probe]", *a)
-
 
     def _wait_161(self):
         """等待 161 握手。
@@ -387,7 +426,9 @@ class RWProbe:
             elif mtype == 151:
                 self._handle_relay_151(payload)
             elif mtype == 108:
-                r = NetWriter(); r.int64(NetReader(payload).int64()); r.byte(1)
+                r = NetWriter()
+                r.int64(NetReader(payload).int64())
+                r.byte(1)
                 self.sock.sendall(pack_frame(109, r.output()))
             elif mtype == 150:
                 raise RuntimeError("kicked: " + NetReader(payload).utf())
@@ -433,8 +474,10 @@ class RWProbe:
                 v10 = r.int32()
 
             if DEBUG_MODE:
-                _dprint(f"151 relay: v7={v7} v8={v8} bf_i={bf_i} bf_j={bf_j} "
-                      f"s1={s1!r} s2={s2!r} v10={v10}")
+                _dprint(
+                    f"151 relay: v7={v7} v8={v8} bf_i={bf_i} bf_j={bf_j} "
+                    f"s1={s1!r} s2={s2!r} v10={v10}"
+                )
 
             v0 = ""
             if v8 == 0:
@@ -460,14 +503,17 @@ class RWProbe:
                             if f_c(prefix + str(i)) == s1:
                                 v0 = str(i)
                                 if DEBUG_MODE:
-                                    _dprint(f"[151] POW solved: i={i} ({time.time()-t_pow:.1f}s)")
+                                    _dprint(f"[151] POW solved: i={i} ({time.time() - t_pow:.1f}s)")
                                 break
                             if time.time() - t_pow > POW_TIMEOUT:
                                 if DEBUG_MODE:
                                     _dprint(f"[151] POW超时({POW_TIMEOUT}s), 发-1")
                                 break
                             if i > 0 and i % 2_000_000 == 0 and DEBUG_MODE:
-                                _dprint(f"[151] POW进度: {i}/{v10} ({time.time()-t_pow:.0f}s)", flush=True)
+                                _dprint(
+                                    f"[151] POW进度: {i}/{v10} ({time.time() - t_pow:.0f}s)",
+                                    flush=True,
+                                )
             else:
                 v0 = "max"
 
@@ -485,8 +531,9 @@ class RWProbe:
             # 否则父进程只能看到「未收到房间信息」这种没法排查的结论。
             self.log(f"151 parse err: {e}")
             try:
-                _dprint(f"[151] 挑战应答失败（{type(e).__name__}）：{e}",
-                      file=sys.stderr, flush=True)
+                _dprint(
+                    f"[151] 挑战应答失败（{type(e).__name__}）：{e}", file=sys.stderr, flush=True
+                )
             except Exception:
                 pass
 
@@ -515,7 +562,6 @@ class RWProbe:
         self.challenge_y = f.get("challenge_y")
         self.extra = f.get("extra")
 
-
     def _handle_178(self, payload):
         """解析 178 PACKET_RECONNECT_TO。
         客户端 ae.smali sswitch_72f 结构: byte / int32 / boolean / int32(N) / N x utf 地址
@@ -527,7 +573,7 @@ class RWProbe:
             b0 = r.byte()
             i1 = r.int32()
             b2 = r.boolean()
-            n = r.int32()          # 服务器数量
+            n = r.int32()  # 服务器数量
             addrs = []
             for _ in range(max(0, n)):
                 if r.remaining() < 2:
@@ -545,7 +591,6 @@ class RWProbe:
                 addr = ""
         return addr
 
-
     def close(self):
         if self.sock:
             try:
@@ -553,6 +598,7 @@ class RWProbe:
             except OSError:
                 pass
             self.sock = None
+
 
 # ================================================================ 106/115/141 解析
 
@@ -589,6 +635,8 @@ HELP_TEXT = """\
   --max-players <N>     玩家列表最多显示人数 (默认 10)
   --promote <文本>      进房后发一条消息
   --promote-cooldown <秒>  同一房间推广冷却 (默认 180)
+  --state-dir <目录>    运行时数据目录(统计/推广冷却), 由插件传入
+  --bin-dir <目录>      bin 缓存目录(默认 <state-dir>/bin_cache)
   --api-version         打印接口版本号 (供插件判断是否兼容)
   --debug               调试输出
 
@@ -613,13 +661,21 @@ HELP_TEXT = """\
 
 
 def _find_arg(name, default=None):
-    if name in sys.argv:
-        try:
-            return sys.argv[sys.argv.index(name) + 1]
-        except IndexError:
-            return default
-    return default
+    """取 `--name value`（或 `--name=value`）形式的值。
 
+    值缺失时后面紧跟的往往是另一个选项（`--state-dir --promote x`），
+    把选项名当值的后果很脏：会在当前目录建出一个叫 `--promote` 的文件夹。
+    所以以 `-` 开头的「值」一律视为缺失。
+    """
+    for a in sys.argv:
+        if a.startswith(name + "="):
+            return a[len(name) + 1 :] or default
+    if name in sys.argv:
+        i = sys.argv.index(name) + 1
+        if i < len(sys.argv) and not sys.argv[i].startswith("-"):
+            return sys.argv[i]
+        return default
+    return default
 
 
 # 收集非选项参数 (第一个非 -- 开头的即房间ID/目标)
@@ -628,8 +684,19 @@ _MODE_SWITCHES = ("--list", "--list-json", "--cleanup-bins")
 # 交互模式开关。`-i` 不以 `--` 开头，必须排除，否则会被当成房号。
 _INTERACTIVE_FLAGS = ("-i", "--interactive", "--shell")
 # 带值选项：值本身不能被当成房号（`--name abc r5132` 里的 abc）
-_VALUE_OPTS = ("--name", "--max-players", "--promote", "--promote-cooldown",
-               "--max-age", "--search", "--status", "--source", "--full")
+_VALUE_OPTS = (
+    "--name",
+    "--max-players",
+    "--promote",
+    "--promote-cooldown",
+    "--max-age",
+    "--search",
+    "--status",
+    "--source",
+    "--full",
+    "--state-dir",
+    "--bin-dir",
+)
 
 
 def _pick_positionals(argv):
@@ -638,7 +705,7 @@ def _pick_positionals(argv):
     while i < len(argv):
         a = argv[i]
         if a in _VALUE_OPTS:
-            i += 2          # 连值一起跳过
+            i += 2  # 连值一起跳过
             continue
         if a in _MODE_SWITCHES or not a.startswith("-"):
             out.append(a)
@@ -649,10 +716,8 @@ def _pick_positionals(argv):
 _positional = _pick_positionals(sys.argv[1:])
 _arg1 = _positional[0] if _positional else None
 # 终端里不带参数 → 直接进交互模式；管道/脚本调用仍打印帮助，避免破坏自动化。
-_AUTO_INTERACTIVE = (len(sys.argv) <= 1
-                     and getattr(sys.stdin, "isatty", lambda: False)())
-_INTERACTIVE = (any(a in _INTERACTIVE_FLAGS for a in sys.argv[1:])
-                or _AUTO_INTERACTIVE)
+_AUTO_INTERACTIVE = len(sys.argv) <= 1 and getattr(sys.stdin, "isatty", lambda: False)()
+_INTERACTIVE = any(a in _INTERACTIVE_FLAGS for a in sys.argv[1:]) or _AUTO_INTERACTIVE
 
 # 帮助: 仅命令行直接运行时生效 (import 不触发)
 if __name__ == "__main__":
@@ -671,8 +736,9 @@ if __name__ == "__main__":
     if _INTERACTIVE and _oneshot:
         # `-i --list-json` / `-i r5132`：交互外壳转交不了一次性任务，
         # 静默丢弃会让人以为卡住，所以按一次性模式跑完并说明原因。
-        _dprint("[提示] -i 与一次性参数互斥，本次按一次性模式执行；"
-                "要交互请去掉 " + " ".join(_oneshot))
+        _dprint(
+            "[提示] -i 与一次性参数互斥，本次按一次性模式执行；要交互请去掉 " + " ".join(_oneshot)
+        )
         _INTERACTIVE = False
     if _INTERACTIVE:
         # 交互模式要等文件末尾所有函数定义完才能启动，这里只放行。
@@ -712,9 +778,64 @@ if "--promote-cooldown" in sys.argv:
         PROMOTE_COOLDOWN = max(0.0, float(_find_arg("--promote-cooldown")))
     except (IndexError, ValueError, TypeError):
         pass
-# 冷却状态文件。用脚本自身目录（此时 BIN_DIR 还没定义，不能提前引用）。
-PROMOTE_STATE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), ".promote_state.json")
+
+
+# 冷却状态文件的位置。
+# 规范要求插件不把运行时数据写进插件目录（更新会整体覆盖），所以这里
+# 优先用插件传进来的 `--state-dir`（= data/plugin_data/<插件名>/），其次
+# 环境变量 RWINFO_PLUGIN_DATA，最后才退回用户家目录 —— 命令行单独跑探针
+# 时也不会往仓库里拉屎。
+def _dir_writable(path: str) -> bool:
+    """真写一个探测文件判断目录可写。
+
+    不能用 `os.makedirs(exist_ok=True)` 判断：目录已存在时它什么都不做、
+    权限不足也不抛，于是「存在但不可写」会被当成可写，冷却静默丢失。
+    """
+    probe = os.path.join(path, f".rwinfo_probe_{os.getpid()}")
+    try:
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def _promote_state_path(create: bool = False) -> str:
+    """算冷却状态文件路径。
+
+    `create=False` 只算路径、不建目录：`--list-json` / `--cleanup-bins`
+    这类根本用不到推广状态的模式，不该在用户家目录里留个空目录。
+
+    目录不可写时**必须留一句话**（走 stderr，stdout 是给插件的契约）：
+    静默换落点会让冷却记录分裂，用户之间看到"每个房间第一次都多发一条"却查不出原因。
+    """
+    cand = _find_arg("--state-dir") or os.environ.get("RWINFO_PLUGIN_DATA", "").strip()
+    cand = (cand or "").strip()
+    if not cand:
+        cand = os.path.join(os.path.expanduser("~"), ".rwinfo")
+    if create:
+        ok = True
+        try:
+            os.makedirs(cand, exist_ok=True)
+        except OSError as e:
+            ok = False
+            err = str(e)
+        if ok and not _dir_writable(cand):
+            ok = False
+            err = "目录不可写"
+        if not ok:
+            alt = os.path.join(os.path.expanduser("~"), ".rwinfo")
+            sys.stderr.write(f"[提示] 状态目录不可用（{cand}: {err}），改用 {alt}\n")
+            try:
+                os.makedirs(alt, exist_ok=True)
+            except OSError:
+                pass
+            cand = alt
+    return os.path.join(cand, "promote_state.json")
+
+
+PROMOTE_STATE = _promote_state_path()
 
 # 玩家列表默认显示
 SHOW_PLAYERS = "--show-players" in sys.argv
@@ -724,17 +845,16 @@ LIST_JSON = _arg1 == "--list-json"
 # 独立清理 bin 缓存: 供插件定时任务调用, 也可手动执行
 CLEANUP_MODE = _arg1 == "--cleanup-bins"
 # 列表筛选开关
-LIST_ALL = "--all" in sys.argv              # official 源保留全部条目(调试用)
-LIST_JOINABLE = "--joinable" in sys.argv    # 只保留可加入(battleroom)
+LIST_ALL = "--all" in sys.argv  # official 源保留全部条目(调试用)
+LIST_JOINABLE = "--joinable" in sys.argv  # 只保留可加入(battleroom)
 LIST_KEYWORD = _find_arg("--search") or ""  # 按 房主/地图/描述 搜索
-LIST_STATUS = _find_arg("--status") or ""   # 按 status 过滤
+LIST_STATUS = _find_arg("--status") or ""  # 按 status 过滤
 LIST_SOURCE = _find_arg("--source") or "all"  # all / qroom / official
-LIST_FULL = _find_arg("--full") or ""       # hide / only
+LIST_FULL = _find_arg("--full") or ""  # hide / only
 # 直连目标：IP[:端口] 或 IP[:端口]/房间UUID
 # 后者是「从房间列表进入」的形式：列表里的 addr 是分配中心地址，
 # 必须带 UUID 才能路由到目标房间。
-_DIRECT_RE = re.compile(
-    r"^\d+\.\d+\.\d+\.\d+(?::\d+)?(?:/[A-Za-z0-9_\-]+)?$")
+_DIRECT_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+(?::\d+)?(?:/[A-Za-z0-9_\-]+)?$")
 DIRECT_TARGET = _arg1 if _DIRECT_RE.match(_arg1) else None
 RID = _arg1 if DIRECT_TARGET is None else _arg1
 NAME = _NAME_ARG or "ABAB探针"
@@ -742,18 +862,26 @@ NID = str(uuid.uuid4())
 
 # ================================================================ 房间列表
 
+
 def connect_and_161(host, port, rid=None):
     s = socket.create_connection((host, port), timeout=8)
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     w = NetWriter()
     w.utf(PROTO_MAGIC)
     if rid:
-        w.int32(4); w.int32(CLIENT_VER); w.int32(1)
+        w.int32(4)
+        w.int32(CLIENT_VER)
+        w.int32(1)
         w.nullable_str(rid)
-        w.utf(NAME); w.utf(NID); w.utf('')
+        w.utf(NAME)
+        w.utf(NID)
+        w.utf('')
     else:
-        w.int32(2); w.int32(CLIENT_VER); w.int32(2)
-        w.utf(NAME); w.utf('en')
+        w.int32(2)
+        w.int32(CLIENT_VER)
+        w.int32(2)
+        w.utf(NAME)
+        w.utf('en')
     s.sendall(pack_frame(160, w.output()))
     probe = RWProbe('x', 0, NAME, unit_checksum=CK or 0, client_version=CLIENT_VER, verbose=False)
     probe.sock = s
@@ -763,14 +891,17 @@ def connect_and_161(host, port, rid=None):
 
 def send_110(sock, sid, ck, conn, chal=None):
     """注册包 110。字段顺序严格对齐客户端 ae.f(c) / sendRegisterConnection:
-       magic / regVer=5 / clientVer / verAdjust / name / password(nullable) /
-       networkClientId / 身份哈希 / unitsChecksum / challenge_e(conn) / hash_e_int(chal)
+    magic / regVer=5 / clientVer / verAdjust / name / password(nullable) /
+    networkClientId / 身份哈希 / unitsChecksum / challenge_e(conn) / hash_e_int(chal)
     """
     w = NetWriter()
     w.utf(PROTO_MAGIC)
-    w.int32(REG_VER); w.int32(CLIENT_VER); w.int32(CLIENT_VER)
-    w.utf(NAME); w.nullable_str(None)
-    w.utf(NID)                               # network_client_id (此前误发 PROTO_MAGIC)
+    w.int32(REG_VER)
+    w.int32(CLIENT_VER)
+    w.int32(CLIENT_VER)
+    w.utf(NAME)
+    w.nullable_str(None)
+    w.utf(NID)  # network_client_id (此前误发 PROTO_MAGIC)
     w.utf(sha256_hex(NID + (sid or '')))
     w.int32(ck)
     w.utf(challenge_e(conn or 0))
@@ -851,12 +982,15 @@ def _load_promote_state():
 def _save_promote_state(state):
     """原子写，避免并发子进程写坏文件。"""
     try:
+        # 状态目录是懒创建的（--list-json 之类不该建目录），这里兜一次
+        os.makedirs(os.path.dirname(PROMOTE_STATE), exist_ok=True)
         tmp = PROMOTE_STATE + f".{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f)
         os.replace(tmp, PROMOTE_STATE)
-    except OSError:
-        pass
+    except OSError as e:
+        # 冷却记不下来 = 下次同一房间会再发一条推广，必须留痕
+        sys.stderr.write(f"[提示] 推广冷却写盘失败（{PROMOTE_STATE}: {e}）\n")
 
 
 def maybe_promote_room(sock, rid, sid=None, tag=""):
@@ -884,12 +1018,13 @@ def maybe_promote_room(sock, rid, sid=None, tag=""):
         now = time.time()
         state = _load_promote_state()
         # 清理陈旧条目（24h）：避免文件随房间数无限膨胀
-        state = {k: v for k, v in state.items()
-                 if isinstance(v, (int, float)) and now - v < 86400}
+        state = {k: v for k, v in state.items() if isinstance(v, (int, float)) and now - v < 86400}
         last = state.get(key, 0)
         if isinstance(last, (int, float)) and now - last < PROMOTE_COOLDOWN:
             if DEBUG_MODE:
-                print(f"{tag}    推广冷却中（{int(PROMOTE_COOLDOWN - (now - last))}s 后到期），跳过")
+                print(
+                    f"{tag}    推广冷却中（{int(PROMOTE_COOLDOWN - (now - last))}s 后到期），跳过"
+                )
             return False
         if not send_chat(sock, PROMOTE_TEXT):
             if DEBUG_MODE:
@@ -936,8 +1071,7 @@ def extract_k_room_id_from_chat(message):
     text = str(message or "")
     m = re.search(r'(?:优先)?分享房号\s*[：:]\s*(R?KC\d{2,8})\b', text, re.I)
     if not m:
-        m = re.search(r'(?:https?://)?(?:www\.)?cnkd\.fun/(R?KC\d{2,8})\b',
-                      text, re.I)
+        m = re.search(r'(?:https?://)?(?:www\.)?cnkd\.fun/(R?KC\d{2,8})\b', text, re.I)
     return m.group(1).upper() if m else ""
 
 
@@ -1008,11 +1142,14 @@ def fetch_qroom_list(timeout=None) -> list:
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    req = urllib.request.Request(QROOM_URL, headers={
-        "User-Agent": "okhttp/4.12.0",
-        "Accept": "*/*",
-        "Accept-Encoding": "gzip",
-    })
+    req = urllib.request.Request(
+        QROOM_URL,
+        headers={
+            "User-Agent": "okhttp/4.12.0",
+            "Accept": "*/*",
+            "Accept-Encoding": "gzip",
+        },
+    )
     data = b""
     try:
         with urllib.request.urlopen(req, timeout=timeout or QROOM_TIMEOUT, context=ctx) as resp:
@@ -1052,29 +1189,32 @@ def fetch_qroom_list(timeout=None) -> list:
         # 然后拼出房号 "Q" + internal_id, 走 q.relay.corrodinggames.com 进房。
         # host_ip:5129 是房主公网出口 IP, TCP/UDP 一律超时, 不可用。
         internal_id = str(r.get("internal_id") or "").strip()
-        rooms.append({
-            "source": "qroom",
-            "id": internal_id,
-            "addr": "",
-            # 房号 = 大写 Q + internal_id; q 中继会回 178 跳转到真实节点
-            "room_id": f"Q{internal_id}" if internal_id else "",
-            "name": str(r.get("host_name") or "").strip() or "?",
-            "map": mapname or "?",
-            "players": _as_int(r.get("current_players"), 0),
-            "max": _as_int(r.get("max_players"), 0),
-            "status": "ingame" if started else "battleroom",
-            # is_mod 不再解析: rwpp 客户端(其原始数据来源)根本不读这个字段,
-            # 它是 rtsbox 服务端黑盒判定, 无法用客户端行为交叉验证, 误判会误导用户。
-            "is_started": started,
-        })
+        rooms.append(
+            {
+                "source": "qroom",
+                "id": internal_id,
+                "addr": "",
+                # 房号 = 大写 Q + internal_id; q 中继会回 178 跳转到真实节点
+                "room_id": f"Q{internal_id}" if internal_id else "",
+                "name": str(r.get("host_name") or "").strip() or "?",
+                "map": mapname or "?",
+                "players": _as_int(r.get("current_players"), 0),
+                "max": _as_int(r.get("max_players"), 0),
+                "status": "ingame" if started else "battleroom",
+                # is_mod 不再解析: rwpp 客户端(其原始数据来源)根本不读这个字段,
+                # 它是 rtsbox 服务端黑盒判定, 无法用客户端行为交叉验证, 误判会误导用户。
+                "is_started": started,
+            }
+        )
     return rooms
 
 
 def masterserver_request(params: dict) -> list:
     for base in MASTERSERVERS:
         url = base + "/interface?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "rw android 176 en", "Language": "en"})
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "rw android 176 en", "Language": "en"}
+        )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return resp.read().decode("utf-8", "replace").splitlines()
@@ -1132,8 +1272,7 @@ def classify_room(room: dict) -> tuple:
 #   4+      = 最少玩家数
 #   [US-E]  = 区域(US-E/US-F/US-G/CN...)
 #   #3      = 编号
-_AUTO_SERVER_RE = re.compile(r"^auto\s*server\s*\d+\s*\+?\s*\[[^\]]*#\d+\]",
-                             re.IGNORECASE)
+_AUTO_SERVER_RE = re.compile(r"^auto\s*server\s*\d+\s*\+?\s*\[[^\]]*#\d+\]", re.IGNORECASE)
 
 
 def _parse_room_line(line: str, index: int) -> dict:
@@ -1143,10 +1282,13 @@ def _parse_room_line(line: str, index: int) -> dict:
     清洗前的原文, 因此额外保留 name_raw / desc_raw。
     """
     f = line.split(",")
+
     def g(i, d=""):
         return _clean(f[i]) if len(f) > i and f[i] else d
+
     def raw(i):
         return f[i] if len(f) > i else ""
+
     # 22 字段含义(按客户端 j/r.smali 反编译逐列核实):
     #   0  房间UUID        1  房名            2  版本号
     #   3  对外IP          4  内网IP          5  端口
@@ -1170,8 +1312,8 @@ def _parse_room_line(line: str, index: int) -> dict:
         "ip": g(3),
         "lan_ip": g(4),
         "port": g(5),
-        "host": g(7),          # 房主名 created_by
-        "type": g(7),          # 兼容旧字段名
+        "host": g(7),  # 房主名 created_by
+        "type": g(7),  # 兼容旧字段名
         "mode": g(10),
         "status": g(11),
         "game_ver": g(12),
@@ -1187,6 +1329,7 @@ def _parse_room_line(line: str, index: int) -> dict:
         "desc_raw": raw(9) or raw(14),
         "raw": line,
     }
+
 
 # 列表条目筛选。只回答一个问题: 这个房间值不值得探针去抓。
 #   · 超员房间(max 超出游戏真实范围)是刷出来的展示位, 抓它没有意义
@@ -1225,8 +1368,8 @@ def _is_relay_entry(host: str, desc: str) -> bool:
 _GROUP_AD_RE = re.compile(
     # —— 明确的群号: 群在数字前 / 数字在群前 两种顺序都要覆盖 ——
     r"群号\s*\d{6,}"
-    r"|群\s*\d{6,}"            # 群94600232 / 群687958465
-    r"|\d{6,}\s*群"            # 762601886群
+    r"|群\s*\d{6,}"  # 群94600232 / 群687958465
+    r"|\d{6,}\s*群"  # 762601886群
     r"|\d{6,}\s*裙"
     # —— 拉人动作 ——
     r"|加群|进群|入群|进裙|加裙|来群|进群聊|群聊"
@@ -1234,7 +1377,7 @@ _GROUP_AD_RE = re.compile(
     # —— 明确指代 QQ 群的复合词 ——
     r"|QQ\s*群|企鹅群|交流群|玩家群|开黑群|粉丝群|水友群"
     r"|铁锈群|模组群|联机群|游戏群|活跃群"
-    r"|群里有|群内|群里"          # 群里有猫娘 / 群内有可爱男娘
+    r"|群里有|群内|群里"  # 群里有猫娘 / 群内有可爱男娘
     # —— 社交/主播导向(正常房名不会写) ——
     r"|直播间|直播服务器|主播|关注|点赞"
     r"|男娘|女装|变装|性感|萝莉|正太|猫娘|猫耳",
@@ -1280,14 +1423,15 @@ def _is_group_ad(name: str, host: str, desc: str) -> bool:
     # 命中的是"弱"特征(只因为出现"群"字)且房名有玩法词 -> 不算推广
     hit = m.group(0)
     if "群" in hit or "裙" in hit:
-        strong = re.search(r"\d{6,}|加群|进群|入群|进裙|加裙|来群|群聊"
-                           r"|QQ|企鹅|交流群|玩家群|开黑群|粉丝群|水友群"
-                           r"|铁锈群|模组群|联机群|游戏群|活跃群", hit)
+        strong = re.search(
+            r"\d{6,}|加群|进群|入群|进裙|加裙|来群|群聊"
+            r"|QQ|企鹅|交流群|玩家群|开黑群|粉丝群|水友群"
+            r"|铁锈群|模组群|联机群|游戏群|活跃群",
+            hit,
+        )
         if not strong and _PLAY_STYLE_RE.search(blob):
             return False
     return True
-
-
 
 
 def _normalize_official(room: dict) -> dict:
@@ -1318,8 +1462,7 @@ def _normalize_official(room: dict) -> dict:
     # 那种房的房主不是 "SERVER"。
     # 注意: 房名列(第 1 列)对 Auto Server 是 "Unnamed", 房主列才是 "SERVER"。
     raw_host = (room.get("host") or "").strip()
-    is_auto = bool(raw_host.upper() == "SERVER"
-                   and _AUTO_SERVER_RE.match(desc))
+    is_auto = bool(raw_host.upper() == "SERVER" and _AUTO_SERVER_RE.match(desc))
 
     return {
         "source": "official",
@@ -1357,8 +1500,9 @@ def fetch_official_rooms(include_all: bool = False) -> list:
       2. _is_relay_entry —— 房主名或描述是中继自身入口(且房间空置)
       3. _is_group_ad    —— 房主名或描述带群号/加群/直播等推广话术
     """
-    lines = masterserver_request({"action": "list", "game_version": str(CLIENT_VER),
-                                  "game_version_beta": "false"})
+    lines = masterserver_request(
+        {"action": "list", "game_version": str(CLIENT_VER), "game_version_beta": "false"}
+    )
     if not lines:
         return []
 
@@ -1413,9 +1557,14 @@ def fetch_official_rooms(include_all: bool = False) -> list:
     return rooms
 
 
-def fetch_rooms(source: str = "all", include_all: bool = False,
-                only_joinable: bool = False, keyword: str = "",
-                status: str = "", full: str = "") -> list:
+def fetch_rooms(
+    source: str = "all",
+    include_all: bool = False,
+    only_joinable: bool = False,
+    keyword: str = "",
+    status: str = "",
+    full: str = "",
+) -> list:
     """拉取并合并房间列表, 返回统一结构。
 
     source:        "all"(默认, Q优先+Official补充) / "qroom" / "official"
@@ -1440,7 +1589,9 @@ def fetch_rooms(source: str = "all", include_all: bool = False,
         if status and st != status.lower():
             continue
         # 人满过滤
-        is_full = (room.get("max") or 0) > 0 and (room.get("players") or 0) >= (room.get("max") or 0)
+        is_full = (room.get("max") or 0) > 0 and (room.get("players") or 0) >= (
+            room.get("max") or 0
+        )
         if full == "hide" and is_full:
             continue
         if full == "only" and not is_full:
@@ -1448,11 +1599,13 @@ def fetch_rooms(source: str = "all", include_all: bool = False,
         # 关键词搜索
         if keyword:
             kw = keyword.lower()
-            blob = " ".join([
-                str(room.get("name") or ""),
-                str(room.get("map") or ""),
-                str(room.get("desc") or ""),
-            ]).lower()
+            blob = " ".join(
+                [
+                    str(room.get("name") or ""),
+                    str(room.get("map") or ""),
+                    str(room.get("desc") or ""),
+                ]
+            ).lower()
             if kw not in blob:
                 continue
         out.append(room)
@@ -1469,17 +1622,23 @@ def fetch_rooms(source: str = "all", include_all: bool = False,
         st = (r.get('status') or '').strip().lower()
         is_auto = bool(r.get('is_auto_server'))
         return (
-            0 if players > 0 else 1,        # 有人的房排前面(热闹优先)
-            0 if not is_auto else 1,        # 玩家自开房优先于官方自动房
-            0 if st == 'battleroom' else 1, # 房间中优先于游戏中
-            -players,                        # 人数降序
+            0 if players > 0 else 1,  # 有人的房排前面(热闹优先)
+            0 if not is_auto else 1,  # 玩家自开房优先于官方自动房
+            0 if st == 'battleroom' else 1,  # 房间中优先于游戏中
+            -players,  # 人数降序
         )
+
     out.sort(key=_sort_key)
     return out
 
 
-STATUS_CN = {"battleroom": "房间中", "ingame": "游戏中", "locked": "已锁定",
-             "chat": "聊天", "unknown": "-"}
+STATUS_CN = {
+    "battleroom": "房间中",
+    "ingame": "游戏中",
+    "locked": "已锁定",
+    "chat": "聊天",
+    "unknown": "-",
+}
 
 
 def _fmt_room_line(room: dict) -> str:
@@ -1488,22 +1647,34 @@ def _fmt_room_line(room: dict) -> str:
     pl = room.get("players", 0)
     mx = room.get("max", 0)
     desc = room.get("desc") or ""
-    line = (f"{str(room.get('name') or '?')[:14]:<16}"
-            f"{str(room.get('map') or '-')[:26]:<28}"
-            f"{pl}/{mx:<7}{st:<7}")
+    line = (
+        f"{str(room.get('name') or '?')[:14]:<16}"
+        f"{str(room.get('map') or '-')[:26]:<28}"
+        f"{pl}/{mx:<7}{st:<7}"
+    )
     if desc and desc != room.get("map"):
         line += desc[:24]
     return line
 
 
-def room_list(source: str = "all", include_all: bool = False,
-              only_joinable: bool = False, keyword: str = "",
-              status: str = "", full: str = "") -> list:
+def room_list(
+    source: str = "all",
+    include_all: bool = False,
+    only_joinable: bool = False,
+    keyword: str = "",
+    status: str = "",
+    full: str = "",
+) -> list:
     if not QUIET:
         _dprint("[list] 获取房间列表...")
-    rooms = fetch_rooms(source=source, include_all=include_all,
-                        only_joinable=only_joinable, keyword=keyword,
-                        status=status, full=full)
+    rooms = fetch_rooms(
+        source=source,
+        include_all=include_all,
+        only_joinable=only_joinable,
+        keyword=keyword,
+        status=status,
+        full=full,
+    )
     if not QUIET:
         conds = []
         if only_joinable:
@@ -1528,20 +1699,28 @@ def room_list(source: str = "all", include_all: bool = False,
 def parse_106(data):
     """解析 106 SERVER_INFO 房间信息消息"""
     r = NetReader(data)
+
     def i32():
         return struct.unpack('>i', r.read(4))[0]
+
     def utf():
         return r.utf()
+
     def boolean():
         return r.boolean()
+
     def f32():
         return r.float32()
+
     def byte():
         return r.byte()
+
     def int64():
         return r.int64()
+
     def nullable_str():
         return r.nullable_str()
+
     info = {}
     # 106 消息结构依据客户端发送端 (ae.java b(c): 525-551) 与
     # as.java 字段语义 (bp.java: startingCredits=c, fogMode=d, revealedMap=e,
@@ -1565,14 +1744,14 @@ def parse_106(data):
         info['revealed'] = boolean()
         info['ai_diff'] = i32()
         info['sub_ver'] = byte()
-        info['proxy_h'] = boolean()   # ae.H
-        info['proxy_i'] = boolean()   # ae.I
-        info['unit_cap'] = i32()      # ae.ay
+        info['proxy_h'] = boolean()  # ae.H
+        info['proxy_i'] = boolean()  # ae.I
+        info['unit_cap'] = i32()  # ae.ay
         info['unit_cap_max'] = i32()  # ae.az
-        info['units'] = i32()         # startingUnits (as.g)
-        info['multiplier'] = f32()    # incomeMultiplier (as.h)
+        info['units'] = i32()  # startingUnits (as.g)
+        info['multiplier'] = f32()  # incomeMultiplier (as.h)
         info['no_nukes'] = boolean()  # as.i
-        info['flag_j'] = boolean()    # as.j
+        info['flag_j'] = boolean()  # as.j
         info['has_custom'] = boolean()
 
         # 初始化 customUnits 相关字段
@@ -1581,7 +1760,7 @@ def parse_106(data):
         # 因此这里只保留「默认单位」展示所需的列表, 不再推测 mod 名。
         info['custom_unit_count'] = 0
         info['custom_units'] = []
-        info['custom_unit_list'] = []   # 自定义单位显示名列表, 索引0对应ID=100
+        info['custom_unit_list'] = []  # 自定义单位显示名列表, 索引0对应ID=100
         if info.get('has_custom', False):
             # customUnits 块: readUTF("customUnits") + int32块长 + 块内容
             # 块内容结构 (l.a(j) 接收端, custom/l.java 980-1010):
@@ -1606,10 +1785,10 @@ def parse_106(data):
                 info['custom_unit_count'] = cnt
                 for _ in range(min(cnt, 5000)):
                     unit_id = utf()
-                    i32()          # l.H
+                    i32()  # l.H
                     boolean()
-                    dname = nullable_str()   # 显示名 l.t()
-                    int64()        # checksum J.i
+                    dname = nullable_str()  # 显示名 l.t()
+                    int64()  # checksum J.i
                     int64()
                     if z:
                         nullable_str()
@@ -1618,7 +1797,9 @@ def parse_106(data):
             except (EOFError, struct.error):
                 # 单位解析中途失败: 放弃块内容, 但确保跳到块尾, 后续字段不错位
                 if DEBUG_MODE:
-                    _dprint(f"[DEBUG] customUnits 块解析中断: cur={r.buf.tell()} block_start={block_start} block_len={block_len}")
+                    _dprint(
+                        f"[DEBUG] customUnits 块解析中断: cur={r.buf.tell()} block_start={block_start} block_len={block_len}"
+                    )
             # 跳过整个块内容 (单位定义列表)
             end = block_start + block_len
             if end > len(data):
@@ -1626,27 +1807,37 @@ def parse_106(data):
             r.buf.seek(end)
 
         # customUnits 块之后: 房间设置布尔 + seed (as.l/m/n/o/p/q)
-        info['shared'] = boolean()      # as.l 共享控制
-        info['teamlock'] = boolean()    # as.m 锁定队伍
-        info['flag_n'] = boolean()      # as.n
+        info['shared'] = boolean()  # as.l 共享控制
+        info['teamlock'] = boolean()  # as.m 锁定队伍
+        info['flag_n'] = boolean()  # as.n
         info['spectators'] = boolean()  # as.o 允许旁观
-        info['roomlock'] = boolean()    # as.p 房间锁定
-        info['seed'] = i32()            # as.q
+        info['roomlock'] = boolean()  # as.p 房间锁定
+        info['seed'] = i32()  # as.q
 
     except EOFError:
         # 确保关键字段存在
-        for k in ['shared','teamlock','spectators','roomlock','seed']:
+        for k in ['shared', 'teamlock', 'spectators', 'roomlock', 'seed']:
             info.setdefault(k, None)
 
     if DEBUG_MODE:
-        _dprint(f"[DEBUG] 106解析: app_ver={info.get('app_ver')} mode={info.get('mode')} mapname={info.get('mapname')!r}")
-        _dprint(f"[DEBUG] 106解析: credits={info.get('credits')} fog={info.get('fog')} revealed={info.get('revealed')} ai={info.get('ai_diff')} subVer={info.get('sub_ver')}")
-        _dprint(f"[DEBUG] 106解析: units={info.get('units')} multiplier={info.get('multiplier')} noNukes={info.get('no_nukes')} teamLock={info.get('teamlock')}")
-        _dprint(f"[DEBUG] 106解析: shared={info.get('shared')}, shared2={info.get('shared2')}, "
-              f"spectators={info.get('spectators')}, teamlock={info.get('teamlock')}, "
-              f"force2team={info.get('force2team')}, roomlock={info.get('roomlock')}, seed={info.get('seed')}")
+        _dprint(
+            f"[DEBUG] 106解析: app_ver={info.get('app_ver')} mode={info.get('mode')} mapname={info.get('mapname')!r}"
+        )
+        _dprint(
+            f"[DEBUG] 106解析: credits={info.get('credits')} fog={info.get('fog')} revealed={info.get('revealed')} ai={info.get('ai_diff')} subVer={info.get('sub_ver')}"
+        )
+        _dprint(
+            f"[DEBUG] 106解析: units={info.get('units')} multiplier={info.get('multiplier')} noNukes={info.get('no_nukes')} teamLock={info.get('teamlock')}"
+        )
+        _dprint(
+            f"[DEBUG] 106解析: shared={info.get('shared')}, shared2={info.get('shared2')}, "
+            f"spectators={info.get('spectators')}, teamlock={info.get('teamlock')}, "
+            f"force2team={info.get('force2team')}, roomlock={info.get('roomlock')}, seed={info.get('seed')}"
+        )
         _dprint(f"[DEBUG] 自定义单位数量: {info.get('custom_unit_count', 0)}")
-        _dprint(f"[DEBUG] 自定义单位列表: {info.get('custom_unit_list', [])[:10]}{'...' if len(info.get('custom_unit_list', [])) > 10 else ''}")
+        _dprint(
+            f"[DEBUG] 自定义单位列表: {info.get('custom_unit_list', [])[:10]}{'...' if len(info.get('custom_unit_list', [])) > 10 else ''}"
+        )
 
     return info
 
@@ -1655,7 +1846,7 @@ def parse_141(payload):
     try:
         r = NetReader(payload)
         message = r.utf()
-        flag = r.byte()
+        r.byte()  # 版本标志位，用不到但要读掉
         sender = r.nullable_str()
         return sender, message
     except Exception:
@@ -1663,11 +1854,32 @@ def parse_141(payload):
 
 
 FOG_NAMES = {0: '无雾', 1: '轻雾', 2: '重雾'}
-CREDITS_NAMES = {0: '默认', 1: '$0', 2: '$1000', 3: '$2000', 4: '$5000', 5: '$10000', 6: '$50000', 7: '$100000', 8: '$200000'}
-UNIT_NAMES = {1: '常规模式（1个建造者）', 2: '小军队', 3: '3工程师', 4: '3工程师（无指挥中心）', 9: '自定义'}
+CREDITS_NAMES = {
+    0: '默认',
+    1: '$0',
+    2: '$1000',
+    3: '$2000',
+    4: '$5000',
+    5: '$10000',
+    6: '$50000',
+    7: '$100000',
+    8: '$200000',
+}
+UNIT_NAMES = {
+    1: '常规模式（1个建造者）',
+    2: '小军队',
+    3: '3工程师',
+    4: '3工程师（无指挥中心）',
+    9: '自定义',
+}
 # RWPP 可选起始单位 (isPickableStartingUnit: true, 客户端 ae.d() 下拉 5-8 项)
 # units=100 起按此列表索引: 100=experimentalDropship(飞行堡垒), 101=experimentalGunship(实验悬浮型气垫船)...
-PICKABLE_STARTING_UNITS = ['experimentalDropship', 'experimentalGunship', 'experimentalSpider', 'modularSpider']
+PICKABLE_STARTING_UNITS = [
+    'experimentalDropship',
+    'experimentalGunship',
+    'experimentalSpider',
+    'modularSpider',
+]
 MULTIPLIER_NAMES = {0: '1x', 1: '1.5x', 2: '2x', 3: '2.5x'}
 
 
@@ -1685,6 +1897,7 @@ def _fmt_multiplier(v):
     if key in MULTIPLIER_NAMES:
         return MULTIPLIER_NAMES[key]
     return f"{format(v, 'g')}x"
+
 
 UNIT_TRANSLATIONS = {
     'AntiNukeLaucher': '反核防御',
@@ -1858,7 +2071,16 @@ def clean_mapname(raw):
     return name or str(raw or "").strip()
 
 
-def format_room(info, rid, players, capacity=None, players_detail=None, max_players_display=10, player_count=None, show_players=False):
+def format_room(
+    info,
+    rid,
+    players,
+    capacity=None,
+    players_detail=None,
+    max_players_display=10,
+    player_count=None,
+    show_players=False,
+):
     import re as _re
 
     # 排版约定：
@@ -1881,7 +2103,9 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
     else:
         money_str = CREDITS_NAMES.get(c, f"${c}")
     mul = _fmt_multiplier(info.get('multiplier', 1.0))
-    mode_str = {0: '遭遇战', 1: '自定义', 2: '存档'}.get(info.get('mode'), '未知(' + str(info.get('mode')) + ')')
+    mode_str = {0: '遭遇战', 1: '自定义', 2: '存档'}.get(
+        info.get('mode'), '未知(' + str(info.get('mode')) + ')'
+    )
     lines.append(f"初始资金：{money_str}[{mul}倍率]")
     lines.append(f"地图模式：{mode_str}")
 
@@ -2035,16 +2259,24 @@ def parse_player_record(r, stream_ver, game_running=False):
       bool L, bool M, bool H, bool F, int32 G,
       nullable_str player_id(S), int32 T, int32 A-E
     """
-    p = {'slot': None, 'credits': None, 'spawn_id': None, 'name': None,
-         'is_ai': None, 'player_id': None, 'ping': None, 'exists': True}
+    p = {
+        'slot': None,
+        'credits': None,
+        'spawn_id': None,
+        'name': None,
+        'is_ai': None,
+        'player_id': None,
+        'ping': None,
+        'exists': True,
+    }
     try:
         if game_running:
             # z=true(游戏中): 客户端丢弃前 5 个字段, 只读公共扩展字段
-            r.byte()          # slot (丢弃)
-            r.int32()         # credits (丢弃)
-            r.int32()         # spawn_id (丢弃)
+            r.byte()  # slot (丢弃)
+            r.int32()  # credits (丢弃)
+            r.int32()  # spawn_id (丢弃)
             r.nullable_str()  # name (客户端丢弃)
-            r.boolean()       # is_ai (丢弃)
+            r.boolean()  # is_ai (丢弃)
         else:
             # z=false(房间阶段): byte slot + int32 credits + int32 spawn
             #                   + nullable_str name + boolean is_ai
@@ -2058,30 +2290,30 @@ def parse_player_record(r, stream_ver, game_running=False):
 
         # 公共扩展字段 (smali goto_32 起; c=0xf423f 恒满足, d=版本)
         if stream_ver >= 14:
-            r.int32()         # Z
-            r.int64()         # aa
+            r.int32()  # Z
+            r.int64()  # aa
         if stream_ver >= 34:
-            r.boolean()       # x
-            r.int32()         # y
+            r.boolean()  # x
+            r.int32()  # y
         if stream_ver >= 50:
-            r.int32()         # af
-            r.byte()          # 跳过
+            r.int32()  # af
+            r.byte()  # 跳过
         if stream_ver >= 52:
-            r.boolean()       # L
-            r.boolean()       # M
+            r.boolean()  # L
+            r.boolean()  # M
         if stream_ver >= 70:
-            r.boolean()       # H
-            r.boolean()       # F
-            r.int32()         # G
+            r.boolean()  # H
+            r.boolean()  # F
+            r.int32()  # G
         if stream_ver >= 90:
             p['player_id'] = r.nullable_str()  # S (player_id)
-            r.int32()         # T
+            r.int32()  # T
         if stream_ver >= 93:
-            r.int32()         # A
-            r.int32()         # B
-            r.int32()         # C
-            r.int32()         # D
-            r.int32()         # E
+            r.int32()  # A
+            r.int32()  # B
+            r.int32()  # C
+            r.int32()  # D
+            r.int32()  # E
     except (EOFError, struct.error):
         pass
     return p
@@ -2104,7 +2336,6 @@ def parse_player_record(r, stream_ver, game_running=False):
 #             扫描可 100% 复现, 不依赖固定偏移 (服务器记录变长)
 
 
-
 def _classify_name(name: str):
     """确定性分类玩家名. 返回 (is_real_name, is_ai, is_id_only)."""
     if not name:
@@ -2121,8 +2352,9 @@ def _classify_name(name: str):
     return True, False, False
 
 
-def _parse_115_offset(block_body: bytes, team_count: int, full_load: bool,
-                      stream_ver: int, game_running: bool = False):
+def _parse_115_offset(
+    block_body: bytes, team_count: int, full_load: bool, stream_ver: int, game_running: bool = False
+):
     """纯偏移解析 teams 块(标准协议), 严格复刻客户端 ae.smali 循环 + p.a()。
 
     返回 (players, ok) —— players 为解析出的玩家列表; ok=False 表示
@@ -2144,7 +2376,7 @@ def _parse_115_offset(block_body: bytes, team_count: int, full_load: bool,
     try:
         for team_idx in range(team_count):
             exists = r.boolean()
-            score = r.int32()
+            _score = r.int32()  # 队伍分数，展示用不到，但必须读掉
             if not full_load:
                 # 完整玩家结构: p.a(j, z=false)
                 p = parse_player_record(r, stream_ver, game_running=game_running)
@@ -2152,34 +2384,38 @@ def _parse_115_offset(block_body: bytes, team_count: int, full_load: bool,
                     # 名字是空(None): 说明是空槽, 客户端仍保留该槽位但不展示
                     continue
                 if not game_running:
-                    players.append({
-                        'slot': p.get('slot'),
-                        'team': team_idx,
-                        'num': (p.get('slot') or 0) + 1,
-                        'name': p.get('name'),
-                        'raw_name': p.get('name'),
-                        'is_ai': bool(p.get('is_ai')),
-                        'is_id_only': _classify_name(p.get('name') or '')[2],
-                        'player_id': p.get('player_id'),
-                        'ping': None,
-                        'exists': exists,
-                    })
+                    players.append(
+                        {
+                            'slot': p.get('slot'),
+                            'team': team_idx,
+                            'num': (p.get('slot') or 0) + 1,
+                            'name': p.get('name'),
+                            'raw_name': p.get('name'),
+                            'is_ai': bool(p.get('is_ai')),
+                            'is_id_only': _classify_name(p.get('name') or '')[2],
+                            'player_id': p.get('player_id'),
+                            'ping': None,
+                            'exists': exists,
+                        }
+                    )
                 else:
                     # 游戏中: p.a() 丢弃了 name, 只能拿到公共扩展字段
                     # 探针场景基本不进入此分支(查房时是房间阶段)
                     if p.get('player_id'):
-                        players.append({
-                            'slot': None,
-                            'team': team_idx,
-                            'num': 0,
-                            'name': None,
-                            'raw_name': None,
-                            'is_ai': None,
-                            'is_id_only': True,
-                            'player_id': p.get('player_id'),
-                            'ping': None,
-                            'exists': exists,
-                        })
+                        players.append(
+                            {
+                                'slot': None,
+                                'team': team_idx,
+                                'num': 0,
+                                'name': None,
+                                'raw_name': None,
+                                'is_ai': None,
+                                'is_id_only': True,
+                                'player_id': p.get('player_id'),
+                                'ping': None,
+                                'exists': exists,
+                            }
+                        )
             else:
                 # 精简结构: byte + int32 + bool + bool
                 r.byte()
@@ -2205,9 +2441,14 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
 
     返回 dict(players, capacity, team_count, own_player_id, ...)
     """
-    result = {'players': [], 'capacity': None, 'team_count': 0,
-              'own_player_id': None, 'stream_ver': stream_ver,
-              'full_load': False}
+    result = {
+        'players': [],
+        'capacity': None,
+        'team_count': 0,
+        'own_player_id': None,
+        'stream_ver': stream_ver,
+        'full_load': False,
+    }
     try:
         if len(payload) < 12:
             return result
@@ -2235,6 +2476,7 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
             try:
                 # 限制解压后大小, 防 gzip 炸弹 (用 zlib 底层, 兼容 3.11/3.12 及魔改环境)
                 import zlib as _zlib
+
                 _d = _zlib.decompressobj(16 + _zlib.MAX_WBITS)
                 block_body = _d.decompress(block_body, 512 * 1024)
                 block_body += _d.flush()
@@ -2243,12 +2485,13 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
                     _dprint("[DEBUG] teams块gzip解压失败, 按明文处理")
 
         if DEBUG_MODE:
-            _dprint(f"[DEBUG] 115: own_id={own_id} full_load={full_load} teams={team_count} "
-                  f"block='{block_name}' len={block_len} body={len(block_body)}")
+            _dprint(
+                f"[DEBUG] 115: own_id={own_id} full_load={full_load} teams={team_count} "
+                f"block='{block_name}' len={block_len} body={len(block_body)}"
+            )
 
         # ---- 首选: 纯偏移解析(标准协议) ----
-        players, ok = _parse_115_offset(
-            block_body, team_count, full_load, stream_ver)
+        players, ok = _parse_115_offset(block_body, team_count, full_load, stream_ver)
         if ok and players:
             result['players'] = players
             if DEBUG_MODE:
@@ -2271,7 +2514,7 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
             segments.append(block_body[start:idx])
             start = idx + len(sep)
 
-# 每条记录: 按客户端 p.b() 精简结构连续解析 (ae.java 1900-1911 + p.java 122-128)
+        # 每条记录: 按客户端 p.b() 精简结构连续解析 (ae.java 1900-1911 + p.java 122-128)
         #   bool exists + int32 is_ai + byte l + int32 p(credits) + int32 s(队伍)
         #   + nullable name + bool X
         # RCN 服务器: 记录间有 ff ff d8 f1 分隔符填充, 记录无扩展字段
@@ -2294,22 +2537,22 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
                     o += 1
                     continue
                 try:
-                    is_ai = struct.unpack('>i', seg[o+1:o+5])[0]
+                    is_ai = struct.unpack('>i', seg[o + 1 : o + 5])[0]
                     if is_ai not in (0, 1):
                         o += 1
                         continue
-                    p_l = seg[o+5]
-                    p_cred = struct.unpack('>i', seg[o+6:o+10])[0]
-                    p_s = struct.unpack('>i', seg[o+10:o+14])[0]
+                    p_l = seg[o + 5]
+                    p_cred = struct.unpack('>i', seg[o + 6 : o + 10])[0]
+                    p_s = struct.unpack('>i', seg[o + 10 : o + 14])[0]
                     if not (0 <= p_s < team_count):
                         o += 1
                         continue
                     o2 = o + 14
                     name = None
                     if o2 < n and seg[o2] == 1:
-                        ln = struct.unpack('>H', seg[o2+1:o2+3])[0]
-                        if 0 < ln <= 64 and o2+3+ln <= n:
-                            _nb = seg[o2+3:o2+3+ln]
+                        ln = struct.unpack('>H', seg[o2 + 1 : o2 + 3])[0]
+                        if 0 < ln <= 64 and o2 + 3 + ln <= n:
+                            _nb = seg[o2 + 3 : o2 + 3 + ln]
                             # 与 NetReader.utf() 一致: 处理游戏端 UTF-16 代理对误当 UTF-8 的 Emoji
                             try:
                                 name = _nb.decode('utf-8')
@@ -2334,18 +2577,20 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
                     if not is_real:
                         o += 1
                         continue
-                    players.append({
-                        'slot': p_l,
-                        'team': p_s,
-                        'num': p_l + 1,
-                        'name': name,
-                        'raw_name': name,
-                        'is_ai': is_ai != 0 or is_ai_name,
-                        'is_id_only': is_id_only,
-                        'player_id': name if is_id_only else None,
-                        'ping': None,
-                        'exists': True,
-                    })
+                    players.append(
+                        {
+                            'slot': p_l,
+                            'team': p_s,
+                            'num': p_l + 1,
+                            'name': name,
+                            'raw_name': name,
+                            'is_ai': is_ai != 0 or is_ai_name,
+                            'is_id_only': is_id_only,
+                            'player_id': name if is_id_only else None,
+                            'ping': None,
+                            'exists': True,
+                        }
+                    )
                     break  # 一段只取一条记录
                 except (struct.error, IndexError):
                     o += 1
@@ -2356,8 +2601,10 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
         if DEBUG_MODE:
             _dprint(f"[DEBUG] 解析出 {len(players)} 个玩家 (队伍+编号排序)")
             for p in players:
-                _dprint(f"  {chr(ord('A')+p['team'])}{p['num']} name={p['name']!r} "
-                      f"ai={p['is_ai']} id_only={p['is_id_only']}")
+                _dprint(
+                    f"  {chr(ord('A') + p['team'])}{p['num']} name={p['name']!r} "
+                    f"ai={p['is_ai']} id_only={p['is_id_only']}"
+                )
 
         return result
 
@@ -2365,34 +2612,64 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
         if DEBUG_MODE:
             _dprint(f"[DEBUG] parse_115 异常: {e}")
             import traceback
+
             traceback.print_exc()
         return result
 
 
+def bin_dir(create: bool = False) -> str:
+    """bin 缓存目录（server_info_*.bin 落盘处）。
 
-# bin 缓存目录: 固定为本脚本所在目录, 不依赖调用方的 cwd
-# (插件用 cwd=ROOM_INFO_DIR 启动子进程, 但 --list 等模式可能在其他 cwd 下被调用)
-BIN_DIR = os.path.dirname(os.path.abspath(__file__))
+    优先级：`--bin-dir` → `--state-dir`/bin_cache → `RWINFO_PLUGIN_DATA`/bin_cache
+    → `~/.rwinfo/bin_cache`。
+
+    **绝不回退到脚本所在目录**：那是插件本体，插件更新/重装会整体覆盖，
+    运行时数据写进去必丢；插件市场审核也明确不允许往插件目录写数据。
+    `create=True` 时建目录；建不出来返回空串，调用方跳过落盘（不抛异常）。
+    """
+    explicit = (_find_arg("--bin-dir") or "").strip()
+    if not explicit:
+        state = (_find_arg("--state-dir") or os.environ.get("RWINFO_PLUGIN_DATA", "")).strip()
+        if state:
+            explicit = os.path.join(state, "bin_cache")
+    if not explicit:
+        explicit = os.path.join(os.path.expanduser("~"), ".rwinfo", "bin_cache")
+    if create:
+        try:
+            os.makedirs(explicit, exist_ok=True)
+            ok = _dir_writable(explicit)
+            err = "" if ok else "目录不可写"
+        except OSError as e:
+            ok, err = False, str(e)
+        if not ok:
+            sys.stderr.write(f"[提示] bin 缓存目录不可用（{explicit}: {err}），本次不落盘\n")
+            return ""
+    return explicit
 
 
 def cleanup_old_bin_files(max_age_seconds=3600, verbose=False):
-    """删除 BIN_DIR 下超过 max_age_seconds 的 server_info_*.bin 缓存。
+    """删除 bin 缓存目录下超过 max_age_seconds 的 server_info_*.bin。
 
     返回 (deleted, kept) 两个计数，便于调用方记录日志或做自检。
     verbose=True 时无条件打印清理明细(命令行/定时任务用)。
     """
     deleted = kept = 0
     current_time = time.time()
+    # 不建目录：目录不存在就说明从来没落过盘，没什么可清的
+    # （每次 --list-json 都建一个空目录，等于在用户家目录里留垃圾）
+    _bd = bin_dir()
+    if not _bd or not os.path.isdir(_bd):
+        return deleted, kept
     try:
-        names = os.listdir(BIN_DIR)
+        names = os.listdir(_bd)
     except OSError as e:
         if verbose or DEBUG_MODE:
-            _dprint(f"[清理] 无法列出目录 {BIN_DIR}: {e}")
+            _dprint(f"[清理] 无法列出目录 {_bd}: {e}")
         return deleted, kept
     for fname in names:
         if not (fname.startswith('server_info_') and fname.endswith('.bin')):
             continue
-        fpath = os.path.join(BIN_DIR, fname)
+        fpath = os.path.join(_bd, fname)
         try:
             if current_time - os.path.getmtime(fpath) > max_age_seconds:
                 os.remove(fpath)
@@ -2563,10 +2840,14 @@ def finish_report(sock, got_106, got_115, target):
         t = parse_115(got_115)
         players_detail = t.get('players', [])
         own_slot = t.get('own_player_id')
-        players_detail = [p for p in players_detail
-                          if p.get('exists') and p.get('name')
-                          and (own_slot is None or p.get('slot') != own_slot)
-                          and NAME not in p['name']]
+        players_detail = [
+            p
+            for p in players_detail
+            if p.get('exists')
+            and p.get('name')
+            and (own_slot is None or p.get('slot') != own_slot)
+            and NAME not in p['name']
+        ]
         players_names = [p['name'] for p in players_detail if p.get('exists')]
         capacity = t.get('capacity') or t.get('team_count')
         current_players = len(players_detail)
@@ -2585,16 +2866,37 @@ def finish_report(sock, got_106, got_115, target):
     # K 房必须展示 RKC 分享号，不能被 [z;p10] 或 KC497 内部号覆盖。
     if _K_ROOM_ID:
         _disp_target = _K_ROOM_ID
-    print(format_room(info, _disp_target, players_names, capacity, players_detail, _MAX_PLAYERS_DISPLAY, player_count=current_players, show_players=SHOW_PLAYERS))
+    print(
+        format_room(
+            info,
+            _disp_target,
+            players_names,
+            capacity,
+            players_detail,
+            _MAX_PLAYERS_DISPLAY,
+            player_count=current_players,
+            show_players=SHOW_PLAYERS,
+        )
+    )
 
     timestamp = int(time.time())
     safe_target = re.sub(r'[^\w\-]', '_', target)
-    # 写入路径与 cleanup_old_bin_files 保持一致(固定 BIN_DIR), 避免 cwd 不同导致清理不到
-    with open(os.path.join(BIN_DIR, f"server_info_106_{safe_target}_{timestamp}.bin"), "wb") as f:
-        f.write(got_106)
-    if got_115:
-        with open(os.path.join(BIN_DIR, f"server_info_115_{safe_target}_{timestamp}.bin"), "wb") as f:
-            f.write(got_115)
+    # 写入路径与 cleanup_old_bin_files 同一个目录（bin_dir），避免 cwd 不同导致清理不到。
+    # 落盘只是排查用的副本，写不进去不能让查房结果和离房包一起丢。
+    _bd = bin_dir(create=True)
+    if _bd:
+        try:
+            with open(
+                os.path.join(_bd, f"server_info_106_{safe_target}_{timestamp}.bin"), "wb"
+            ) as f:
+                f.write(got_106)
+            if got_115:
+                with open(
+                    os.path.join(_bd, f"server_info_115_{safe_target}_{timestamp}.bin"), "wb"
+                ) as f:
+                    f.write(got_115)
+        except OSError as e:
+            sys.stderr.write(f"[提示] bin 缓存写入失败（{_bd}: {e}），已跳过\n")
     if sock is not None:
         send_leave(sock)
         time.sleep(0.5)
@@ -2634,7 +2936,11 @@ def direct_main():
     # 早期这里另写了一套 connect_and_161 流程, 只认 161, 遇到节点先回 178
     # 就报 sid=None / 未收到106 —— 而同样的地址走 node_session 是能查到的。
     result = node_session(ip, port, room_uuid or None)
-    if isinstance(result, tuple) and result and result[0] in ("KICKED", "FAILED", "LOOP", "CAPTCHA"):
+    if (
+        isinstance(result, tuple)
+        and result
+        and result[0] in ("KICKED", "FAILED", "LOOP", "CAPTCHA")
+    ):
         kind, msg = result[0], str(result[1])
         if kind == "KICKED":
             _handle_kicked(msg)
@@ -2760,7 +3066,10 @@ def relay_session(host, port, rid, depth=0, seen=None):
                     _dprint(f"{tag}    已重新发送110到游戏服务器")
         elif mtype == 163:
             r = NetReader(payload)
-            r.byte(); relay_ver = r.int32(); r.int32(); r.boolean()
+            r.byte()
+            relay_ver = r.int32()
+            r.int32()
+            r.boolean()
             if DEBUG_MODE:
                 _dprint(f"{tag}    163 relay_ver={relay_ver}")
         elif mtype == 151:
@@ -2780,7 +3089,9 @@ def relay_session(host, port, rid, depth=0, seen=None):
             if DEBUG_MODE:
                 _dprint(f"{tag}[4] 收到115 teams ({len(payload)}B)")
         elif mtype == 108:
-            r = NetWriter(); r.int64(NetReader(payload).int64()); r.byte(1)
+            r = NetWriter()
+            r.int64(NetReader(payload).int64())
+            r.byte(1)
             s.sendall(pack_frame(109, r.output()))
         elif mtype == 150:
             kick_reason = NetReader(payload).utf()
@@ -2796,7 +3107,8 @@ def relay_session(host, port, rid, depth=0, seen=None):
             hint = ""
             try:
                 _r = NetReader(payload)
-                _r.byte(); _r.int32()
+                _r.byte()
+                _r.int32()
                 hint = _r.utf()
             except Exception:
                 hint = ""
@@ -2808,7 +3120,9 @@ def relay_session(host, port, rid, depth=0, seen=None):
             _handle_chat_packet(payload, tag)
         else:
             if DEBUG_MODE:
-                _dprint(f"{tag}    未处理消息 mtype={mtype} len={len(payload)} hex={payload.hex()[:80]}")
+                _dprint(
+                    f"{tag}    未处理消息 mtype={mtype} len={len(payload)} hex={payload.hex()[:80]}"
+                )
         if got_106 is not None:
             got_115 = _drain_115(s, got_106, got_115)
             return _finalize_room(s, got_106, got_115, probe, rid, tag)
@@ -2850,8 +3164,14 @@ def _follow_node_jump(addr, rid, depth=0, seen=None):
     # 例: "[TCP]RRELAY-CN" -> "R.relay.corrodinggames.com/RRELAY-CN"
     if raw.lower().endswith(".relay"):
         raw = raw + ".corrodinggames.com"
-    elif (len(raw) > 1 and ":" not in raw and "." not in raw
-          and "/" not in raw and "\\" not in raw and raw != "localhost"):
+    elif (
+        len(raw) > 1
+        and ":" not in raw
+        and "." not in raw
+        and "/" not in raw
+        and "\\" not in raw
+        and raw != "localhost"
+    ):
         raw = f"{raw[0]}.relay.corrodinggames.com/{raw}"
         if DEBUG_MODE:
             _dprint(f"[*] 短代号转域名: {raw!r}")
@@ -2907,11 +3227,15 @@ def node_session(host, port, rid=None, depth=0, seen=None):
         return ("FAILED", f"无法连接游戏节点 {host}:{port}")
     w = NetWriter()
     w.utf(PROTO_MAGIC)
-    w.int32(4); w.int32(CLIENT_VER); w.int32(1)
+    w.int32(4)
+    w.int32(CLIENT_VER)
+    w.int32(1)
     # 注意: 此处必须不带房间号。节点是按 178 分配到的专用节点,
     # 带 room_id 会触发 "绕过ID分配中心" 拒绝, 并导致 178 环路。
     w.nullable_str(None)
-    w.utf(NAME); w.utf(NID); w.utf('')
+    w.utf(NAME)
+    w.utf(NID)
+    w.utf('')
     s2.sendall(pack_frame(160, w.output()))
     probe2 = RWProbe('x', 0, NAME, unit_checksum=CK or 0, client_version=CLIENT_VER, verbose=False)
     probe2.sock = s2
@@ -2955,10 +3279,13 @@ def node_session(host, port, rid=None, depth=0, seen=None):
             if probe2.server_id:
                 send_110(s2, probe2.server_id, CK, probe2.conn_id, probe2.challenge_y)
                 if DEBUG_MODE:
-                    _dprint(f"[6] 已重新发送110到游戏服务器")
+                    _dprint("[6] 已重新发送110到游戏服务器")
         elif mtype == 163:
             r = NetReader(payload)
-            r.byte(); relay_ver = r.int32(); r.int32(); r.boolean()
+            r.byte()
+            relay_ver = r.int32()
+            r.int32()
+            r.boolean()
             if DEBUG_MODE:
                 _dprint(f"[6] 163 relay_ver={relay_ver}")
         elif mtype == 151:
@@ -2972,7 +3299,9 @@ def node_session(host, port, rid=None, depth=0, seen=None):
             if DEBUG_MODE:
                 _dprint(f"[6] 收到115 teams ({len(payload)}B)")
         elif mtype == 108:
-            r = NetWriter(); r.int64(NetReader(payload).int64()); r.byte(1)
+            r = NetWriter()
+            r.int64(NetReader(payload).int64())
+            r.byte(1)
             s2.sendall(pack_frame(109, r.output()))
         elif mtype == 150:
             kick_reason = NetReader(payload).utf()
@@ -2986,7 +3315,8 @@ def node_session(host, port, rid=None, depth=0, seen=None):
             hint = ""
             try:
                 _r = NetReader(payload)
-                _r.byte(); _r.int32()
+                _r.byte()
+                _r.int32()
                 hint = _r.utf()
             except Exception:
                 hint = ""
@@ -3008,8 +3338,7 @@ def node_session(host, port, rid=None, depth=0, seen=None):
                 _dprint(f"[6] 未处理消息 mtype={mtype} len={len(payload)} hex={payload.hex()[:80]}")
         if got_106 is not None:
             got_115 = _drain_115(s2, got_106, got_115)
-            return _finalize_room(s2, got_106, got_115, probe2,
-                                  rid or f"{host}:{port}")
+            return _finalize_room(s2, got_106, got_115, probe2, rid or f"{host}:{port}")
     s2.close()
     if kick_reason:
         return ("KICKED", kick_reason)
@@ -3043,9 +3372,11 @@ def _start_watchdog(seconds=WATCHDOG_SECONDS):
         if cancel.is_set():
             return
         try:
-            msg = (f"[房间查询失败] 查询超过 {seconds} 秒仍未完成"
-                   f"（中继跳转过多或网络卡住），已主动中止")
-            print(msg, flush=True)      # stdout：父进程靠这一行判断失败原因
+            msg = (
+                f"[房间查询失败] 查询超过 {seconds} 秒仍未完成"
+                f"（中继跳转过多或网络卡住），已主动中止"
+            )
+            print(msg, flush=True)  # stdout：父进程靠这一行判断失败原因
             # stderr 另写一句就够：同一句写两遍会让 `2>&1` 看起来像失败两次
             _dprint(f"[看门狗] 查询超过 {seconds} 秒仍未完成，已中止")
         finally:
@@ -3073,19 +3404,26 @@ def _cancel_watchdog():
 
 # 退出码分档：父进程(main.py)靠它区分「房间问题」还是「探针所在机器的网络问题」。
 # 增加或调整语义时必须同步升 ROOM_INFO_API，否则老插件会把新码当成失败。
-EXIT_OK = 0          # 成功
-EXIT_UNKNOWN = 1     # 未归类
-EXIT_NET = 2         # DNS/连接失败：bot 所在机器到中继不通
-EXIT_NO_ROOM = 3     # 房间不存在或已关闭
-EXIT_ROOM_BUSY = 4   # 房间已满 / 游戏已经开始
-EXIT_PROTO = 5       # 协议或链路异常（跳转环、解析失败、虚拟房号等）
+EXIT_OK = 0  # 成功
+EXIT_UNKNOWN = 1  # 未归类
+EXIT_NET = 2  # DNS/连接失败：bot 所在机器到中继不通
+EXIT_NO_ROOM = 3  # 房间不存在或已关闭
+EXIT_ROOM_BUSY = 4  # 房间已满 / 游戏已经开始
+EXIT_PROTO = 5  # 协议或链路异常（跳转环、解析失败、虚拟房号等）
 
 
 def _exit_code_for_failure(msg: str) -> int:
     """把失败文案归类成退出码（文案见各处 [房间查询失败] 前缀行）。"""
     m = str(msg or "")
-    if ("无法连接中继" in m or "连接中继失败" in m or "无法连接游戏节点" in m
-            or "连接超时" in m or "网络不通" in m or "DNS" in m or "端口无效" in m):
+    if (
+        "无法连接中继" in m
+        or "连接中继失败" in m
+        or "无法连接游戏节点" in m
+        or "连接超时" in m
+        or "网络不通" in m
+        or "DNS" in m
+        or "端口无效" in m
+    ):
         return EXIT_NET
     if "房间不存在" in m or "找不到这个服务器" in m or "已关闭" in m:
         return EXIT_NO_ROOM
@@ -3101,23 +3439,26 @@ def _handle_kicked(reason, sock=None):
     if "No free slots" in reason:
         print("[房间查询失败] 房间已满，无法加入")
         code = EXIT_ROOM_BUSY
-    elif ("游戏已经开始" in reason or "already been started" in low
-          or "already started" in low):
+    elif "游戏已经开始" in reason or "already been started" in low or "already started" in low:
         # RELAY-CN 走错房间(节点默认房)时也会返回这句, 需加提示
         print("[房间查询失败] 游戏已经开始，无法加入")
         code = EXIT_ROOM_BUSY
-    elif ("client is different" in low or "newer then the server" in low
-          or "different to the server" in low or "can not be synchronized" in low):
+    elif (
+        "client is different" in low
+        or "newer then the server" in low
+        or "different to the server" in low
+        or "can not be synchronized" in low
+    ):
         # 服务端小版本更新后客户端跟不上：不是房间问题，也不该报成「未归类」
-        print("[房间查询失败] 客户端版本和服务器不一致（服务端已升级，"
-              "探针客户端较旧），无法加入")
+        print("[房间查询失败] 客户端版本和服务器不一致（服务端已升级，探针客户端较旧），无法加入")
         code = EXIT_PROTO
     elif "绕过ID分配中心" in reason:
         # 178 跳到节点后节点拒绝: 房间已迁移/需走分配中心, 探针无法直连
         print("[房间查询失败] 该房间当前无法直接查询（RELAY-CN 节点限制，请稍后重试或联系房主）")
         code = EXIT_PROTO
-    elif ("找不到这个服务器" in reason or "cant find this server" in low
-          or "不存在或已关闭" in reason):
+    elif (
+        "找不到这个服务器" in reason or "cant find this server" in low or "不存在或已关闭" in reason
+    ):
         print("[房间查询失败] 房间不存在或已关闭")
         code = EXIT_NO_ROOM
     else:
@@ -3127,6 +3468,7 @@ def _handle_kicked(reason, sock=None):
     if sock is not None:
         sock.close()
     sys.exit(code)
+
 
 def relay_main():
     host = relay_host(RID)
@@ -3183,23 +3525,34 @@ def main():
         except (TypeError, ValueError):
             pass
         deleted, kept = cleanup_old_bin_files(max_age, verbose=True)
-        _dprint(f"[清理] 目录: {BIN_DIR}")
+        _dprint(f"[清理] 目录: {bin_dir()}")
         sys.exit(0)
     cleanup_old_bin_files()
     if LIST_JSON:
         # 抓取过程中会 print 各种 [qroom]/[master]/[DEBUG] 诊断行；
         # 这些一律改投 stderr，stdout 只留一行 JSON，否则父进程 json 解析必炸。
         import contextlib
+
         with contextlib.redirect_stdout(sys.stderr):
-            rooms = fetch_rooms(source=LIST_SOURCE, include_all=LIST_ALL,
-                                only_joinable=LIST_JOINABLE, keyword=LIST_KEYWORD,
-                                status=LIST_STATUS, full=LIST_FULL)
+            rooms = fetch_rooms(
+                source=LIST_SOURCE,
+                include_all=LIST_ALL,
+                only_joinable=LIST_JOINABLE,
+                keyword=LIST_KEYWORD,
+                status=LIST_STATUS,
+                full=LIST_FULL,
+            )
         print(json.dumps(rooms, ensure_ascii=False, default=str))
         return
     if LIST_MODE:
-        room_list(source=LIST_SOURCE, include_all=LIST_ALL,
-                  only_joinable=LIST_JOINABLE, keyword=LIST_KEYWORD,
-                  status=LIST_STATUS, full=LIST_FULL)
+        room_list(
+            source=LIST_SOURCE,
+            include_all=LIST_ALL,
+            only_joinable=LIST_JOINABLE,
+            keyword=LIST_KEYWORD,
+            status=LIST_STATUS,
+            full=LIST_FULL,
+        )
         return
     if not RID:
         print(HELP_TEXT)
@@ -3214,11 +3567,14 @@ def main():
         # u_ 是列表接口给 Auto Server 房用的虚拟房号，没有真实房间 ID，
         # 探针拿它进不了房。这里以前静默 return —— 父进程只看到「零输出」，
         # 只能回一句「查房无响应」，把「用错房号」误报成「网络故障」。
-        print(f"[房间查询失败] {RID} 是列表里的虚拟房号（Auto Server 房），"
-              f"没有真实房号可用；请用 /铁锈列表 的序号查，或直连它的 IP:端口")
+        print(
+            f"[房间查询失败] {RID} 是列表里的虚拟房号（Auto Server 房），"
+            f"没有真实房号可用；请用 /铁锈列表 的序号查，或直连它的 IP:端口"
+        )
         sys.exit(EXIT_PROTO)
     # 所有中继房间统一走 relay_main (含 h.relay.* 国际中继)
     relay_main()
+
 
 # ================================================================ 交互模式
 #
@@ -3297,14 +3653,13 @@ def _repl_banner():
 def _repl_status():
     _dprint("当前设置：")
     _dprint(f"  探针名字：{NAME}")
-    _dprint(f"  玩家列表：{'开' if SHOW_PLAYERS else '关'}"
-            f"（最多 {_MAX_PLAYERS_DISPLAY} 人）")
+    _dprint(f"  玩家列表：{'开' if SHOW_PLAYERS else '关'}（最多 {_MAX_PLAYERS_DISPLAY} 人）")
     if PROMOTE_TEXT:
         _dprint(f"  进房推广：{PROMOTE_TEXT}（冷却 {PROMOTE_COOLDOWN:.0f} 秒）")
     else:
         _dprint("  进房推广：关")
     _dprint(f"  调试输出：{'开' if DEBUG_MODE else '关'}")
-    _dprint(f"  bin 缓存：{BIN_DIR}")
+    _dprint(f"  bin 缓存：{bin_dir()}")
 
 
 def _repl_apply_query_opts(tokens):
@@ -3323,6 +3678,11 @@ def _repl_apply_query_opts(tokens):
             QUIET = False
         elif a == "--no-debug":
             DEBUG_MODE = False
+        elif a in ("--state-dir", "--bin-dir"):
+            # 由插件传入的持久化目录，交互模式下已由启动参数决定，忽略即可
+            if not nxt:
+                _dprint(f"[提示] {a} 缺少参数，已忽略")
+            i += 1
         elif a in ("--name", "--limit", "--promote"):
             if not nxt:
                 _dprint(f"[提示] {a} 缺少参数，已忽略")
@@ -3358,14 +3718,17 @@ def _repl_query(target, opts=None):
     if target.startswith("u_"):
         # 先判目标再改设置：手滑打了 `u_xxx --promote 广告` 时不能留下推广文案，
         # 否则下一条真查询会往真人房发消息。
-        print(f"[房间查询失败] {target} 是列表里的虚拟房号（Auto Server 房），"
-              f"没有真实房号可用；用 list --addr / json 看它的 IP:端口/UUID 再直连")
+        print(
+            f"[房间查询失败] {target} 是列表里的虚拟房号（Auto Server 房），"
+            f"没有真实房号可用；用 list --addr / json 看它的 IP:端口/UUID 再直连"
+        )
         try:
             sys.stdout.flush()
         except Exception:
             pass
-        _dprint(f"[结束] 未连接（虚拟房号）· 退出码 {EXIT_PROTO}"
-                f"（{EXIT_NAMES.get(EXIT_PROTO, '')}）")
+        _dprint(
+            f"[结束] 未连接（虚拟房号）· 退出码 {EXIT_PROTO}（{EXIT_NAMES.get(EXIT_PROTO, '')}）"
+        )
         return EXIT_PROTO
     if opts:
         _repl_apply_query_opts(opts)
@@ -3397,15 +3760,14 @@ def _repl_query(target, opts=None):
     finally:
         _cancel_watchdog()
         try:
-            sys.stdout.flush()   # 结果先落地，别让 `[结束]`（stderr）抢到前面
+            sys.stdout.flush()  # 结果先落地，别让 `[结束]`（stderr）抢到前面
         except Exception:
             pass
     cost = time.time() - started
     if code is None:
         _dprint(f"[结束] 被中断，用时 {cost:.2f} 秒")
     else:
-        _dprint(f"[结束] 用时 {cost:.2f} 秒 · 退出码 {code}"
-                f"（{EXIT_NAMES.get(code, '未知')}）")
+        _dprint(f"[结束] 用时 {cost:.2f} 秒 · 退出码 {code}（{EXIT_NAMES.get(code, '未知')}）")
     return code
 
 
@@ -3444,11 +3806,17 @@ def _repl_list(argv, as_json=False):
     started = time.time()
     if as_json:
         import contextlib
+
         # 抓取过程中的诊断行一律改投 stderr，stdout 只留 JSON
         with contextlib.redirect_stdout(sys.stderr):
-            rooms = fetch_rooms(source=source, include_all=include_all,
-                                only_joinable=only_joinable, keyword=keyword,
-                                status=status, full=full)
+            rooms = fetch_rooms(
+                source=source,
+                include_all=include_all,
+                only_joinable=only_joinable,
+                keyword=keyword,
+                status=status,
+                full=full,
+            )
         print(json.dumps(rooms, ensure_ascii=False, default=str))
         _dprint(f"[结束] {len(rooms)} 个房间 · 用时 {time.time() - started:.2f} 秒")
         return rooms
@@ -3459,15 +3827,19 @@ def _repl_list(argv, as_json=False):
         if show_addr:
             # 列表默认只给房主/地图/人数：official 房全是 18.x:5158/u_<uuid>，
             # 不给地址就查不下去，所以单独开一列。
-            rooms = fetch_rooms(source=source, include_all=include_all,
-                                only_joinable=only_joinable, keyword=keyword,
-                                status=status, full=full)
+            rooms = fetch_rooms(
+                source=source,
+                include_all=include_all,
+                only_joinable=only_joinable,
+                keyword=keyword,
+                status=status,
+                full=full,
+            )
             # official 房的 id 是 u_<36 位 uuid>，固定 12 列会把地址挤到下一屏
             rows = []
             for r in rooms:
                 addr = r.get("addr") or r.get("room_id") or r.get("id") or "-"
-                rows.append((str(r.get("id") or "-"), str(addr),
-                             str(r.get("name") or "?")[:20]))
+                rows.append((str(r.get("id") or "-"), str(addr), str(r.get("name") or "?")[:20]))
             w1 = min(max([len(x[0]) for x in rows] + [4]), 40)
             w2 = min(max([len(x[1]) for x in rows] + [4]), 42)
             print(f"{'房号':<{w1}}  {'地址':<{w2}} 房主")
@@ -3477,9 +3849,14 @@ def _repl_list(argv, as_json=False):
             print("-" * (w1 + w2 + 12))
             print(f"共 {len(rooms)} 个房间")
         else:
-            rooms = room_list(source=source, include_all=include_all,
-                              only_joinable=only_joinable, keyword=keyword,
-                              status=status, full=full)
+            rooms = room_list(
+                source=source,
+                include_all=include_all,
+                only_joinable=only_joinable,
+                keyword=keyword,
+                status=status,
+                full=full,
+            )
     finally:
         QUIET = _quiet
     _dprint(f"[结束] 用时 {time.time() - started:.2f} 秒")
@@ -3498,7 +3875,7 @@ def _repl_cleanup(argv):
         except (TypeError, ValueError):
             _dprint(f"[提示] 秒数需要整数，用默认 3600：{argv[0]!r}")
     cleanup_old_bin_files(max_age, verbose=True)
-    _dprint(f"[清理] 目录：{BIN_DIR}")
+    _dprint(f"[清理] 目录：{bin_dir()}")
 
 
 def interactive_shell():
@@ -3514,16 +3891,14 @@ def interactive_shell():
     _repl_banner()
     try:
         # 一次性模式每次启动都会清过期 bin，交互模式同样该清一次，
-        # 否则长期挂着会话时 BIN_DIR 只增不减。
+        # 否则长期挂着会话时 bin 缓存只增不减。
         cleanup_old_bin_files()
     except Exception as _e:
         _dprint(f"[提示] 清理过期缓存出错（已忽略）：{_e}")
-    _ignored = [a for a in _positional
-                if a not in _MODE_SWITCHES] if _positional else []
+    _ignored = [a for a in _positional if a not in _MODE_SWITCHES] if _positional else []
     if _ignored:
         # `-i r5132` / `-i --list-json`：交互模式优先，但这些参数确实没用上
-        _dprint(f"[提示] 交互模式下忽略启动参数：{' '.join(_ignored)}"
-                f"（进去以后直接敲房号即可）")
+        _dprint(f"[提示] 交互模式下忽略启动参数：{' '.join(_ignored)}（进去以后直接敲房号即可）")
     # 管道喂指令时（room_info.py -i < cmds.txt）不刷提示符，输出更干净
     show_prompt = sys.stdin.isatty()
     while True:
@@ -3569,8 +3944,7 @@ def interactive_shell():
                     NAME = " ".join(args).strip() or NAME
                     _dprint(f"探针名字已设为：{NAME}")
             elif low == "players":
-                SHOW_PLAYERS, _known = _repl_onoff_checked(
-                    args[0] if args else "", SHOW_PLAYERS)
+                SHOW_PLAYERS, _known = _repl_onoff_checked(args[0] if args else "", SHOW_PLAYERS)
                 if args and not _known:
                     _dprint(f"[提示] 只认 on/off（或 开/关），已保留原值：{args[0]!r}")
                 _dprint(f"玩家列表：{'开' if SHOW_PLAYERS else '关'}")
@@ -3629,7 +4003,8 @@ def interactive_shell():
                 else:
                     _repl_query(_target, _rest)
             elif _DIRECT_RE.match(cmd) or re.fullmatch(
-                    r"[A-Za-z][A-Za-z0-9_\u4e00-\u9fff]{0,23}", cmd):
+                r"[A-Za-z][A-Za-z0-9_\u4e00-\u9fff]{0,23}", cmd
+            ):
                 # 裸房号直查：字母房 r5132 / hytvvi，也支持自定义房号
                 # （中继字母 + 汉字，如 s九一大魔王）。这里只做形态过滤，
                 # 合法性由探针判断。
@@ -3640,8 +4015,10 @@ def interactive_shell():
                 if _code not in (0, None):
                     _dprint("[提示] 如果这不是房号，输入 help 看指令。")
             else:
-                _dprint(f"[提示] 看不懂 {cmd!r}：它既不是房号也不是指令。"
-                        f"输入 help 看指令，或直接敲 r5132 这样的房号。")
+                _dprint(
+                    f"[提示] 看不懂 {cmd!r}：它既不是房号也不是指令。"
+                    f"输入 help 看指令，或直接敲 r5132 这样的房号。"
+                )
         except KeyboardInterrupt:
             _cancel_watchdog()
             sys.stderr.write("\n")

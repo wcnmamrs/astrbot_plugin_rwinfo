@@ -148,7 +148,9 @@ AstrBot 插件商店搜索安装，或在 WebUI 中安装：
 `/铁锈查房 状态`（别名参数 `统计`、`status`）显示本地日期当天的查询总数、
 成功/失败数、成功率、平均耗时、成功平均耗时、K 房成功率、失败分类和
 当前探针占用。显式指令与自动触发均计入；探针名重试按实际发起的查询计数。
-数据保存在插件目录 `.rwinfo_stats.json`，重载插件不会丢失；跨天重新统计。
+数据保存在 `data/plugin_data/astrbot_plugin_rwinfo/stats.json`（不写插件目录），
+重载插件不会丢失；跨天重新统计。旧版的 `.rwinfo_stats.json` 首次加载时会只读迁移过去
+（旧文件保留，可自行删除）。
 
 **权限**
 
@@ -302,8 +304,10 @@ AstrBot 插件商店搜索安装，或在 WebUI 中安装：
 
 几个实现要点：
 
-- 清理固定作用于 `room_info.py` 所在目录（`BIN_DIR`），不依赖当前工作目录；
-  写入端也用同一路径，避免"写在 A 目录、清的是 B 目录"。
+- bin 缓存**不写插件目录**：优先 `--bin-dir`，其次 `--state-dir/bin_cache`
+  （插件传的就是 `data/plugin_data/astrbot_plugin_rwinfo/`），单独跑探针时退回
+  `~/.rwinfo/bin_cache`。写完与清理用的是同一个目录，不会"写在 A 目录、清的是 B 目录"。
+- 目录不可写时直接跳过落盘并在 stderr 提示一句，查房结果和离房包不受影响。
 - 实际清理跑在独立子进程（`room_info.py --cleanup-bins`），不阻塞事件循环。
 - 清理失败不会终止循环，下一轮会重试。
 - 插件卸载（`terminate`）时会取消该循环，不留后台任务。
@@ -429,6 +433,18 @@ astrbot_plugin_rwinfo/
 ├── LICENSE            # MIT 许可证
 └── .gitignore
 ```
+
+运行时数据不写在这里（插件更新会整个覆盖该目录），而是放在
+`data/plugin_data/astrbot_plugin_rwinfo/`：
+
+| 文件 | 内容 |
+| --- | --- |
+| `stats.json` | `/铁锈查房 状态` 的今日统计（跨天归零） |
+| `promote_state.json` | 进房推广的按房间冷却记录 |
+| `bin_cache/` | 查房时保存的原始 106/115 报文（排查协议用，定时清理） |
+
+老版本的 `.rwinfo_stats.json` 若还在插件目录里，首次加载时会只读迁移到新位置
+（旧文件不删，可自行删除）。
 
 ---
 

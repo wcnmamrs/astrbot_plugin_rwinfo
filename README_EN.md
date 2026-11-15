@@ -168,8 +168,10 @@ column 7 is the host name).
 `/铁锈查房 状态` (also `统计` or `status`) reports today's total, successes,
 failures, success rate, average latency, K-room success rate, failure categories
 and probe usage. Explicit and automatic lookups are included; probe-name retries
-are counted as actual probe attempts. Data is stored in `.rwinfo_stats.json`
-inside the plugin directory, survives reloads, and resets on the next local day.
+are counted as actual probe attempts. Data lives in
+`data/plugin_data/astrbot_plugin_rwinfo/stats.json` (never in the plugin directory),
+survives reloads, and resets on the next local day. A legacy `.rwinfo_stats.json`
+in the plugin directory is migrated read-only on first load (the old file is kept).
 
 **Permissions**
 
@@ -264,9 +266,12 @@ it deletes bin files whose mtime is older than `bin_cleanup_max_age_hours` (defa
 
 Implementation notes:
 
-- Cleanup always targets the directory containing `room_info.py` (`BIN_DIR`), independent
-  of the current working directory. Writes use the same path, so writer and cleaner can
-  never disagree.
+- The bin cache never lives in the plugin directory: `--bin-dir` first, then
+  `--state-dir/bin_cache` (the plugin passes `data/plugin_data/astrbot_plugin_rwinfo/`),
+  falling back to `~/.rwinfo/bin_cache` for a standalone probe run. Writer and cleaner
+  share one path, so they can never disagree.
+- If that directory is not writable the dump is skipped with a single stderr note; the
+  room output and the leave packet are unaffected.
 - The actual deletion runs in a separate subprocess (`room_info.py --cleanup-bins`) so it
   never blocks the event loop.
 - A failed run does not kill the loop; it retries on the next tick.
@@ -391,6 +396,16 @@ astrbot_plugin_rwinfo/
 ├── LICENSE            # MIT license
 └── .gitignore
 ```
+
+Runtime data is **not** written here (plugin updates replace this directory).
+It lives in `data/plugin_data/astrbot_plugin_rwinfo/`:
+
+| File | Content |
+| --- | --- |
+| `stats.json` | Today's counters behind `/铁锈查房 状态` (resets daily) |
+| `promote_state.json` | Per-room cooldown for the in-room promotion message |
+
+A leftover `.rwinfo_stats.json` in the plugin directory is migrated on first load.
 
 ---
 

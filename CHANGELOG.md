@@ -2,6 +2,103 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.0.4] - 2026-11-15
+
+### 代码风格（同日，ruff）
+
+官方开发原则里有「提交前用 ruff 格式化」这一条，之前一直没做（本机装不上）。这次
+`pkg install ruff` 装上 0.17.5 之后补齐：
+
+- **新增 `ruff.toml`**：行宽 100（中文提示偏长，88 会挤成多行反而难读）、
+  引号保持原样（文件里单双引号混用是历史原因，整体翻转只是噪音）、lint 只开官方
+  默认集 `E4/E7/E9/F`（插件里大量 `except Exception` 是为了「一条消息解析失败不能
+  把整个机器人带崩」，开 BLE001/S110 只会逼出几百个 `noqa`，把真问题埋掉），
+  另忽略 `E702`（解析二进制包时 `r.byte(); relay_v = r.int32(); r.boolean()` 按字节
+  顺序排一行，拆开反而看不出字段顺序）。
+- **顺手修掉 9 处真实问题**（不是风格）：`main.py` 顶部重复 import 了
+  `filter` / `AstrMessageEvent`（F811，通配符改显式导入时留下的）；
+  `room_info.py` 未使用的 `import random`；两处「赋值了但没人用」的局部变量
+  （`matched_total`、`parse_115` 里的 `score` 改名 `_score` 并注明必须读掉）；
+  `parse_141` 里同样必须读掉、但用不到的版本标志位；`IGNORE_PATTERNS` 里一处隐式
+  字符串拼接（补括号）；`/铁锈忽略` 里 `if sign == "-" or (not sign and False)` 的
+  死分支；两处 `lambda` 赋值改成 `def`；一处多余 f-string 前缀。
+- **全量格式化**：`main.py` 8212 → 8620 行、`room_info.py` 3776 → 4042 行。
+  用 AST 逐节点比对确认**语义完全没变**（41977 / 20114 个节点一一对应），
+  唯一差异是 ruff 把几个 docstring 里示例代码的缩进规范化了。
+- **探针哈希同步**：`ROOM_INFO_SHA256` 是随包的 `room_info.py` 哈希，格式化后必须
+  重算，否则自愈会把好好的探针判成「校验不符」。
+
+### 规范对齐（同日，按官方文档逐条比对）
+
+之前的整改是照着驳回意见和框架源码改的，没有回去翻官方文档。补上这一步后
+（[插件开发指南](https://docs.astrbot.app/dev/star/plugin-new.html)、
+[发布到插件市场](https://docs.astrbot.app/dev/star/plugin-publish.html)、
+[处理消息事件](https://docs.astrbot.app/dev/star/guides/listen-message-event.html)），
+又找到两处不合规：
+
+- **显式导入**：`main.py` 顶部原来是 `from astrbot.api.all import *`。官方示例与
+  审核意见都要求 `filter` 来自 `astrbot.api.event`、`Star`/`Context` 来自
+  `astrbot.api.star`；通配符导入会把 message_components 等一并倒进来，静态检查
+  看不出到底依赖了框架什么。已改为两行显式导入。
+- **不再自己推算数据目录**：`plugin_data_dir()` 原有第三级回退
+  「`<插件目录>/../../plugin_data/<插件名>`」，正是审核明确禁止的「硬编码
+  `plugin_data` 拼接」。已删除该级，只保留 `RWINFO_PLUGIN_DATA` 环境变量 →
+  `StarTools.get_data_dir()` → `~/.rwinfo` 兜底。
+
+核对通过、无需改动的项：`filter`/`Star`/`Context` 导入路径、Handler 都在插件类内、
+签名均为 `(self, event)`、27 条指令名不含空格、每个函数只挂一个 `@filter.command`、
+未使用 `@register`、无内置 logging、无 `requests`、`_conf_schema.json` 与 `config`
+参数对应、消息监听器用 `yield event.plain_result(...)`（官方示例即如此）。
+
+### 复审补漏（同日，三路只读审查后）
+
+初版整改覆盖了统计与推广冷却，但三路审查发现同一类问题还有三处漏网，一并补掉：
+
+- **bin 缓存也搬出插件目录**：`BIN_DIR` 原本固定在 `room_info.py` 所在目录，
+  每次查房成功都往插件目录写 `server_info_106_*.bin`（这仍是驳回理由第 2 条的同一违规）。
+  改为 `--bin-dir` → `--state-dir/bin_cache` → `~/.rwinfo/bin_cache`，
+  写盘失败只打一行 stderr，不再影响房间信息输出与离房包；清理任务同样带上 `--state-dir`，
+  否则会出现「写在一个目录、清的是另一个」。
+- **自愈不再从第三方镜像取代码**：删掉 ghproxy / jsDelivr 两个反代源，只留官方 raw 与
+  GitHub Contents API；新增随包 `ROOM_INFO_SHA256`，下载内容逐字节校验，不符即拒收
+  （用途是「恢复本版本的探针」，不是「升级到最新」）。`.bak` 备份改存数据目录，
+  插件目录只留一个瞬时 `.new`。
+- **探针接口版本升到 4**：旧探针不认 `--state-dir`（会把冷却写回插件目录），
+  插件侧要求版本 4；但下载失败时若本地文件仍可解析，就继续用旧版并记 warning，
+  不让一条下载失败把查房整体打死。
+- **「目录存在但不可写」被当成可写**：`os.makedirs(exist_ok=True)` 对已存在目录是空操作，
+  权限不足也不抛，于是冷却状态静默丢失。改为真写一个探测文件；不可写时回退 `~/.rwinfo`
+  并在 stderr 说明，写盘失败也不再静默吞掉。
+- **参数解析**：`--state-dir` / `--bin-dir` 缺值时不再把后面的选项名当值
+  （原来 `--state-dir --promote x` 会在当前目录建出名为 `--promote/` 的文件夹）；
+  支持 `--opt=value` 写法。
+- **其它**：`plugin_data_dir()` 结果统一 `abspath`（否则相对路径会经由子进程的
+  `cwd=插件目录` 把状态文件写回插件目录）；`StarTools.get_data_dir()` 兼容新旧签名；
+  `logger.exception` 改等价写法 `logger.error(..., exc_info=True)`；
+  `setLevel` 只在 logger 名确属本插件时才调（共享 logger 会改掉整个实例的级别）；
+  统计迁移把「新文件存在但为空」也算需要迁移；`--api-version`、帮助与 README 同步。
+
+### 插件市场审核整改
+
+首次提交被 AstrBot 插件市场驳回，两条「必须整改」，本次按规范改掉：
+
+- **日志改用框架 logger**：删掉 `import logging`、`logging.getLogger("astrbot_plugin_rwinfo")`
+  与自建的 `StreamHandler`，`self.logger` 直接指向 `from astrbot.api import logger`。
+  框架会把这个代理路由到 `astrbot.plugin.<插件名>` 专属 logger，级别仍按插件独立，
+  不会影响内核或别的插件。debug 开关用 `setLevel(10/20)` 表达，避免再 import 内置 logging。
+- **持久化移出插件目录**：统计从 `<插件目录>/.rwinfo_stats.json` 改为
+  `data/plugin_data/<插件名>/stats.json`，推广冷却从 `<插件目录>/.promote_state.json`
+  改为同一目录下的 `promote_state.json`。目录解析顺序：环境变量 `RWINFO_PLUGIN_DATA`
+  → `StarTools.get_data_dir(PLUGIN_NAME)`（框架官方入口）→ 按标准布局推算
+  `<data>/plugin_data/<插件名>` → `~/.rwinfo` 兜底。
+  - 探针是独立子进程，拿不到框架上下文，所以由插件用 `--state-dir` 把目录传下去；
+    命令行单独跑探针时退回 `~/.rwinfo`，不会往仓库里写文件。
+  - 老用户的统计文件在首次加载时**只读**迁移到新位置，不删旧文件（可自行删除），不丢当天数据。
+  - 探针的 bin 缓存（`server_info_*.bin`）也不再落插件目录：`--bin-dir` →
+    `--state-dir/bin_cache` → `~/.rwinfo/bin_cache`，写盘失败只提示不阻断查房。
+  - 探针接口版本升到 4（旧探针不认 `--state-dir`）；自愈只从官方 raw / GitHub
+    Contents API 下载，并用随包 sha256 逐字节校验，不符即拒收。
+
 ## [2.0.3] - 2026-11-15
 
 房号提取重做：贴合、粘连、连写、重复前缀全部按「房号本体」取。

@@ -3,25 +3,97 @@
 """
 AstrBot 插件: 铁锈战争房间查询 (rwinfo)
 """
+
 import asyncio
 import datetime as _datetime
 import hashlib
 import io
 import json
-import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 import traceback
 import urllib.request
 
-from astrbot.api.all import *
-from astrbot.api import logger
-from astrbot.api.event import filter, AstrMessageEvent
+# 显式导入，不用 `astrbot.api.all` 的通配符写法：通配符会把 message_components
+# 之类的名字一起倒进来，静态检查看不出到底依赖了框架什么，也没法做改名检查。
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star
+
+try:
+    from astrbot.api import logger
+except Exception:  # 框架版本差异：拿不到日志器不能让插件整个加载失败
+
+    class _SilentLogger:
+        """兜底日志器：什么都不输出，但方法一个不缺。
+
+        不用内置日志模块（规范禁止），也不让插件因为日志器缺失而起不来。
+        """
+
+        name = "astrbot_plugin_rwinfo"
+
+        def __getattr__(self, _name):
+            def _noop(*_a, **_kw):
+                return None
+
+            return _noop
+
+    logger = _SilentLogger()
 
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 插件名，与 metadata.yaml 的 name 一致。持久化数据按它落到
+# data/plugin_data/<插件名>/ 下（AstrBot 插件规范要求，见 plugin_data_dir）。
+PLUGIN_NAME = "astrbot_plugin_rwinfo"
+
+
+def plugin_data_dir() -> str:
+    """返回本插件的持久化目录 data/plugin_data/<插件名>。
+
+    规范要求插件不要把运行时数据写进插件自身目录：插件更新/重装会整体
+    覆盖那个目录，用户数据会跟着丢，备份与迁移也识别不到。
+
+    解析顺序（官方文档要求：「持久化数据请存储于 `data` 目录下，而非插件
+    自身目录」；审核侧还明确「必须且只能」用 `StarTools.get_data_dir()`，
+    禁止自己拼 `plugin_data` 路径）：
+
+      1. 环境变量 `RWINFO_PLUGIN_DATA`（测试/特殊部署用）
+      2. `StarTools.get_data_dir(PLUGIN_NAME)`（框架官方唯一入口）
+      3. 家目录兜底 `~/.rwinfo`（框架结构完全识别不到时的最后退路）
+
+    不再自己按 `<插件目录>/../../plugin_data` 推算：那条路径看着对，其实
+    依赖目录层级，改了布局就静默写到别处；而且审核会按「硬编码 plugin_data」
+    判违规。
+    """
+    env = os.environ.get("RWINFO_PLUGIN_DATA", "").strip()
+    candidates = []
+    if env:
+        candidates.append(env)
+    try:
+        from astrbot.api.star import StarTools
+
+        try:
+            candidates.append(str(StarTools.get_data_dir(PLUGIN_NAME)))
+        except TypeError:  # 老版本 StarTools.get_data_dir() 不收参数
+            candidates.append(str(StarTools.get_data_dir()))
+    except Exception as e:
+        logger.warning(f"[数据] StarTools 不可用（{e}），改用回退路径")
+    candidates.append(os.path.join(os.path.expanduser("~"), ".rwinfo"))
+    for d in candidates:
+        try:
+            # 必须 abspath：`--state-dir` 会传给 cwd=插件目录 的子进程，
+            # 相对路径会把状态文件写回插件目录，正好把这次整改作废。
+            d = os.path.abspath(d)
+            os.makedirs(d, exist_ok=True)
+            if os.path.isdir(d) and os.access(d, os.W_OK):
+                return d
+        except OSError:
+            continue
+    return os.path.abspath(os.path.join(os.path.expanduser("~"), ".rwinfo"))
+
 
 # ================================================================ 探针脚本定位
 # 只在插件自身目录查找 room_info.py。
@@ -29,7 +101,7 @@ _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 # 不能向上一级目录回退：AstrBot 的标准布局是
 # `<data>/plugins/astrbot_plugin_rwinfo/`，回退会指向 `<data>/plugins/`，
 # 那是所有插件的公共父目录，既找不到目标，也可能误用他插件的同名文件。
-ROOM_INFO_API_REQUIRED = 2          # 需要的最低接口版本（对应 room_info.py 的 ROOM_INFO_API）
+ROOM_INFO_API_REQUIRED = 4  # 需要的最低接口版本（对应 room_info.py 的 ROOM_INFO_API）
 ROOM_INFO_DIR = _PLUGIN_DIR
 ROOM_INFO_PY = os.path.join(_PLUGIN_DIR, "room_info.py")
 
@@ -43,35 +115,37 @@ COOLDOWN = 10
 #
 # **加指令/改指令名时必须同步这里**：`harness_commands.py` 会拿源码里的
 # `@filter.command(指令名)` 与实际集合做双向比对，漏一个就会报错。
-COMMAND_NAMES = frozenset({
-    "铁锈查房帮助",
-    "铁锈查房菜单",
-    "铁锈帮助",
-    "rwhelp",
-    "铁锈列表",
-    "房间列表",
-    "铁锈房列表",
-    "rwlist",
-    "铁锈下一页",
-    "铁锈上一页",
-    "铁锈查房",
-    "铁锈全局解析",
-    "铁锈模式",
-    "铁锈玩家列表",
-    "铁锈白名",
-    "铁锈黑名",
-    "铁锈重试",
-    "铁锈忽略",
-    "铁锈查房调试",
-    "铁锈查房调试菜单",
-    "铁锈压缩",
-    "铁锈官机探测",
-    "铁锈官机测试",
-    "铁锈探针时解",
-    "铁锈撤回",
-    "铁锈私聊策略",
-    "铁锈私聊开关",
-})
+COMMAND_NAMES = frozenset(
+    {
+        "铁锈查房帮助",
+        "铁锈查房菜单",
+        "铁锈帮助",
+        "rwhelp",
+        "铁锈列表",
+        "房间列表",
+        "铁锈房列表",
+        "rwlist",
+        "铁锈下一页",
+        "铁锈上一页",
+        "铁锈查房",
+        "铁锈全局解析",
+        "铁锈模式",
+        "铁锈玩家列表",
+        "铁锈白名",
+        "铁锈黑名",
+        "铁锈重试",
+        "铁锈忽略",
+        "铁锈查房调试",
+        "铁锈查房调试菜单",
+        "铁锈压缩",
+        "铁锈官机探测",
+        "铁锈官机测试",
+        "铁锈探针时解",
+        "铁锈撤回",
+        "铁锈私聊策略",
+        "铁锈私聊开关",
+    }
+)
 
 # 一次性编译好，供 `command_in_text()` 用：名字按长度倒序，保证
 # 「铁锈查房调试菜单」先于「铁锈查房」被尝试匹配。
@@ -105,7 +179,7 @@ CMD_DEDUP_WINDOW = 10
 PROBE_MIN, PROBE_MAX = 1, 99
 
 # 插件版本（菜单与元数据展示用，与 metadata.yaml 的 version 保持一致）
-PLUGIN_VERSION = "2.0.3"
+PLUGIN_VERSION = "2.0.4"
 
 # ---- 协议侧常量（与 room_info.py 保持一致）----
 # 官方 masterserver 列表。插件侧解析中继房真实地址时要用，
@@ -149,15 +223,16 @@ ROOM_INFO_ALLOWED = ("room_info.py",)
 #   而 ghproxy 镜像和 api.github.com 是通的。
 # 只写死官方 raw 地址在部分网络环境下会失败，所以做成有序回退。
 _DOWNLOAD_SOURCES = (
-    # ① 国内可用性最好：ghproxy 反向代理（直接拼在 raw 地址前）
-    "https://ghproxy.net/" + REPO_RAW_BASE + "/{path}",
-    # ② GitHub Contents API（返回 base64，需单独处理，标记 api:）
-    "api:https://api.github.com/repos/wcnmamrs/astrbot_plugin_rwinfo/contents/{path}",
-    # ③ 直连 raw（海外/有代理时最快）
+    # ① 直连 raw（官方）
     REPO_RAW_BASE + "/{path}",
-    # ④ jsDelivr CDN（部分网络环境可用，有缓存但还算及时）
-    "https://cdn.jsdelivr.net/gh/wcnmamrs/astrbot_plugin_rwinfo@main/{path}",
+    # ② GitHub Contents API（官方，返回 base64，需单独处理，标记 api:）
+    "api:https://api.github.com/repos/wcnmamrs/astrbot_plugin_rwinfo/contents/{path}",
 )
+# 只保留官方源：第三方反代（ghproxy/jsDelivr）会把「下载并执行 Python」的
+# 最后一环交给镜像运营者，等于把机器人的执行权外包出去。
+# 校验值随插件一起发布，用途是「恢复与本版本一模一样的探针」——
+# 不是「升级到最新探针」，所以哈希不匹配一律拒收，宁可让用户重装插件。
+ROOM_INFO_SHA256 = "921e2b9eeb75c91a527ecc3849595a18c3f20545111771dd8cc6683d9f43a35c"
 _DOWNLOAD_TIMEOUT = 15
 
 
@@ -169,11 +244,13 @@ def _fetch_once(url, timeout=_DOWNLOAD_TIMEOUT):
     is_api = url.startswith("api:")
     real = url[4:] if is_api else url
     req = urllib.request.Request(
-        real, headers={
+        real,
+        headers={
             "User-Agent": f"astrbot-rwinfo/{PLUGIN_VERSION}",
             # API 要求显式 Accept；raw 源带这个也无害
             "Accept": "application/vnd.github+json" if is_api else "*/*",
-        })
+        },
+    )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         raw = r.read()
     if not is_api:
@@ -181,6 +258,7 @@ def _fetch_once(url, timeout=_DOWNLOAD_TIMEOUT):
     obj = json.loads(raw.decode("utf-8"))
     if isinstance(obj, dict) and obj.get("content"):
         import base64
+
         return base64.b64decode(obj["content"]).decode("utf-8")
     raise ValueError("API 返回不含 content")
 
@@ -232,7 +310,7 @@ def _safe_target_dir(rel_path):
     try:
         if os.path.commonpath([root, target]) != root:
             return None
-    except ValueError:      # 不同盘符等
+    except ValueError:  # 不同盘符等
         return None
     return target
 
@@ -248,7 +326,10 @@ def _probe_api_version(py_path):
     try:
         out = subprocess.run(
             [python, "-B", py_path, "--api-version"],
-            capture_output=True, text=True, timeout=15, cwd=ROOM_INFO_DIR,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            cwd=ROOM_INFO_DIR,
         )
         s = (out.stdout or "").strip().splitlines()
         if s and s[-1].strip().isdigit():
@@ -323,6 +404,7 @@ def extract_text_from_event(event, base: str = "") -> str:
 
     返回的文本都会过一遍 `unwrap_forward_text`。
     """
+
     def _walk(obj, depth=0):
         """递归收集对象里所有像「文本」的值。"""
         if depth > 6 or obj is None:
@@ -334,8 +416,18 @@ def extract_text_from_event(event, base: str = "") -> str:
         out = []
         if isinstance(obj, dict):
             # 优先取文本字段，避免把 type/uuid 等元数据当成正文
-            for key in ("content", "text", "message", "data", "messages",
-                        "msg", "node", "nodes", "raw_message", "message_str"):
+            for key in (
+                "content",
+                "text",
+                "message",
+                "data",
+                "messages",
+                "msg",
+                "node",
+                "nodes",
+                "raw_message",
+                "message_str",
+            ):
                 if key in obj:
                     out.extend(_walk(obj[key], depth + 1))
             return out
@@ -344,8 +436,7 @@ def extract_text_from_event(event, base: str = "") -> str:
                 out.extend(_walk(it, depth + 1))
             return out
         # 任意对象：扫常见属性
-        for key in ("content", "text", "message", "messages", "raw_message",
-                    "data", "message_str"):
+        for key in ("content", "text", "message", "messages", "raw_message", "data", "message_str"):
             v = getattr(obj, key, None)
             if v is not None:
                 out.extend(_walk(v, depth + 1))
@@ -404,11 +495,11 @@ def unwrap_forward_text(text: str) -> str:
         if m:
             field, rest = m.group(1), m.group(2)
             if field == "发送者":
-                continue                 # 丢弃发送者行
+                continue  # 丢弃发送者行
             if rest:
-                out.append(rest)         # [消息内容] xxx -> xxx
+                out.append(rest)  # [消息内容] xxx -> xxx
                 continue
-            continue                     # 空的 [消息内容] 行
+            continue  # 空的 [消息内容] 行
         out.append(L)
     res = "\n".join(out).strip()
     return res or text
@@ -452,12 +543,11 @@ def ensure_room_info(auto=True):
             # 真的缺参数时，调用方会拿到服务的报错，用户也能看到具体原因。
             if _py_syntax_ok(path):
                 logger.info(
-                    "[补文件] room_info.py 无接口版本标记，按旧版兼容使用；"
-                    "如需新参数请更新插件包")
+                    "[补文件] room_info.py 无接口版本标记，按旧版兼容使用；如需新参数请更新插件包"
+                )
                 return True, ""
         # 版本太旧：需要补齐。auto=False 时不动手，只报告
-        reason = (f"本地 room_info.py 接口版本 {ver} < "
-                  f"需要 {ROOM_INFO_API_REQUIRED}")
+        reason = f"本地 room_info.py 接口版本 {ver} < 需要 {ROOM_INFO_API_REQUIRED}"
     else:
         reason = "本地缺少 room_info.py"
 
@@ -467,29 +557,42 @@ def ensure_room_info(auto=True):
     logger.info(f"[补文件] {reason}，尝试从仓库下载")
     txt = _download_text(_room_info_relname())
     if not txt:
+        if os.path.exists(path) and _py_syntax_ok(path):
+            logger.warning(f"[补文件] {reason}，下载失败但本地文件可解析，继续用旧版")
+            return True, ""
         return False, f"{reason}，且从 GitHub 下载失败（检查网络后重试）"
+    import hashlib
+
+    got_sha = hashlib.sha256(txt.encode("utf-8")).hexdigest()
+    if got_sha != ROOM_INFO_SHA256:
+        logger.error(f"[补文件] 下载内容校验不符: {got_sha[:16]}… != {ROOM_INFO_SHA256[:16]}…")
+        if os.path.exists(path) and _py_syntax_ok(path):
+            logger.warning("[补文件] 校验不符，保留本地文件继续使用")
+            return True, ""
+        return False, (
+            f"{reason}，但下载内容与本版本不一致，已拒绝写入（可能是仓库已更新，请重新安装插件）"
+        )
 
     rel = _room_info_relname()
-    if rel not in ROOM_INFO_ALLOWED:      # 白名单校验，防止写入范围失控
+    if rel not in ROOM_INFO_ALLOWED:  # 白名单校验，防止写入范围失控
         return False, f"{reason}，但目标任务不在允许列表内，已放弃写入"
 
     target = _safe_target_dir(rel)
     if not target:
         return False, f"{reason}，但目标路径校验未通过，已放弃写入"
 
-    # 写临时文件再原子替换；旧文件改名 .bak 保留（不删除）
-    bak = target + ".bak"
+    # 写临时文件再原子替换；旧文件备份到数据目录（.bak 不留在插件目录里）
+    bak = os.path.join(plugin_data_dir(), rel + ".bak")
     moved_old = False
     try:
         tmp = target + ".new"
         with io.open(tmp, "w", encoding="utf-8", newline="\n") as f:
             f.write(txt)
         if os.path.exists(target):
-            bak = target + ".bak"
             try:
                 if os.path.exists(bak):
-                    os.remove(bak)      # 只删我们自己生成的 .bak
-                os.replace(target, bak)
+                    os.remove(bak)  # 只删我们自己生成的 .bak
+                shutil.copyfile(target, bak)
                 moved_old = True
             except OSError:
                 pass
@@ -506,7 +609,7 @@ def ensure_room_info(auto=True):
         # 否则插件目录里就没有 room_info.py 了
         if moved_old and os.path.exists(bak) and not os.path.exists(target):
             try:
-                os.replace(bak, target)
+                shutil.copyfile(bak, target)
                 logger.info(f"[补文件] 已从 .bak 还原旧版 {rel}")
             except OSError as e2:
                 logger.error(f"[补文件] .bak 还原失败: {e2}")
@@ -515,10 +618,12 @@ def ensure_room_info(auto=True):
     # 校验下载结果确实可用
     ver = _probe_api_version(target)
     if ver < ROOM_INFO_API_REQUIRED and not (ver == 0 and _py_syntax_ok(target)):
-        return False, (f"已下载 room_info.py 但接口版本仍为 {ver}，"
-                       f"可能仓库分支也不是新版，请手动更新插件")
+        return False, (
+            f"已下载 room_info.py 但接口版本仍为 {ver}，可能仓库分支也不是新版，请手动更新插件"
+        )
     logger.info(f"[补文件] room_info.py 已补齐（接口版本 {ver or '旧版兼容'}）")
     return True, ""
+
 
 # 合并转发卡片的标题（按内容类别区分，让收件人一眼看出是什么）
 _FOLD_TITLES = {
@@ -592,8 +697,8 @@ def _relay_priority(rid: str) -> int:
 # CNKD K 服分享号：RKC497 / KC497。必须在普通 o/q/r/s 房号之前提取，
 # 否则字母房正则会从 URL 里捞出 rkc、kc 之类的残片。
 K_ROOM_RE = re.compile(
-    r'(?<![A-Za-z0-9._:@=\-?#&])R?KC\d{2,8}(?![A-Za-z0-9._:/@=\-?#&])',
-    re.IGNORECASE)
+    r'(?<![A-Za-z0-9._:@=\-?#&])R?KC\d{2,8}(?![A-Za-z0-9._:/@=\-?#&])', re.IGNORECASE
+)
 
 RELAY_NUM_LOOSE_RE = re.compile(r'[oqrsOQRS]+\d{2,}')
 _RELAY_NUM_HEAD_RE = re.compile(r'^([oqrsOQRS]+)(\d+)$')
@@ -605,7 +710,8 @@ _RELAY_NUM_HEAD_RE = re.compile(r'^([oqrsOQRS]+)(\d+)$')
 # 只加 URL/标点类边界，不影响纯字母房号（hello / hlbifz 照常识别）。
 RELAY_ALPHA_RE = re.compile(
     r'(?<![A-Za-z0-9._:/@=\-?#&])(?![oqrsOQRS])[A-Za-z]{3,}'
-    r'(?![A-Za-z0-9._:/@=\-?#&])')
+    r'(?![A-Za-z0-9._:/@=\-?#&])'
+)
 
 # 自定义房号: 中继前缀字母 + 汉字（可夹字母/数字），如 `s九一大魔王`。
 # RW 允许玩家自定义房号，实测 `s九一大魔王` 能连上并返回「游戏已经开始」。
@@ -617,7 +723,8 @@ RELAY_ALPHA_RE = re.compile(
 CUSTOM_ROOM_RE = re.compile(
     r'(?<![A-Za-z0-9._:/@=\-?#&])[A-Za-z][\u4e00-\u9fff]'
     r'[A-Za-z0-9_\u4e00-\u9fff]{1,23}'
-    r'(?![A-Za-z0-9._:/@=\-?#&])')
+    r'(?![A-Za-z0-9._:/@=\-?#&])'
+)
 
 # 不识别纯数字房号(如 5232): 首字符为数字的中继主机无 DNS, 无法查询。
 # 不识别混合格式(如 a1b2c3): 不在实测的两种形态内, 排除以防误报。
@@ -650,7 +757,7 @@ def _split_relay_run(head: str, digits: str):
         再由 extract_room_ids 的 seen 去重，最终只留一个 r5132。
     """
     letters = []
-    for ch in (head or ""):
+    for ch in head or "":
         low = ch.lower()
         if low and (not letters or letters[-1] != low):
             letters.append(low)
@@ -687,7 +794,7 @@ def _split_relay_run(head: str, digits: str):
         if i == n - 1:
             seg = digits[pos:]
         else:
-            seg = digits[pos:pos + seg_len]
+            seg = digits[pos : pos + seg_len]
             pos += seg_len
         if len(seg) >= 2:
             out.append(letter + seg)
@@ -850,10 +957,18 @@ def extract_room_ids(text: str, allow_custom: bool = False):
 IGNORE_PATTERNS = (
     # 字段名后必须跟冒号（或表格分隔符）才算「报告」——
     # 否则「地图名称是什么」这种提问也会被当成报告，把真请求挡掉。
-    ("房间信息块", r"房间版本\s*[：:]|地图名称\s*[：:]|初始资金\s*[：:]"
-                 r"|初始禁核\s*[：:]|初始迷雾\s*[：:]"
-                 r"|\|\s*(?:房间版本|地图名称|初始资金|初始禁核|初始迷雾)\s*\|"),
-    ("字段行", r"^\s*(?:ID|当前人数|单位上限|地图模式|默认单位|共享控制|允许旁观|队伍锁定)\s*[：:]"),
+    (
+        "房间信息块",
+        (
+            r"房间版本\s*[：:]|地图名称\s*[：:]|初始资金\s*[：:]"
+            r"|初始禁核\s*[：:]|初始迷雾\s*[：:]"
+            r"|\|\s*(?:房间版本|地图名称|初始资金|初始禁核|初始迷雾)\s*\|"
+        ),
+    ),
+    (
+        "字段行",
+        r"^\s*(?:ID|当前人数|单位上限|地图模式|默认单位|共享控制|允许旁观|队伍锁定)\s*[：:]",
+    ),
     ("房号标注", r"房号\s*[：:]\s*[A-Za-z]"),
     ("房间列表", r"【房间列表】|房间列表\s*[：:]|第\s*\d+\s*页\s*/\s*共"),
     ("错误报告", r"\[房间查询失败\]|\[插件错误\]|查房无响应|房间不存在或已关闭"),
@@ -871,9 +986,20 @@ IGNORE_PATTERNS = (
 # `房间版本` 里含 `版本`，同一行会被计成两次命中，
 # 于是用户随便打一句「房间版本是多少」就能凑够 2 个字段。
 # 统一用 `版本` 覆盖（它同时匹配新旧两种标签）。
-_ROOM_FIELDS = ("版本", "地图名称", "初始资金", "初始禁核",
-                "初始迷雾", "地图模式", "默认单位", "单位上限",
-                "共享控制", "允许旁观", "队伍锁定", "当前人数")
+_ROOM_FIELDS = (
+    "版本",
+    "地图名称",
+    "初始资金",
+    "初始禁核",
+    "初始迷雾",
+    "地图模式",
+    "默认单位",
+    "单位上限",
+    "共享控制",
+    "允许旁观",
+    "队伍锁定",
+    "当前人数",
+)
 
 # 把各种平台差异抹平：
 #   · markdown 修饰符  *  `  ~
@@ -882,6 +1008,7 @@ _ROOM_FIELDS = ("版本", "地图名称", "初始资金", "初始禁核",
 #   · 冒号后的空白
 # 只做归一化，不改动“有多少个字段”这个事实。
 _ROOM_NOISE_RE = re.compile(r'[*`~|]')
+
 
 def _normalize_room_text(text: str) -> str:
     """把文本归一化成「字段名+N 个字符」的扁平串，便于找字段。
@@ -895,10 +1022,11 @@ def _normalize_room_text(text: str) -> str:
     s = s.replace(':', '：').replace('　', ' ').replace('	', ' ')
     return s
 
+
 # 值起始字符：冒号、数字、字母、常见符号。
 # 用来区分「字段名 + 值」与「句子里恰好提到这个词」。
-_VALUE_HEAD = set('：0123456789abcdefghijklmnopqrstuvwxyz'
-                  'ABCDEFGHIJKLMNOPQRSTUVWXYZ#-/¤(')
+_VALUE_HEAD = set('：0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ#-/¤(')
+
 
 def _field_has_value(s: str, name: str) -> bool:
     """字段名是否以「键 + 值」的形式出现，而不是被当作普通词语。
@@ -920,11 +1048,12 @@ def _field_has_value(s: str, name: str) -> bool:
         i = s.find(name, start)
         if i < 0:
             return False
-        tail = s[i + len(name): i + len(name) + 4]
+        tail = s[i + len(name) : i + len(name) + 4]
         for ch in tail:
             if ch in _VALUE_HEAD:
                 return True
         start = i + 1
+
 
 def is_room_info(text: str) -> bool:
     """判断一段文本是不是「房间信息」（用于探针返回结果校验）。
@@ -954,6 +1083,7 @@ def is_room_info(text: str) -> bool:
                 return True
     return False
 
+
 def fingerprint_room_id(text: str) -> str:
     """从查房结果里取房号, 仅用于日志与调试展示。"""
     for line in text.splitlines():
@@ -961,6 +1091,7 @@ def fingerprint_room_id(text: str) -> str:
         if s.startswith("ID："):
             return s[3:].strip()
     return ""
+
 
 # ================================================================ 探针名前缀
 # 探针在游戏内显示为「<前缀>探针NN_xxxxx」，前缀可由用户配置（如 ABAB）。
@@ -1017,6 +1148,7 @@ def first_error_line(text: str) -> str:
 def is_error_info(text: str) -> bool:
     return bool(first_error_line(text))
 
+
 # 服务器错误信息 -> 中文翻译
 ERROR_TRANSLATIONS = [
     ("No free slots", "房间已满，无法加入"),
@@ -1028,6 +1160,7 @@ ERROR_TRANSLATIONS = [
     ("banned", "已被封禁"),
     ("kicked", "被移出房间"),
 ]
+
 
 def translate_error(text: str) -> str:
     """给服务器错误说明补一句中文（只补注，不替换原文）。
@@ -1045,6 +1178,7 @@ def translate_error(text: str) -> str:
             return f"{head}（{zh}）"
     return head
 
+
 def is_name_check_error(text: str) -> bool:
     """判断是否为探针名字被过滤错误 (可重试)"""
     return "Name Check" in text or "前置过滤" in text or "名字被" in text
@@ -1054,9 +1188,13 @@ def is_name_check_error(text: str) -> bool:
 # 其余(房间不存在 / 中继未响应 / 节点限制 等)一律静默。
 # 设计核心: 自动触发时房号可能是英文单词误报, 大量失败绝不能刷屏。
 REPORTABLE_ERRORS = (
-    "房间已满", "房间已锁定", "游戏已经开始",
-    "已被封禁", "被移出房间",
+    "房间已满",
+    "房间已锁定",
+    "游戏已经开始",
+    "已被封禁",
+    "被移出房间",
 )
+
 
 def is_reportable_error(text: str) -> bool:
     """该失败原因是否值得回传到群里(仅房间确实存在时)。"""
@@ -1100,19 +1238,11 @@ def normalize_gid(gid) -> str:
 class RWInfoPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
-        # **独立 logger，绝不用框架共享的 `logger` 单例改级别**。
-        # 早期用 `from astrbot.api import logger` 并 setLevel，
-        # 会把整个 AstrBot 实例（所有插件 + 内核）的日志级别一起改掉。
-        # 现在用独立命名的 logger，只影响本插件自己的输出密度。
-        self.logger = logging.getLogger("astrbot_plugin_rwinfo")
-        # 防止重复初始化 handler（插件重载时 logger 单例还在）
-        self.logger.propagate = False
-        if not self.logger.handlers:
-            _h = logging.StreamHandler()
-            _h.setFormatter(logging.Formatter(
-                "[%(asctime)s.%(msecs)03d] [%(name)s] [%(levelname)s] "
-                "%(message)s", datefmt="%H:%M:%S"))
-            self.logger.addHandler(_h)
+        # 统一用 `from astrbot.api import logger`：框架按调用方模块路由到
+        # `astrbot.plugin.<插件名>` 专属 logger，级别按插件独立，不会污染
+        # 内核或别的插件。**不要自建日志器**：AstrBot 插件规范禁止使用内置
+        # 日志模块，插件市场审核会因此打回。
+        self.logger = logger
         self.config = config or self._default_config()
         # 最近一次配置写盘失败的原因（空 = 正常）。
         # _send_text 会在下一条消息末尾附一句提示，避免「回执说已设置、
@@ -1137,11 +1267,12 @@ class RWInfoPlugin(Star):
         if not self._conf_groups:
             self.logger.warning(
                 "[配置] 未能识别分组结构（_conf_schema.json 读取失败），"
-                "已按嵌套/平铺自动兜底解析。若配置修改不生效请检查该文件是否存在。")
+                "已按嵌套/平铺自动兜底解析。若配置修改不生效请检查该文件是否存在。"
+            )
         elif self.cfg.get("debug", False):
             self.logger.debug(
-                f"[配置] 识别到 {len(self._conf_groups)} 个分组，"
-                f"schema 路径: {self._schema_path()}")
+                f"[配置] 识别到 {len(self._conf_groups)} 个分组，schema 路径: {self._schema_path()}"
+            )
         # 关键配置自检：无条件打印，这是排查「明明是官Q模式却发成纯文本」
         # 最直接的入口 —— 只要看这行就知道插件当时读到的到底是什么值。
         try:
@@ -1150,7 +1281,8 @@ class RWInfoPlugin(Star):
                 f"压缩范围={self.cfg.get('压缩范围')!r} "
                 f"唤醒词={self.cfg.get('指令唤醒词')!r} "
                 f"显示项目地址={bool(self.cfg.get('显示项目地址', True))} "
-                f"分组数={len(self._conf_groups)}")
+                f"分组数={len(self._conf_groups)}"
+            )
         except Exception:
             pass
 
@@ -1169,11 +1301,17 @@ class RWInfoPlugin(Star):
         # 格式从 "key:开:延迟" 简化为 "key:延迟"
         self._migrate_recall()
 
-        if self.cfg.get("debug", False):
-            self.logger.setLevel(logging.DEBUG)
-            self.logger.debug("Debug 模式已启用")
-        else:
-            self.logger.setLevel(logging.INFO)
+        # 级别用数字写死（10/20），避免引入内置日志模块（规范禁止）：
+        # 10 = DEBUG，20 = INFO。改的是本插件专属 logger，不影响其它插件。
+        try:
+            # 框架若返回共享的日志对象，setLevel 会连内核和其它插件一起改
+            # （历史上踩过：debug=true 把整个实例拖进 DEBUG）。只认专属 logger。
+            if str(getattr(self.logger, "name", "") or "").endswith(PLUGIN_NAME):
+                self.logger.setLevel(10 if self.cfg.get("debug", False) else 20)
+            if self.cfg.get("debug", False):
+                self.logger.debug("Debug 模式已启用")
+        except Exception:
+            pass
 
         self.room_cooldown = {}
         # 「本机确实查到过房间信息」的记录: {"会话|房号": ts}
@@ -1194,9 +1332,11 @@ class RWInfoPlugin(Star):
         self.pending_recall_tasks = set()
         # 撤回任务明细: {id(task): {"key","mid","due","delay"}}, 供调试指令展示
         self._recall_meta = {}
-        # 今日查房统计：按插件运行环境的本地日期归档，持久化到插件目录，
-        # 重载/重启后今日数据不丢。跨天时旧记录保留在文件里，页面只展示今日。
-        self._stats_path = os.path.join(_PLUGIN_DIR, ".rwinfo_stats.json")
+        # 今日查房统计：按插件运行环境的本地日期归档。
+        # 持久化到 data/plugin_data/<插件名>/（不能写插件目录 —— 插件更新会
+        # 整个覆盖那个目录，用户数据会丢，也无法纳入框架的备份）。
+        self._data_dir = plugin_data_dir()
+        self._stats_path = os.path.join(self._data_dir, "stats.json")
         self._stats = self._load_stats()
         # bin 缓存定时清理任务(插件启动后开始循环)
         self._bin_cleanup_task = None
@@ -1206,14 +1346,44 @@ class RWInfoPlugin(Star):
     @staticmethod
     def _stats_day(ts=None):
         """本地日期键；与「今日」的用户直觉一致，不用 UTC 日期。"""
-        return _datetime.datetime.fromtimestamp(
-            time.time() if ts is None else ts).strftime("%Y-%m-%d")
+        return _datetime.datetime.fromtimestamp(time.time() if ts is None else ts).strftime(
+            "%Y-%m-%d"
+        )
 
     def _load_stats(self):
         """读取统计文件；损坏/字段异常时归零，不影响插件加载。"""
-        empty = {"date": self._stats_day(), "total": 0, "success": 0,
-                 "failure": 0, "errors": {}, "k_total": 0, "k_success": 0,
-                 "total_seconds": 0.0, "success_seconds": 0.0}
+        empty = {
+            "date": self._stats_day(),
+            "total": 0,
+            "success": 0,
+            "failure": 0,
+            "errors": {},
+            "k_total": 0,
+            "k_success": 0,
+            "total_seconds": 0.0,
+            "success_seconds": 0.0,
+        }
+        # 老版本把统计写在插件目录里。这里只**读**它一次并写到新位置，
+        # 不删也不改旧文件（插件不往自身目录写任何东西）。
+        legacy = os.path.join(_PLUGIN_DIR, ".rwinfo_stats.json")
+
+        def _needs_migrate(p):
+            try:
+                return (not os.path.exists(p)) or os.path.getsize(p) == 0
+            except OSError:
+                return True
+
+        if _needs_migrate(self._stats_path) and os.path.exists(legacy):
+            try:
+                with open(legacy, "r", encoding="utf-8") as f:
+                    _old = json.load(f)
+                with open(self._stats_path, "w", encoding="utf-8") as f:
+                    json.dump(_old, f, ensure_ascii=False)
+                self.logger.info(
+                    f"[统计] 已在 {self._stats_path} 建立新统计文件（旧文件 {legacy} 可自行删除）"
+                )
+            except (OSError, ValueError) as e:
+                self.logger.warning(f"[统计] 旧统计文件读取失败（忽略）: {e}")
         try:
             with open(self._stats_path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
@@ -1227,9 +1397,11 @@ class RWInfoPlugin(Star):
                 empty[k] = max(0.0, float(v)) if isinstance(v, (int, float)) else 0.0
             errors = raw.get("errors", {})
             if isinstance(errors, dict):
-                empty["errors"] = {str(k)[:80]: max(0, int(v))
-                                   for k, v in errors.items()
-                                   if isinstance(v, (int, float))}
+                empty["errors"] = {
+                    str(k)[:80]: max(0, int(v))
+                    for k, v in errors.items()
+                    if isinstance(v, (int, float))
+                }
         except (OSError, ValueError, TypeError):
             pass
         return empty
@@ -1342,7 +1514,9 @@ class RWInfoPlugin(Star):
             self.logger.debug(f"[清理] 事件循环不可用, 改为惰性启动: {e}")
             self._bin_cleanup_task = None
             return
-        self.logger.info(f"[清理] bin 缓存定时清理已启动: 每 {interval_sec / 3600:.2f} 小时检查一次")
+        self.logger.info(
+            f"[清理] bin 缓存定时清理已启动: 每 {interval_sec / 3600:.2f} 小时检查一次"
+        )
 
     async def _bin_cleanup_loop(self):
         """循环: 从插件启动起计时, 每隔 interval 清理一次(启动瞬间不清理)。"""
@@ -1370,8 +1544,16 @@ class RWInfoPlugin(Star):
         python = sys.executable
         if not python or not os.path.exists(python):
             python = "python3"
-        cmd = [python, "-B", ROOM_INFO_PY, "--cleanup-bins",
-               "--max-age", str(int(max_age_sec))]
+        cmd = [
+            python,
+            "-B",
+            ROOM_INFO_PY,
+            "--cleanup-bins",
+            "--max-age",
+            str(int(max_age_sec)),
+            "--state-dir",
+            self._data_dir,
+        ]
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -1397,8 +1579,7 @@ class RWInfoPlugin(Star):
                     await asyncio.wait_for(proc.wait(), timeout=5)
                 except Exception:
                     pass
-                self.logger.warning(
-                    f"[清理] 读取清理子进程输出异常: {type(e).__name__}: {e}")
+                self.logger.warning(f"[清理] 读取清理子进程输出异常: {type(e).__name__}: {e}")
                 return
         except Exception as e:
             self.logger.warning(f"[清理] 启动清理子进程失败: {e}")
@@ -1424,16 +1605,16 @@ class RWInfoPlugin(Star):
 
     def _default_config(self) -> dict:
         return {
-            "global_enabled": True,           # 全局开关：关闭后自动查房不触发（显式指令仍可用）
-            "mode": "black",                  # 模式：black=黑名单放行 / white=白名单放行 / mixed=混合模式(@优先)
-            "白名单": [],                     # 白名单列表（black/white模式下使用）
-            "黑名单": [],                     # 黑名单列表（black/white模式下使用）
-            "混合_白名单": [],                # 混合模式专用白名单（@用户/#群 独立管理）
-            "混合_黑名单": [],                # 混合模式专用黑名单（@用户/#群 独立管理）
-            "混合_私聊策略": "white",         # 混合模式私聊默认策略：white=不在白名单拦 / black=在黑名单拦
-            "私聊启用": True,                 # 是否处理私聊消息（关闭则私聊不发房号）
+            "global_enabled": True,  # 全局开关：关闭后自动查房不触发（显式指令仍可用）
+            "mode": "black",  # 模式：black=黑名单放行 / white=白名单放行 / mixed=混合模式(@优先)
+            "白名单": [],  # 白名单列表（black/white模式下使用）
+            "黑名单": [],  # 黑名单列表（black/white模式下使用）
+            "混合_白名单": [],  # 混合模式专用白名单（@用户/#群 独立管理）
+            "混合_黑名单": [],  # 混合模式专用黑名单（@用户/#群 独立管理）
+            "混合_私聊策略": "white",  # 混合模式私聊默认策略：white=不在白名单拦 / black=在黑名单拦
+            "私聊启用": True,  # 是否处理私聊消息（关闭则私聊不发房号）
             "debug": False,
-# 官Q模式：一键接管排版（Markdown 卡片 + 快捷按钮 + 换行规整）。
+            # 官Q模式：一键接管排版（Markdown 卡片 + 快捷按钮 + 换行规整）。
             # 合并了旧版的「官机适配 / 消息格式 / 快捷按钮」三个开关。
             "官Q模式": False,
             # 压缩范围：none / room / diag / all
@@ -1451,13 +1632,13 @@ class RWInfoPlugin(Star):
             "show_players": False,
             "retry_times": 3,
             # ---- 房间列表 ----
-            "list_page_size": 5,              # 列表指令每页显示数量
-            "list_default_full": "",          # 列表默认人数筛选: 空=全部 / hide=隐藏人满
-            "probe_max_per_msg": 5,           # 单条消息最多召唤的探针数
+            "list_page_size": 5,  # 列表指令每页显示数量
+            "list_default_full": "",  # 列表默认人数筛选: 空=全部 / hide=隐藏人满
+            "probe_max_per_msg": 5,  # 单条消息最多召唤的探针数
             # ---- bin 缓存清理 ----
-            "bin_cleanup_enabled": True,      # 是否在插件启动后定时清理 bin 缓存
-            "bin_cleanup_interval_hours": 24, # 清理间隔(小时), 默认一天一次
-            "bin_cleanup_max_age_hours": 1,   # 只清理超过该小时数(默认1小时)的 bin
+            "bin_cleanup_enabled": True,  # 是否在插件启动后定时清理 bin 缓存
+            "bin_cleanup_interval_hours": 24,  # 清理间隔(小时), 默认一天一次
+            "bin_cleanup_max_age_hours": 1,  # 只清理超过该小时数(默认1小时)的 bin
             # 撤回配置: 单一列表, 由 key 前缀区分群/用户, 写入即启用
             #   "#123456:60"      群 123456, 消息发出 60 秒后撤回
             #   "@3856554669:30"  用户 3856554669 私聊, 30 秒后撤回
@@ -1488,7 +1669,7 @@ class RWInfoPlugin(Star):
         try:
             self._sync_config_from_view()
             if hasattr(self.config, "save_config"):
-                self.config.save_config()          # AstrBot 的 AstrBotConfig
+                self.config.save_config()  # AstrBot 的 AstrBotConfig
             elif hasattr(self, "_config_saver"):
                 self._config_saver()
             else:
@@ -1496,7 +1677,8 @@ class RWInfoPlugin(Star):
                 # 调用方却照样回「已设置」，用户重启后发现全被还原。
                 self._save_failed = "config 对象不支持写盘（既无 save_config 也无 _config_saver）"
                 self.logger.error(
-                    "保存配置失败：config 对象既没有 save_config()，也没有 _config_saver")
+                    "保存配置失败：config 对象既没有 save_config()，也没有 _config_saver"
+                )
                 return False
             self._save_failed = ""
             return True
@@ -1540,10 +1722,10 @@ class RWInfoPlugin(Star):
 
         moved = False
         for k in list(self.config.keys()):
-            if k in self._conf_groups:        # 本身就是分组，跳过
+            if k in self._conf_groups:  # 本身就是分组，跳过
                 continue
             group = owner.get(k)
-            if not group:                     # 不属于任何分组，保留原样
+            if not group:  # 不属于任何分组，保留原样
                 continue
             body = self.config.get(group)
             if not isinstance(body, dict):
@@ -1585,9 +1767,7 @@ class RWInfoPlugin(Star):
             except Exception:
                 continue
         try:
-            self.logger.warning(
-                f"[配置] _conf_schema.json 未找到，已尝试: {cands[:8]}"
-            )
+            self.logger.warning(f"[配置] _conf_schema.json 未找到，已尝试: {cands[:8]}")
         except Exception:
             pass
         return cands[0] if cands else "_conf_schema.json"
@@ -1621,8 +1801,11 @@ class RWInfoPlugin(Star):
         except Exception:
             pass
         bases = []
-        for b in (here, globals().get("_PLUGIN_DIR", ""),
-                  os.path.dirname(globals().get("ROOM_INFO_PY", ""))):
+        for b in (
+            here,
+            globals().get("_PLUGIN_DIR", ""),
+            os.path.dirname(globals().get("ROOM_INFO_PY", "")),
+        ):
             if b and b not in bases:
                 bases.append(b)
         for base in bases:
@@ -1661,9 +1844,11 @@ class RWInfoPlugin(Star):
             # 这里必须打出来，否则线上永远查不出原因。
             try:
                 import traceback
+
                 self.logger.warning(
                     f"[配置] 读取 _conf_schema.json 失败: {path} | "
-                    f"{type(e).__name__}: {e} | 存在={os.path.exists(path)}")
+                    f"{type(e).__name__}: {e} | 存在={os.path.exists(path)}"
+                )
                 self.logger.warning(f"[配置] 候选路径: {self._schema_candidates()[:8]}")
                 self.logger.debug(traceback.format_exc())
             except Exception:
@@ -1729,7 +1914,7 @@ class RWInfoPlugin(Star):
             if isinstance(body, dict) and body.get("type") == "object":
                 items = body.get("items") or {}
             elif isinstance(body, dict):
-                items = {name: body}      # 未分组时 schema 是平铺的
+                items = {name: body}  # 未分组时 schema 是平铺的
             else:
                 continue
             for k, v in items.items():
@@ -1834,8 +2019,18 @@ class RWInfoPlugin(Star):
             return ""
         low = s.lower()
         # 平台名 / 适配器名 / 明显的非身份单词
-        bad = ("qq_official", "qqofficial", "official", "qq", "adapter",
-               "aiocqhttp", "napcat", "unknown", "none", "null")
+        bad = (
+            "qq_official",
+            "qqofficial",
+            "official",
+            "qq",
+            "adapter",
+            "aiocqhttp",
+            "napcat",
+            "unknown",
+            "none",
+            "null",
+        )
         if low in bad:
             return ""
         if "official" in low or "adapter" in low:
@@ -1857,8 +2052,7 @@ class RWInfoPlugin(Star):
             self._self_qq = sid
             return sid
 
-        cfg_qq = self._plausible_ident(
-            str(self.cfg.get("机器人QQ号", "") or "").strip())
+        cfg_qq = self._plausible_ident(str(self.cfg.get("机器人QQ号", "") or "").strip())
         if cfg_qq:
             self._self_qq = cfg_qq
             return cfg_qq
@@ -1871,8 +2065,8 @@ class RWInfoPlugin(Star):
         if not self._self_qq_warned:
             self._self_qq_warned = True
             self.logger.info(
-                f"未取到真实 QQ 号, 使用占位标识 {placeholder} "
-                f"(仅影响合并转发的显示名)")
+                f"未取到真实 QQ 号, 使用占位标识 {placeholder} (仅影响合并转发的显示名)"
+            )
         return placeholder
 
     def _self_placeholder(self) -> str:
@@ -1903,8 +2097,7 @@ class RWInfoPlugin(Star):
             try:
                 rules.append((f"自定义#{i}", re.compile(pat, re.MULTILINE)))
             except re.error as e:
-                self.logger.warning(
-                    f"[忽略] 自定义规则 #{i} 不是合法正则，已跳过：{pat!r}（{e}）")
+                self.logger.warning(f"[忽略] 自定义规则 #{i} 不是合法正则，已跳过：{pat!r}（{e}）")
         self._ignore_cache = (tuple(custom), rules)
         return rules
 
@@ -1946,8 +2139,12 @@ class RWInfoPlugin(Star):
         t = (text or "").strip()
         if not t:
             return False
-        for head in ("【铁锈查房调试】", "【铁锈查房调试 ·",
-                     "【铁锈查房插件指令】", "【铁锈查房调试菜单】"):
+        for head in (
+            "【铁锈查房调试】",
+            "【铁锈查房调试 ·",
+            "【铁锈查房插件指令】",
+            "【铁锈查房调试菜单】",
+        ):
             if head in t:
                 return True
         return False
@@ -2118,8 +2315,7 @@ class RWInfoPlugin(Star):
             # 删掉精确条目后，如果本群还会继承 "*" 默认，就补一条显式关闭记录。
             # 否则「关」只是把延迟退回默认值：用户看到的是"关完又自己开了"。
             # 读路径认 "*"、写路径只认精确 key —— 不对称就在这里。
-            if (not wildcard and not is_private
-                    and self._get_recall_cfg(event)["开"]):
+            if not wildcard and not is_private and self._get_recall_cfg(event)["开"]:
                 store.append(f"{key}:off")
                 self._save_config()
                 return True
@@ -2168,7 +2364,7 @@ class RWInfoPlugin(Star):
             for entry in entries:
                 cfg = self._recall_parse(entry)
                 if not cfg:
-                    changed = True       # 旧格式里开=0 或非法条目, 丢弃
+                    changed = True  # 旧格式里开=0 或非法条目, 丢弃
                     continue
                 new_entry = f"{cfg['key']}:{cfg['延迟']}"
                 if new_entry not in merged:
@@ -2204,8 +2400,7 @@ class RWInfoPlugin(Star):
         tried = []
 
         # ---- ① OneBot v11 标准: call_action ----
-        for holder_name, holder in (("bot.api", getattr(bot, "api", None)),
-                                    ("bot", bot)):
+        for holder_name, holder in (("bot.api", getattr(bot, "api", None)), ("bot", bot)):
             if holder is None:
                 continue
             for attr in ("call_action", "call_api"):
@@ -2221,8 +2416,7 @@ class RWInfoPlugin(Star):
                     if raw:
                         break
                 except Exception as e:
-                    self.logger.debug(
-                        f"[撤回] {holder_name}.{attr}('get_group_list') 失败: {e}")
+                    self.logger.debug(f"[撤回] {holder_name}.{attr}('get_group_list') 失败: {e}")
                     raw = None
             if raw:
                 break
@@ -2241,8 +2435,7 @@ class RWInfoPlugin(Star):
                     raw = None
 
         if not raw:
-            self.logger.debug(
-                f"[撤回] 未能拉取群列表, 已尝试: {tried or '(无可用方法)'}")
+            self.logger.debug(f"[撤回] 未能拉取群列表, 已尝试: {tried or '(无可用方法)'}")
             return []
 
         # ---- 归一化各种返回格式 ----
@@ -2331,7 +2524,7 @@ class RWInfoPlugin(Star):
 
         # 2. 配置里明确写过的群
         for ckey in ("白名单", "黑名单", "混合_白名单", "混合_黑名单"):
-            for item in (self.cfg.get(ckey) or []):
+            for item in self.cfg.get(ckey) or []:
                 s = str(item).strip()
                 if s.startswith("#") and len(s) > 1:
                     for part in s[1:].split("@")[:1]:
@@ -2507,7 +2700,7 @@ class RWInfoPlugin(Star):
                 # 允许 /铁锈列表、/铁锈列表、@机器人 /铁锈列表 等前缀
                 m = re.search(re.escape(name), text)
                 if m:
-                    rest = text[m.end():].strip()
+                    rest = text[m.end() :].strip()
                     # 去掉可能残留的前导分隔符
                     rest = rest.lstrip(":：,，")
                     if rest:
@@ -2725,8 +2918,7 @@ class RWInfoPlugin(Star):
             out.append(ln)
         s = "\n".join(out)
         # 3. 行首：缩进转全角；唤醒词 -> 全角；其余 Markdown 行首符 -> 等价字符
-        full = {"!": "！", "#": "＃", "-": "－",
-                "*": "＊", "_": "＿", ">": "＞", "+": "＋"}
+        full = {"!": "！", "#": "＃", "-": "－", "*": "＊", "_": "＿", ">": "＞", "+": "＋"}
         fixed = []
         for ln in s.split("\n"):
             # 3a. 前导缩进 -> 全角空格（保住缩进观感，不触发代码块）
@@ -2738,15 +2930,15 @@ class RWInfoPlugin(Star):
                 n = sum(4 if ch == "\t" else 1 for ch in raw)
                 ln = "\u3000" * n + ln[lead:]
             stripped = ln.lstrip()
-            indent = ln[:len(ln) - len(stripped)]
+            indent = ln[: len(ln) - len(stripped)]
             # 3b. 唤醒词本身是 Markdown 特殊字符：换成全角，保住指令可见性
             if prefix and prefix in full and stripped.startswith(prefix):
-                ln = indent + full[prefix] + stripped[len(prefix):]
-                stripped = ln[len(indent):]
+                ln = indent + full[prefix] + stripped[len(prefix) :]
+                stripped = ln[len(indent) :]
             # 3c. 引用块
             if stripped.startswith(">"):
                 ln = indent + "」 " + stripped[1:].lstrip()
-                stripped = ln[len(indent):]
+                stripped = ln[len(indent) :]
             # 3d. 有序列表 `1. ` -> `1．`
             # 房间列表里的 `1. 房间名　19/19` 是真实内容（含全角空格分栏），
             # QQ 不会把它当 Markdown 列表，保持原样即可。
@@ -2835,11 +3027,12 @@ class RWInfoPlugin(Star):
         if not body:
             return False, None, "内容为空"
         me = self._as_int(self._resolve_self_qq(event)) or 10000
-        nodes = [{
-            "type": "node",
-            "data": {"name": "铁锈查房", "uin": me,
-                     "content": f"【{title}】\n{body}"},
-        }]
+        nodes = [
+            {
+                "type": "node",
+                "data": {"name": "铁锈查房", "uin": me, "content": f"【{title}】\n{body}"},
+            }
+        ]
         try:
             result = await fn(group_id=gid, messages=nodes)
             mid = self._extract_message_id(result)
@@ -2851,21 +3044,24 @@ class RWInfoPlugin(Star):
             # 第一张卡片可能已经送到，再发一次就是群里两条重复的查房结果。
             if not isinstance(e, (TypeError, KeyError, AttributeError)):
                 reason = f"{type(e).__name__}: {e}"
-                self.logger.warning(
-                    f"[合并转发] 发送异常，可能已送达，不再重试: {reason}")
+                self.logger.warning(f"[合并转发] 发送异常，可能已送达，不再重试: {reason}")
                 return False, None, reason
             try:
-                simple = [{"name": n["data"]["name"], "uin": n["data"]["uin"],
-                           "content": n["data"]["content"]} for n in nodes]
+                simple = [
+                    {
+                        "name": n["data"]["name"],
+                        "uin": n["data"]["uin"],
+                        "content": n["data"]["content"],
+                    }
+                    for n in nodes
+                ]
                 result = await fn(group_id=gid, messages=simple)
                 mid = self._extract_message_id(result)
                 self.logger.info(f"[合并转发] 简写格式成功, mid={mid}")
                 return True, mid, ""
             except Exception as e2:
                 reason = f"{type(e).__name__}: {e} / {type(e2).__name__}: {e2}"
-                self.logger.warning(
-                    f"[合并转发] 两种格式都失败，降级纯文本: {reason}"
-                )
+                self.logger.warning(f"[合并转发] 两种格式都失败，降级纯文本: {reason}")
                 return False, None, reason
 
     @staticmethod
@@ -2895,8 +3091,7 @@ class RWInfoPlugin(Star):
         就抛了，连接被拒说明根本没连上。超时、连接重置可能已经送达，
         重发会让群里出现两条一模一样的消息。
         """
-        return isinstance(e, (TypeError, ValueError, AttributeError,
-                              KeyError, ConnectionError))
+        return isinstance(e, (TypeError, ValueError, AttributeError, KeyError, ConnectionError))
 
     def _want_markdown(self, event=None) -> bool:
         """本条消息是否该走官方 Markdown 通道。
@@ -2916,20 +3111,32 @@ class RWInfoPlugin(Star):
         按会话类型优先匹配接口：群 post_group_message，私 post_c2c_message。
         """
         if topic == "c2c":
-            api_names = ("post_c2c_message", "post_dms_message",
-                         "send_c2c_message", "post_group_message",
-                         "send_group_message")
+            api_names = (
+                "post_c2c_message",
+                "post_dms_message",
+                "send_c2c_message",
+                "post_group_message",
+                "send_group_message",
+            )
         else:
-            api_names = ("post_group_message", "send_group_message",
-                         "post_c2c_message", "post_dms_message")
+            api_names = (
+                "post_group_message",
+                "send_group_message",
+                "post_c2c_message",
+                "post_dms_message",
+            )
         api = getattr(bot, "api", None) if bot is not None else None
         if api is not None:
             for name in api_names:
                 fn = getattr(api, name, None)
                 if callable(fn):
                     return fn, "api", api
-        bot_names = tuple(api_names) + ("send_group_markdown", "send_markdown",
-                                        "send_group_msg", "send_private_msg")
+        bot_names = tuple(api_names) + (
+            "send_group_markdown",
+            "send_markdown",
+            "send_group_msg",
+            "send_private_msg",
+        )
         for name in bot_names:
             fn = getattr(bot, name, None) if bot is not None else None
             if callable(fn):
@@ -3005,6 +3212,7 @@ class RWInfoPlugin(Star):
                     kw["openid"] = target
                 try:
                     import inspect as _insp
+
                     params = _insp.signature(fn).parameters
                     if topic == "group" and "group_openid" not in params:
                         for alt in ("group_id", "open_id", "gid"):
@@ -3017,14 +3225,16 @@ class RWInfoPlugin(Star):
                                 kw[alt] = kw.pop("openid")
                                 break
                     if params and not any(
-                            p.kind == _insp.Parameter.VAR_KEYWORD
-                            for p in params.values()):
+                        p.kind == _insp.Parameter.VAR_KEYWORD for p in params.values()
+                    ):
                         kw = {k: v for k, v in kw.items() if k in params}
                 except Exception:
                     pass
-                call_desc = (f"{getattr(fn, '__name__', 'api')}("
-                             f"{'group_openid' if topic == 'group' else 'openid'}"
-                             f"={target[:8]}..., msg_type=2, ...)")
+                call_desc = (
+                    f"{getattr(fn, '__name__', 'api')}("
+                    f"{'group_openid' if topic == 'group' else 'openid'}"
+                    f"={target[:8]}..., msg_type=2, ...)"
+                )
                 result = await fn(**kw)
             else:
                 # 直接 POST 风格：先试 (target, payload)，失败再试 payload 单参
@@ -3043,8 +3253,7 @@ class RWInfoPlugin(Star):
             # 不清的话一次偶发失败会让菜单永远显示「上次发送异常」。
             self._last_md_error = None
             self.logger.info(
-                f"[官机] markdown 已发送 [{call_desc}] mid={mid} "
-                f"返回类型={type(result).__name__}"
+                f"[官机] markdown 已发送 [{call_desc}] mid={mid} 返回类型={type(result).__name__}"
             )
             return True, mid
         except (TypeError, ValueError, AttributeError) as e:
@@ -3067,7 +3276,8 @@ class RWInfoPlugin(Star):
             # 早先一律返回 True（"已发送"），官Q 通道一超时用户就一条消息都收不到，
             # 日志里也只有一行 error —— 看起来像「房间查不到」。
             uncertain = not isinstance(
-                e, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError))
+                e, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)
+            )
             self.logger.error(
                 f"[官机] markdown 发送异常"
                 f"{'(可能已送达, 不重发)' if uncertain else '(未送达, 降级重发)'}: "
@@ -3287,8 +3497,7 @@ class RWInfoPlugin(Star):
             # `键: 值` 说明行：键加粗，值保留
             m = re.match(r"^([^：:]{1,10})[：:]\s*(.+)$", s)
             if m:
-                out.append(f"- **{m.group(1).strip()}**："
-                           f"{m.group(2).strip().replace('|', '｜')}")
+                out.append(f"- **{m.group(1).strip()}**：{m.group(2).strip().replace('|', '｜')}")
                 continue
             # 以冒号结尾的「引导行」（如 `筛选:`），后面跟着缩进子项：
             # 只把键加粗，不加 `- ` 前缀，避免和子项看起来同级。
@@ -3309,20 +3518,20 @@ class RWInfoPlugin(Star):
     def _pr(self, event, text, kind: str = "auto"):
         """构造面向用户的纯文本结果：替换指令前缀 + 按需压缩折叠。
 
-        **重要限制**：本方法返回的是 AstrBot 的纯文本组件，无法发送
-_ag = self._send_text(...)
-async for _r in _ag:
-    yield _r`。
-_ag = self._send_text(...)
-async for _r in _ag:
-    yield _r` 保持零改动。
+                **重要限制**：本方法返回的是 AstrBot 的纯文本组件，无法发送
+        _ag = self._send_text(...)
+        async for _r in _ag:
+            yield _r`。
+        _ag = self._send_text(...)
+        async for _r in _ag:
+            yield _r` 保持零改动。
 
-        参数 kind：
-          "auto"  —— 自动判断。有房号信息 -> room，有调试标记 -> diag，
-                     其余按 help 处理。
-          "room" / "diag" / "help" —— 显式指定分类。
+                参数 kind：
+                  "auto"  —— 自动判断。有房号信息 -> room，有调试标记 -> diag，
+                             其余按 help 处理。
+                  "room" / "diag" / "help" —— 显式指定分类。
 
-        只替换 `/铁锈`、`/rwinfo` 这类**指令名**，不会碰文件路径和 URL。
+                只替换 `/铁锈`、`/rwinfo` 这类**指令名**，不会碰文件路径和 URL。
         """
         if not text:
             return event.plain_result(text)
@@ -3366,11 +3575,15 @@ async for _r in _ag:
         _help_will_fold = False
         if k == "help" and is_content:
             try:
-                _help_will_fold = (official and self._should_compress("help"))
+                _help_will_fold = official and self._should_compress("help")
             except Exception:
                 _help_will_fold = False
-        if official and is_content and k not in ("list", "room", "diag") \
-                and not (k == "help" and _help_will_fold):
+        if (
+            official
+            and is_content
+            and k not in ("list", "room", "diag")
+            and not (k == "help" and _help_will_fold)
+        ):
             try:
                 s = self._to_markdown(s)
             except Exception:
@@ -3532,12 +3745,9 @@ async for _r in _ag:
             for item in obj:
                 yield item
         except TypeError:
-            self.logger.warning(
-                f"[适配] 无法迭代的对象: {type(obj).__name__}"
-            )
+            self.logger.warning(f"[适配] 无法迭代的对象: {type(obj).__name__}")
 
-    async def _send_text(self, event, text, kind: str = "auto",
-                         keyboard_text: str = None):
+    async def _send_text(self, event, text, kind: str = "auto", keyboard_text: str = None):
         """按平台发送文本（异步生成器）。
 
         官Q模式走 Markdown 通道；第三方机器人没有 Markdown，需要折叠时
@@ -3558,8 +3768,7 @@ async for _r in _ag:
             kb = None
             try:
                 if self.cfg.get("官Q模式", False):
-                    kb = self._keyboard_of(text if keyboard_text is None
-                                          else keyboard_text, event)
+                    kb = self._keyboard_of(text if keyboard_text is None else keyboard_text, event)
             except Exception as e:
                 self.logger.debug(f"[官机] 按钮构造失败(忽略): {e}")
             ok, _mid = await self._send_official_markdown(event, s, kb)
@@ -3581,9 +3790,14 @@ async for _r in _ag:
             k = self._guess_kind(s) if kind == "auto" else kind
         except Exception:
             k = "help"
-        if (self._should_compress(k) and k not in ("room", "diag")
-                and not self._is_official_platform(event)):
-            ok_fw, _mid, reason = await self._send_forward_card(event, s, _FOLD_TITLES.get(k, "房间信息"))
+        if (
+            self._should_compress(k)
+            and k not in ("room", "diag")
+            and not self._is_official_platform(event)
+        ):
+            ok_fw, _mid, reason = await self._send_forward_card(
+                event, s, _FOLD_TITLES.get(k, "房间信息")
+            )
             if ok_fw:
                 return
             self.logger.info(f"[合并转发] 不可用({reason}), 降级完整纯文本")
@@ -3599,20 +3813,33 @@ async for _r in _ag:
         t = str(text)
         if t.lstrip().startswith("【房间列表】") or t.lstrip().startswith("[房间列表]"):
             return "list"
-        room_hits = sum(1 for k in ("地图名称", "初始资金", "初始禁核",
-                                    "当前人数", "初始迷雾", "默认单位") if k in t)
+        room_hits = sum(
+            1
+            for k in ("地图名称", "初始资金", "初始禁核", "当前人数", "初始迷雾", "默认单位")
+            if k in t
+        )
         if room_hits >= 2 or ("ID：" in t and "当前人数" in t):
             return "room"
         # 调试类内容全部以 `-- 分类 --` 分段 + `键: 值` 平铺，
-# 特征是「【铁锈查房调试 或 【官机 开头的标题」和成段的 `-- xxx --`。
+        # 特征是「【铁锈查房调试 或 【官机 开头的标题」和成段的 `-- xxx --`。
         # 之前只认 6 个固定标题，漏了「-- 撤回配置 --」「-- 房间列表 --」
         # 「-- 主要配置 --」等 —— 单独查某一分类时判不出 diag，
         # 会被当成 help 去做 Markdown 转换，排版立刻崩掉。
         if t.lstrip().startswith(("【铁锈查房调试", "【官机")):
             return "diag"
-        diag_hits = sum(1 for k in ("-- 当前会话", "-- 撤回配置", "-- 待撤回",
-                                    "-- 探针池", "-- 房间列表", "-- 主要配置",
-                                    "-- 查看分类") if k in t)
+        diag_hits = sum(
+            1
+            for k in (
+                "-- 当前会话",
+                "-- 撤回配置",
+                "-- 待撤回",
+                "-- 探针池",
+                "-- 房间列表",
+                "-- 主要配置",
+                "-- 查看分类",
+            )
+            if k in t
+        )
         if diag_hits >= 1:
             return "diag"
         return "help"
@@ -3698,57 +3925,115 @@ async for _r in _ag:
             except Exception:
                 cur_page, total_pages = 1, 1
             if cur_page > 1:
-                nav.append({
-                    "render_data": {"label": "上一页",
-                                    "visited_label": "上一页", "style": 0},
-                    "action": {"type": 2, "permission": {"type": 2},
-                               "data": f"{p}铁锈上一页", "enter": False}})
+                nav.append(
+                    {
+                        "render_data": {"label": "上一页", "visited_label": "上一页", "style": 0},
+                        "action": {
+                            "type": 2,
+                            "permission": {"type": 2},
+                            "data": f"{p}铁锈上一页",
+                            "enter": False,
+                        },
+                    }
+                )
             if cur_page < total_pages:
-                nav.append({
-                    "render_data": {"label": "下一页",
-                                    "visited_label": "下一页", "style": 1},
-                    "action": {"type": 2, "permission": {"type": 2},
-                               "data": f"{p}铁锈下一页", "enter": False}})
+                nav.append(
+                    {
+                        "render_data": {"label": "下一页", "visited_label": "下一页", "style": 1},
+                        "action": {
+                            "type": 2,
+                            "permission": {"type": 2},
+                            "data": f"{p}铁锈下一页",
+                            "enter": False,
+                        },
+                    }
+                )
             if nav:
                 rows.append({"buttons": nav})
 
         if is_room:
-            rows.append({"buttons": [
-                {"render_data": {"label": "刷新", "visited_label": "刷新中", "style": 1},
-                 "action": {"type": 2, "permission": {"type": 2},
-                            "data": f"{p}铁锈查房 {rid}", "enter": False}},
-                {"render_data": {"label": "房间列表", "visited_label": "加载中", "style": 0},
-                 "action": {"type": 2, "permission": {"type": 2},
-                            "data": f"{p}铁锈列表", "enter": False}},
-            ]})
+            rows.append(
+                {
+                    "buttons": [
+                        {
+                            "render_data": {"label": "刷新", "visited_label": "刷新中", "style": 1},
+                            "action": {
+                                "type": 2,
+                                "permission": {"type": 2},
+                                "data": f"{p}铁锈查房 {rid}",
+                                "enter": False,
+                            },
+                        },
+                        {
+                            "render_data": {
+                                "label": "房间列表",
+                                "visited_label": "加载中",
+                                "style": 0,
+                            },
+                            "action": {
+                                "type": 2,
+                                "permission": {"type": 2},
+                                "data": f"{p}铁锈列表",
+                                "enter": False,
+                            },
+                        },
+                    ]
+                }
+            )
             cur = bool(self.cfg.get("show_players", False))
             nxt = "关" if cur else "开"
-            rows.append({"buttons": [
-                {"render_data": {"label": "玩家列表" + nxt,
-                                 "visited_label": "已切换", "style": 0},
-                 "action": {"type": 2, "permission": {"type": 2},
-                            "data": f"{p}铁锈玩家列表 {nxt}", "enter": False}},
-                {"render_data": {"label": "帮助", "visited_label": "打开中", "style": 0},
-                 "action": {"type": 2, "permission": {"type": 2},
-                            "data": f"{p}铁锈帮助", "enter": False}},
-            ]})
+            rows.append(
+                {
+                    "buttons": [
+                        {
+                            "render_data": {
+                                "label": "玩家列表" + nxt,
+                                "visited_label": "已切换",
+                                "style": 0,
+                            },
+                            "action": {
+                                "type": 2,
+                                "permission": {"type": 2},
+                                "data": f"{p}铁锈玩家列表 {nxt}",
+                                "enter": False,
+                            },
+                        },
+                        {
+                            "render_data": {"label": "帮助", "visited_label": "打开中", "style": 0},
+                            "action": {
+                                "type": 2,
+                                "permission": {"type": 2},
+                                "data": f"{p}铁锈帮助",
+                                "enter": False,
+                            },
+                        },
+                    ]
+                }
+            )
 
         # 项目主页按钮：type=0 URL 跳转（不受 Markdown 域名白名单限制）
         # 房间信息/房间列表都挂（单页列表没有翻页行时也要有）
         try:
             if self.cfg.get("显示项目地址", True):
-                rows.append({"buttons": [
-                    {"render_data": {"label": "项目主页",
-                                     "visited_label": "感谢支持", "style": 0},
-                     "action": {"type": 0, "permission": {"type": 2},
-                                "data": REPO_URL}},
-                ]})
+                rows.append(
+                    {
+                        "buttons": [
+                            {
+                                "render_data": {
+                                    "label": "项目主页",
+                                    "visited_label": "感谢支持",
+                                    "style": 0,
+                                },
+                                "action": {"type": 0, "permission": {"type": 2}, "data": REPO_URL},
+                            },
+                        ]
+                    }
+                )
         except Exception:
             pass
         return {"content": {"rows": rows}} if rows else None
 
     def _adapt_text(self, text: str, event=None) -> str:
-
         """按平台适配消息文本。
 
         官方机器人对纯文本的支持较弱（有些接口会把长文本截断、
@@ -3858,10 +4143,10 @@ async for _r in _ag:
         # 官方机器人没有这个接口（那边用 Markdown 代码块），
         # 个人机器人（OneBot v11）支持，群里只占一条消息、点开才展开。
         # 折叠没意义，失败提示更是纯噪音。
-        if (not self._is_official_platform(event)
-                and self._should_compress("room")):
+        if not self._is_official_platform(event) and self._should_compress("room"):
             ok_fw, mid_fw, fw_reason = await self._send_forward_card(
-                event, text, _FOLD_TITLES["room"])
+                event, text, _FOLD_TITLES["room"]
+            )
             if ok_fw:
                 return mid_fw
             self.logger.info(f"[合并转发] 不可用({fw_reason}), 降级为普通文本")
@@ -3882,15 +4167,14 @@ async for _r in _ag:
                 # 症状是「查房卡片不出现，其他指令都正常」—— 极难排查。
                 if not self._send_retry_safe(e):
                     self.logger.error(
-                        f"[发送] 发送失败且可能已送达，不重试: {type(e).__name__}: {e}")
+                        f"[发送] 发送失败且可能已送达，不重试: {type(e).__name__}: {e}"
+                    )
                     return None
-                self.logger.warning(
-                    f"发送消息失败, 降级纯文本重试: {type(e).__name__}: {e}")
+                self.logger.warning(f"发送消息失败, 降级纯文本重试: {type(e).__name__}: {e}")
                 try:
                     await event.send(event.plain_result(text))
                 except Exception as e2:
-                    self.logger.error(
-                        f"[发送] 纯文本兜底仍失败: {type(e2).__name__}: {e2}")
+                    self.logger.error(f"[发送] 纯文本兜底仍失败: {type(e2).__name__}: {e2}")
             return None
         mid = None
         bot = getattr(event, "bot", None)
@@ -3942,9 +4226,7 @@ async for _r in _ag:
             except Exception as e:
                 # 发送可能已成功(异常在回包解析阶段), 因此**不重发**,
                 # 只记日志, 本条放弃撤回。
-                self.logger.warning(
-                    f"[撤回] bot.send_msg 调用异常, 本条不再重发(避免重复): {e}"
-                )
+                self.logger.warning(f"[撤回] bot.send_msg 调用异常, 本条不再重发(避免重复): {e}")
                 return None
         else:
             # ---- 路径 ②: bot 不支持显式发送, 只能原生发送 ----
@@ -3954,16 +4236,15 @@ async for _r in _ag:
             except Exception as e:
                 if not self._send_retry_safe(e):
                     self.logger.error(
-                        f"[发送] 发送失败且可能已送达，不重试: {type(e).__name__}: {e}")
+                        f"[发送] 发送失败且可能已送达，不重试: {type(e).__name__}: {e}"
+                    )
                     return None
-                self.logger.warning(
-                    f"发送消息失败, 降级纯文本重试: {type(e).__name__}: {e}")
+                self.logger.warning(f"发送消息失败, 降级纯文本重试: {type(e).__name__}: {e}")
                 try:
                     send_result = await event.send(event.plain_result(text))
                     mid = self._extract_message_id(send_result)
                 except Exception as e2:
-                    self.logger.error(
-                        f"[发送] 纯文本兜底仍失败: {type(e2).__name__}: {e2}")
+                    self.logger.error(f"[发送] 纯文本兜底仍失败: {type(e2).__name__}: {e2}")
                     return None
 
         if mid is None:
@@ -3989,9 +4270,7 @@ async for _r in _ag:
         # 登记明细(会话/计划撤回时间), 供 /铁锈查房调试 展示真实进度。
         due = time.time() + max(0, delay)
         rec_key = self._dedup_key(event)
-        task = asyncio.create_task(
-            self._delayed_recall(event, mid, max(0, delay), bot=bot)
-        )
+        task = asyncio.create_task(self._delayed_recall(event, mid, max(0, delay), bot=bot))
         meta = {"key": rec_key, "mid": mid, "due": due, "delay": delay}
         self._recall_meta[id(task)] = meta
 
@@ -4014,10 +4293,7 @@ async for _r in _ag:
         """
         if not text:
             return text
-        return (str(text)
-                .replace("&", "&amp;")
-                .replace("[", "&#91;")
-                .replace("]", "&#93;"))
+        return str(text).replace("&", "&amp;").replace("[", "&#91;").replace("]", "&#93;")
 
     @staticmethod
     def _extract_message_id(result):
@@ -4077,9 +4353,7 @@ async for _r in _ag:
 
         target = bot if bot is not None else getattr(event, "bot", None)
         if target is None or not hasattr(target, "delete_msg"):
-            self.logger.info(
-                f"[撤回] 无法撤回 mid={message_id}: 当前 bot 对象不支持 delete_msg"
-            )
+            self.logger.info(f"[撤回] 无法撤回 mid={message_id}: 当前 bot 对象不支持 delete_msg")
             return
 
         # message_id 可能是 int 或 str (不同适配器不一致), 原样传入, 不要强转
@@ -4096,8 +4370,19 @@ async for _r in _ag:
                 last_err = e
                 msg = str(e).lower()
                 # 不可恢复的错误直接放弃, 不重试
-                if any(k in msg for k in ("time", "expire", "permission", "forbidden",
-                                          "not found", "不存在", "无权限", "超时")):
+                if any(
+                    k in msg
+                    for k in (
+                        "time",
+                        "expire",
+                        "permission",
+                        "forbidden",
+                        "not found",
+                        "不存在",
+                        "无权限",
+                        "超时",
+                    )
+                ):
                     break
                 if attempt == 1:
                     self.logger.debug(f"[撤回] 第1次失败, 1s 后重试 mid={message_id}: {e}")
@@ -4174,7 +4459,9 @@ async for _r in _ag:
         相比 int(time.time()) 的10位纯数字, 更短且含字母, 降低被服务器过滤概率."""
         t = time.localtime()
         # 月日时分秒压成整数: (月-1)*31+日-1 保证唯一可逆, 最大 32140799, base36 5位足够
-        v = ((((t.tm_mon - 1) * 31 + (t.tm_mday - 1)) * 24 + t.tm_hour) * 60 + t.tm_min) * 60 + t.tm_sec
+        v = (
+            (((t.tm_mon - 1) * 31 + (t.tm_mday - 1)) * 24 + t.tm_hour) * 60 + t.tm_min
+        ) * 60 + t.tm_sec
         chars = "0123456789abcdefghijklmnopqrstuvwxyz"
         s = ""
         while v:
@@ -4189,10 +4476,14 @@ async for _r in _ag:
         v = 0
         for c in s:
             v = v * 36 + chars.find(c)
-        sec = v % 60; v //= 60
-        minute = v % 60; v //= 60
-        hour = v % 24; v //= 24
-        day = v % 31 + 1; v //= 31
+        sec = v % 60
+        v //= 60
+        minute = v % 60
+        v //= 60
+        hour = v % 24
+        v //= 24
+        day = v % 31 + 1
+        v //= 31
         month = v + 1
         return month, day, hour, minute, sec
 
@@ -4256,12 +4547,17 @@ async for _r in _ag:
         import urllib.parse
         import urllib.request
         import gzip as _gzip
+
         for base in MASTERSERVERS:
-            url = base + "/interface?" + urllib.parse.urlencode(
-                {"action": "get", "game_id": room_uuid, "c": c})
+            url = (
+                base
+                + "/interface?"
+                + urllib.parse.urlencode({"action": "get", "game_id": room_uuid, "c": c})
+            )
             try:
-                req = urllib.request.Request(url, headers={
-                    "User-Agent": f"rw android {CLIENT_VER} en", "Language": "en"})
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": f"rw android {CLIENT_VER} en", "Language": "en"}
+                )
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     data = resp.read()
                     if resp.headers.get("Content-Encoding") == "gzip":
@@ -4284,8 +4580,9 @@ async for _r in _ag:
                     return f"{ip}:{port}"
         return ""
 
-    async def _query_room(self, rid: str, probe_name: str, gid: str = "",
-                          explain: bool = False) -> str:
+    async def _query_room(
+        self, rid: str, probe_name: str, gid: str = "", explain: bool = False
+    ) -> str:
         started = time.time()
         try:
             result = await self._query_room_impl(rid, probe_name, gid, explain)
@@ -4297,12 +4594,12 @@ async for _r in _ag:
             raise
         except Exception as e:
             # 兜底也要记账；原有上层异常处理与错误文案不变。
-            self._record_query(rid, started,
-                               f"[插件错误] {type(e).__name__}: {e}")
+            self._record_query(rid, started, f"[插件错误] {type(e).__name__}: {e}")
             raise
 
-    async def _query_room_impl(self, rid: str, probe_name: str, gid: str = "",
-                               explain: bool = False) -> str:
+    async def _query_room_impl(
+        self, rid: str, probe_name: str, gid: str = "", explain: bool = False
+    ) -> str:
         # 探针脚本缺失 / 接口过旧 -> 从仓库补齐（仅这两种情况，不做自动更新）。
         # 放到线程里跑：里面会起子进程探测版本 + 网络下载，不能阻塞事件循环。
         if not os.path.exists(ROOM_INFO_PY) or not getattr(self, "_room_info_ok", False):
@@ -4326,22 +4623,34 @@ async for _r in _ag:
             "-u",
             ROOM_INFO_PY,
             rid,
-            "--name", probe_name,
-            "--max-players", str(self.cfg.get("max_players_display", 10))
+            "--name",
+            probe_name,
+            "--max-players",
+            str(self.cfg.get("max_players_display", 10)),
+            # 推广冷却状态也写到插件数据目录，别落进插件自身目录
+            "--state-dir",
+            self._data_dir,
         ]
         if self.cfg.get("show_players", False):
             cmd_args.append("--show-players")
         # 进房推广：文案固定为项目地址，不开放配置 ——
         # 文案写死为 REPO_URL，保证来源标识不会被配置覆盖。
         if self.cfg.get("推广开关", False):
-            cmd_args += ["--promote", _PROMOTE_DEFAULT,
-                         "--promote-cooldown",
-                         str(self.cfg.get("推广冷却秒", 180))]
+            cmd_args += [
+                "--promote",
+                _PROMOTE_DEFAULT,
+                "--promote-cooldown",
+                str(self.cfg.get("推广冷却秒", 180)),
+            ]
         if self.cfg.get("debug", False):
             cmd_args.append("--debug")
         self.logger.debug(f"[DBG] _query_room 调用: rid={rid} name={probe_name}")
-        self.logger.debug(f"[DBG] python={python} exists={os.path.exists(python) if python else False}")
-        self.logger.debug(f"[DBG] ROOM_INFO_PY={ROOM_INFO_PY} exists={os.path.exists(ROOM_INFO_PY)} cwd={ROOM_INFO_DIR}")
+        self.logger.debug(
+            f"[DBG] python={python} exists={os.path.exists(python) if python else False}"
+        )
+        self.logger.debug(
+            f"[DBG] ROOM_INFO_PY={ROOM_INFO_PY} exists={os.path.exists(ROOM_INFO_PY)} cwd={ROOM_INFO_DIR}"
+        )
         self.logger.debug(f"[DBG] cmd_args={cmd_args}")
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -4352,14 +4661,18 @@ async for _r in _ag:
             )
         except FileNotFoundError:
             self.logger.error(f"启动探针失败: 解释器不存在 {python}")
-            return (f"[房间查询失败] 找不到用来跑探针的 Python：{python}"
-                    f"\n通常是插件运行环境的问题（容器里没有 python3，或路径被改过）")
+            return (
+                f"[房间查询失败] 找不到用来跑探针的 Python：{python}"
+                f"\n通常是插件运行环境的问题（容器里没有 python3，或路径被改过）"
+            )
         except PermissionError as e:
             self.logger.error(f"启动探针失败: 没有执行权限 {python}: {e}")
-            return (f"[房间查询失败] 没有权限执行 {python}：{e}"
-                    f"\n检查该文件是否可执行、是否被安全策略拦截")
+            return (
+                f"[房间查询失败] 没有权限执行 {python}：{e}"
+                f"\n检查该文件是否可执行、是否被安全策略拦截"
+            )
         except Exception as e:
-            self.logger.exception("启动探针进程失败")
+            self.logger.error("启动探针进程失败", exc_info=True)
             return f"[插件错误] 启动探针进程失败（{type(e).__name__}）：{e}"
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=QUERY_TIMEOUT)
@@ -4371,8 +4684,10 @@ async for _r in _ag:
             except Exception:
                 pass
             if explain:
-                return (f"[房间查询失败] 查询超时（超过 {QUERY_TIMEOUT} 秒）——"
-                        f"探针进程无响应，通常是到中继的连接卡住了")
+                return (
+                    f"[房间查询失败] 查询超时（超过 {QUERY_TIMEOUT} 秒）——"
+                    f"探针进程无响应，通常是到中继的连接卡住了"
+                )
             return f"[rwinfo] 查询超时(>{QUERY_TIMEOUT}s): {rid}"
         except asyncio.CancelledError:
             # 协程被取消(插件卸载/任务清理): 必须终止并回收子进程, 避免留下孤儿进程
@@ -4391,10 +4706,12 @@ async for _r in _ag:
                 await asyncio.wait_for(proc.wait(), timeout=5)
             except Exception:
                 pass
-            self.logger.exception(f"[查房] {rid} 与探针进程通信异常")
+            self.logger.error(f"[查房] {rid} 与探针进程通信异常", exc_info=True)
             if explain:
-                return (f"[插件错误] 读取探针输出时异常（{type(e).__name__}）：{e}"
-                        f"\n这是插件 bug，不是房间问题；日志里有完整堆栈")
+                return (
+                    f"[插件错误] 读取探针输出时异常（{type(e).__name__}）：{e}"
+                    f"\n这是插件 bug，不是房间问题；日志里有完整堆栈"
+                )
             raise
         out = stdout.decode("utf-8", "replace").strip()
         err = stderr.decode("utf-8", "replace").strip()
@@ -4406,7 +4723,9 @@ async for _r in _ag:
             self.logger.debug(f"[DBG] stderr 前500字: {err[:500]!r}")
         if not out:
             # 无输出 = 房间不存在/英文单词误报, 静默丢弃 (避免国际房批量尝试刷屏)
-            self.logger.debug(f"查询 {rid} 无输出, 静默 (python={python} rc={rc}) stderr: {err[:300]}")
+            self.logger.debug(
+                f"查询 {rid} 无输出, 静默 (python={python} rc={rc}) stderr: {err[:300]}"
+            )
             if explain:
                 # 用户主动查房时不能只说「无响应」——那等于没说。
                 # 把退出码和 stderr 尾部带回去，至少能区分
@@ -4417,7 +4736,7 @@ async for _r in _ag:
                 # 能直接说清是哪一类问题，比「无响应」有用得多。
                 rc_hint = {
                     2: "探针连不上中继（DNS 解析失败或端口不通），"
-                       "这是机器人所在机器的网络问题，不是房号写错",
+                    "这是机器人所在机器的网络问题，不是房号写错",
                     3: "房间不存在或已关闭",
                     4: "房间已满或游戏已经开始，探针进不去",
                     5: "房间信息解析或查询链路异常（房间可能刚开或在迁移，稍后重试）",
@@ -4425,9 +4744,11 @@ async for _r in _ag:
                 if rc_hint:
                     msg = f"[房间查询失败] {rc_hint}（退出码 {rc}）"
                 else:
-                    msg = (f"[房间查询失败] 探针没有任何输出（退出码 {rc}）。"
-                           f"常见原因：本机到中继不通、DNS 解析失败，"
-                           f"或插件目录里的 room_info.py 与运行环境不匹配")
+                    msg = (
+                        f"[房间查询失败] 探针没有任何输出（退出码 {rc}）。"
+                        f"常见原因：本机到中继不通、DNS 解析失败，"
+                        f"或插件目录里的 room_info.py 与运行环境不匹配"
+                    )
                 if detail:
                     msg += f"\n脚本输出：{detail}"
                 else:
@@ -4461,7 +4782,7 @@ async for _r in _ag:
         if not ident:
             return False
         want = (kind + str(ident).strip()).lower()
-        for raw in (lst or []):
+        for raw in lst or []:
             if isinstance(raw, str) and raw.strip().lower() == want:
                 return True
         return False
@@ -4477,7 +4798,7 @@ async for _r in _ag:
         target = str(ident).strip().lower()
         want = (kind + target).lower()
         out = []
-        for raw in (lst or []):
+        for raw in lst or []:
             if not isinstance(raw, str):
                 continue
             s = raw.strip()
@@ -4520,7 +4841,7 @@ async for _r in _ag:
             if self._list_hit(mbl, "@", uid):
                 return False  # 用户在混合黑名单 -> 拦
             if self._list_hit(mwl, "@", uid):
-                return True   # 用户在混合白名单 -> 放
+                return True  # 用户在混合白名单 -> 放
             # 用户不在两名单: 跟随配置的私聊默认策略
             # 只认明确的 black；None/拼错/大小写不符一律按 white 处理。
             # 原来是 `policy != "white"`，配置被改坏时会 fail-open（谁都放行）。
@@ -4530,12 +4851,12 @@ async for _r in _ag:
         if self._list_hit(mbl, "@", uid):
             return False  # 用户黑名单优先(即使群在白名单) -> 拦
         if self._list_hit(mwl, "@", uid):
-            return True   # 用户白名单优先(即使群在黑名单) -> 放
+            return True  # 用户白名单优先(即使群在黑名单) -> 放
         # 用户不在两名单: 看群级
         if self._list_hit(mbl, "#", gid):
             return False  # 群在黑名单 -> 拦
         if self._list_hit(mwl, "#", gid):
-            return True   # 群在白名单 -> 放
+            return True  # 群在白名单 -> 放
         # 群级都不在：**只要配置了混合白名单就默认拦截**。
         #
         # 旧实现判的是「白名单里有没有群条目」，没有就全放行 —— 这等于：
@@ -4567,7 +4888,7 @@ async for _r in _ag:
             no_prefix = []
             truncated = []
             for g in groups:
-                for x in (self.cfg.get(g) or []):
+                for x in self.cfg.get(g) or []:
                     if not isinstance(x, str):
                         continue
                     s = x.strip()
@@ -4585,13 +4906,15 @@ async for _r in _ag:
                 self.logger.warning(
                     f"[名单] {len(no_prefix)} 条配置缺少前缀（群用 #、用户用 @），"
                     f"严格匹配下永远不会命中：{detail}。"
-                    f"请在配置面板里给它们补上正确前缀。")
+                    f"请在配置面板里给它们补上正确前缀。"
+                )
             if truncated:
                 detail = ", ".join(f"{g}:{x}" for g, x in truncated)
                 self.logger.warning(
                     f"[名单] {len(truncated)} 条疑似旧版截断产生的无效条目：{detail}。"
                     f"它们在官方机器人（哈希群号）下永远无法匹配，"
-                    f"请删除后重新添加完整标识。")
+                    f"请删除后重新添加完整标识。"
+                )
         except Exception as e:
             self.logger.warning(f"[名单] 自检跳过: {type(e).__name__}: {e}")
 
@@ -4618,15 +4941,18 @@ async for _r in _ag:
             is_private = bool(event.is_private_chat())
         except Exception:
             is_private = False
-        if self._is_allowed(is_private, normalize_gid(event.get_sender_id()),
-                            normalize_gid(event.get_group_id())):
+        if self._is_allowed(
+            is_private, normalize_gid(event.get_sender_id()), normalize_gid(event.get_group_id())
+        ):
             return None
         # 说明清楚是「名单没通过」而非「权限不足」：
         # 这两者在管理员眼里很容易混淆 —— 明明自己是管理员却被拒，
         # 若不点明原因，会误以为是插件坏了。
-        return ("当前会话未授权使用本插件（不在名单内）。\n"
-                "名单的优先级高于机器人管理员：管理员也需在名单内才能操作。\n"
-                "请先在已授权的会话里用 /铁锈白名 添加本群/本用户。")
+        return (
+            "当前会话未授权使用本插件（不在名单内）。\n"
+            "名单的优先级高于机器人管理员：管理员也需在名单内才能操作。\n"
+            "请先在已授权的会话里用 /铁锈白名 添加本群/本用户。"
+        )
 
     def _allowed_detail(self, is_private, uid, gid) -> str:
         """给「没有权限」的回复附加可诊断的现场信息。
@@ -4667,10 +4993,7 @@ async for _r in _ag:
                     f"请把里面那条改成：{fixed}"
                 )
             elif lst:
-                lines.append(
-                    "提示：名单里没有与比对值相同的条目，"
-                    "请检查是否漏了字符、或前后带空格"
-                )
+                lines.append("提示：名单里没有与比对值相同的条目，请检查是否漏了字符、或前后带空格")
             return "\n".join(lines)
         except Exception:
             return ""
@@ -4808,7 +5131,7 @@ async for _r in _ag:
         # 剥掉唤醒词：命中配置的前缀 或 `/` 都算
         prefix = self._prefix_of(event)
         if prefix and text.startswith(prefix):
-            cmd = text[len(prefix):].split()[0] if len(text) > len(prefix) else ""
+            cmd = text[len(prefix) :].split()[0] if len(text) > len(prefix) else ""
         elif text.startswith("/"):
             cmd = text[1:].split()[0] if len(text) > 1 else ""
         else:
@@ -4825,15 +5148,13 @@ async for _r in _ag:
         # 而漂移的后果是「已知指令被当成未知指令，回一屏帮助」。
         if cmd in COMMAND_NAMES:
             return
-        _ag = self._send_text(event, 
-            f"未知指令：/{cmd}\n\n" + "\n".join(self._help_text_lines())
-        )
+        _ag = self._send_text(event, f"未知指令：/{cmd}\n\n" + "\n".join(self._help_text_lines()))
         async for _r in _ag:
             yield _r
 
     # ---- 房间列表 (分页 + 按 QQ 号缓存) ----
     # 滑动过期: 每次"有动作"(翻页/切筛选/刷新)都会把过期时间往后推
-    LIST_CACHE_TTL = 60   # 秒: 房间数据缓存有效期(全局共享一份, 滑动续期)
+    LIST_CACHE_TTL = 60  # 秒: 房间数据缓存有效期(全局共享一份, 滑动续期)
     # 秒: 「第 N 条 -> 哪个房」映射的有效期。
     # 比列表数据缓存长得多 —— 房号不会变，过期重建会导致
     # 「序号突然失效」，体验很差。10 分钟足够覆盖一次浏览会话。
@@ -4945,14 +5266,16 @@ async for _r in _ag:
             return []
         return list(st.get("addrs") or [])
 
-    def _state_put(self, event, page, keyword, status, full, source,
-                   total=0, addrs=None):
+    def _state_put(self, event, page, keyword, status, full, source, total=0, addrs=None):
         """保存翻页/筛选状态到内存（ts 只用于容量控制，data_ts 用于 addrs 新鲜度）。"""
         uid = self._list_uid(event)
         now = time.time()
         st = {
-            "page": page, "keyword": keyword, "status": status,
-            "full": full, "source": source,
+            "page": page,
+            "keyword": keyword,
+            "status": status,
+            "full": full,
+            "source": source,
             "total": total,
             "addrs": list(addrs or []),
             "ts": now,
@@ -4998,8 +5321,8 @@ async for _r in _ag:
         states[uid] = st
         try:
             self.logger.info(
-                f"[列表状态] 已从 KV 恢复: {uid} 第 {st.get('page')}/"
-                f"{st.get('total')} 页")
+                f"[列表状态] 已从 KV 恢复: {uid} 第 {st.get('page')}/{st.get('total')} 页"
+            )
         except Exception:
             pass
         return st
@@ -5068,8 +5391,7 @@ async for _r in _ag:
             rst = (r.get("status") or "").lower()
             if status and rst != status:
                 return False
-            isfull = ((r.get("max") or 0) > 0
-                      and (r.get("players") or 0) >= (r.get("max") or 0))
+            isfull = (r.get("max") or 0) > 0 and (r.get("players") or 0) >= (r.get("max") or 0)
             if full == "only" and not isfull:
                 return False
             if full == "hide" and isfull:
@@ -5077,9 +5399,9 @@ async for _r in _ag:
             if source != "all" and (r.get("source") or "") != source:
                 return False
             if keyword:
-                blob = " ".join([str(r.get("name") or ""),
-                                 str(r.get("map") or ""),
-                                 str(r.get("desc") or "")]).lower()
+                blob = " ".join(
+                    [str(r.get("name") or ""), str(r.get("map") or ""), str(r.get("desc") or "")]
+                ).lower()
                 if keyword.lower() not in blob:
                     return False
             return True
@@ -5095,21 +5417,32 @@ async for _r in _ag:
         total_pages = max(1, (len(rooms) + page_size - 1) // page_size)
         page = min(max(1, page), total_pages)
         start = (page - 1) * page_size
-        page_rooms = rooms[start:start + page_size]
+        page_rooms = rooms[start : start + page_size]
 
-        self._state_put(event, page, keyword, status, full, source,
-                        total_pages,
-                        [{
-                            "addr": str(r.get("addr") or ""),
-                            "room_id": str(r.get("room_id") or ""),
-                            "name": str(r.get("name") or ""),
-                            "uuid": str(r.get("id") or ""),
-                            "join_a": str(r.get("join_a") or "0"),
-                        } for r in page_rooms])
+        self._state_put(
+            event,
+            page,
+            keyword,
+            status,
+            full,
+            source,
+            total_pages,
+            [
+                {
+                    "addr": str(r.get("addr") or ""),
+                    "room_id": str(r.get("room_id") or ""),
+                    "name": str(r.get("name") or ""),
+                    "uuid": str(r.get("id") or ""),
+                    "join_a": str(r.get("join_a") or "0"),
+                }
+                for r in page_rooms
+            ],
+        )
         await self._state_save_kv(event)
         self.logger.info(
             f"[查房] 已就地重建第 {page}/{total_pages} 页 addrs "
-            f"（{len(page_rooms)} 条，未发送列表消息）")
+            f"（{len(page_rooms)} 条，未发送列表消息）"
+        )
         return True
 
     def _cleanup_states(self):
@@ -5118,7 +5451,7 @@ async for _r in _ag:
         if len(states) <= 200:
             return
         items = sorted(states.items(), key=lambda kv: kv[1].get("ts", 0))
-        for k, _v in items[:len(items) // 2]:
+        for k, _v in items[: len(items) // 2]:
             states.pop(k, None)
 
     async def _list_fetch(self, force: bool = False):
@@ -5131,8 +5464,8 @@ async for _r in _ag:
         cache = self._list_cache()
         now = time.time()
         if not force and cache["rooms"] and (now - cache["ts"]) < self.LIST_CACHE_TTL:
-            cache["ts"] = now   # 滑动续期: 有人用就续命
-            return cache["rooms"], True   # 命中缓存
+            cache["ts"] = now  # 滑动续期: 有人用就续命
+            return cache["rooms"], True  # 命中缓存
 
         cmd_args = [sys.executable, "-u", ROOM_INFO_PY, "--list-json"]
         # 房间列表也依赖 room_info.py，同样做一次可用性保障
@@ -5161,15 +5494,19 @@ async for _r in _ag:
                 await proc.wait()
             except Exception:
                 pass
-            self._last_list_error = ("[房间查询失败] 房间列表获取超时（90 秒）——"
-                                     "探针进程没有返回，通常是到官方列表服务器的连接卡住了")
+            self._last_list_error = (
+                "[房间查询失败] 房间列表获取超时（90 秒）——"
+                "探针进程没有返回，通常是到官方列表服务器的连接卡住了"
+            )
             return None, False
         except Exception as e:
             # 这里是插件自身的代码/环境错误，不能跟「网络超时」混为一谈
-            self.logger.exception("房间列表获取异常（插件内部）")
-            self._last_list_error = (f"[插件错误] 房间列表获取异常"
-                                     f"（{type(e).__name__}）：{e}"
-                                     f"\n这是插件 bug，不是网络问题；日志里有完整堆栈")
+            self.logger.error("房间列表获取异常（插件内部）", exc_info=True)
+            self._last_list_error = (
+                f"[插件错误] 房间列表获取异常"
+                f"（{type(e).__name__}）：{e}"
+                f"\n这是插件 bug，不是网络问题；日志里有完整堆栈"
+            )
             return None, False
 
         out = (stdout or b"").decode("utf-8", "replace").strip()
@@ -5185,13 +5522,13 @@ async for _r in _ag:
         # stdout 里可能是一行 JSON，但结构未必是房间数组（版本不匹配/报错对象）。
         # 直接往下走会让 cmd_list 对 dict 调 .get 抛 AttributeError，指令无回复。
         if not isinstance(rooms, list):
-            self.logger.warning(
-                f"[列表] 返回的不是房间数组（{type(rooms).__name__}），已忽略")
+            self.logger.warning(f"[列表] 返回的不是房间数组（{type(rooms).__name__}），已忽略")
             rooms = []
         rooms = [r for r in rooms if isinstance(r, dict)]
         if not rooms:
-            self._last_list_error = ("[房间查询失败] 列表接口没有返回可解析的数据"
-                                     "（返回长度 " f"{len(out)} 字节）")
+            self._last_list_error = (
+                f"[房间查询失败] 列表接口没有返回可解析的数据（返回长度 {len(out)} 字节）"
+            )
         cache["rooms"] = rooms
         cache["ts"] = time.time()
         return rooms, False
@@ -5261,9 +5598,7 @@ async for _r in _ag:
 
     async def _cmd_list_impl(self, event: AstrMessageEvent, arg: str = ""):
         # AstrBot 只把第一个空格参数传给 arg, 这里从原始消息补全全部参数
-        arg = self._raw_args(
-            event, arg, "铁锈房列表", "房间列表", "铁锈列表", "rwlist"
-        )
+        arg = self._raw_args(event, arg, "铁锈房列表", "房间列表", "铁锈列表", "rwlist")
         try:
             is_private = bool(event.is_private_chat())
         except Exception:
@@ -5273,10 +5608,11 @@ async for _r in _ag:
         uid = normalize_gid(event.get_sender_id())
         gid = normalize_gid(event.get_group_id())
         if not self._is_allowed(is_private, uid, gid):
-            _ag = self._send_text(event, 
+            _ag = self._send_text(
+                event,
                 "当前会话没有房间列表权限。\n"
                 "管理员可用 /铁锈模式 与 /铁锈白名 调整放行范围。"
-                + self._allowed_detail(is_private, uid, gid)
+                + self._allowed_detail(is_private, uid, gid),
             )
             async for _r in _ag:
                 yield _r
@@ -5303,13 +5639,23 @@ async for _r in _ag:
 
         # ---- 参数解析表: 单遍扫描, 支持 "房间中 2" / "搜索 岛屿 2" / "刷新" ----
         FILTER_WORDS = {
-            "房间中": ("status", "battleroom"), "可加入": ("status", "battleroom"),
-            "joinable": ("status", "battleroom"), "battleroom": ("status", "battleroom"),
-            "游戏中": ("status", "ingame"), "ingame": ("status", "ingame"),
-            "满": ("full", "only"), "人满": ("full", "only"), "full": ("full", "only"),
-            "不满": ("full", "hide"), "有空": ("full", "hide"), "notfull": ("full", "hide"),
-            "真人": ("source", "qroom"), "qroom": ("source", "qroom"), "q": ("source", "qroom"),
-            "官方": ("source", "official"), "official": ("source", "official"),
+            "房间中": ("status", "battleroom"),
+            "可加入": ("status", "battleroom"),
+            "joinable": ("status", "battleroom"),
+            "battleroom": ("status", "battleroom"),
+            "游戏中": ("status", "ingame"),
+            "ingame": ("status", "ingame"),
+            "满": ("full", "only"),
+            "人满": ("full", "only"),
+            "full": ("full", "only"),
+            "不满": ("full", "hide"),
+            "有空": ("full", "hide"),
+            "notfull": ("full", "hide"),
+            "真人": ("source", "qroom"),
+            "qroom": ("source", "qroom"),
+            "q": ("source", "qroom"),
+            "官方": ("source", "official"),
+            "official": ("source", "official"),
             "auto": ("source", "official"),
         }
         RETAIN = ("搜索", "search")
@@ -5332,9 +5678,13 @@ async for _r in _ag:
                 kw_parts = []
                 while idx + 1 < len(toks):
                     nxt = toks[idx + 1]
-                    if (nxt in FILTER_WORDS or nxt in RETAIN
-                            or nxt in RESET_STATE or nxt in REFRESH
-                            or nxt.isdigit()):
+                    if (
+                        nxt in FILTER_WORDS
+                        or nxt in RETAIN
+                        or nxt in RESET_STATE
+                        or nxt in REFRESH
+                        or nxt.isdigit()
+                    ):
                         break
                     idx += 1
                     kw_parts.append(nxt)
@@ -5365,8 +5715,8 @@ async for _r in _ag:
                 # 彻底清空该 QQ 的筛选/翻页状态, 立即生效
                 uid = self._list_uid(event)
                 self._list_page_state().pop(uid, None)
-                _ag = self._send_text(event, 
-                    "已清空本账号的房间列表筛选状态，下一条 /铁锈列表 将从全部房间重新开始"
+                _ag = self._send_text(
+                    event, "已清空本账号的房间列表筛选状态，下一条 /铁锈列表 将从全部房间重新开始"
                 )
                 async for _r in _ag:
                     yield _r
@@ -5377,14 +5727,15 @@ async for _r in _ag:
             idx += 1
 
         if bad:
-            _ag = self._send_text(event, 
+            _ag = self._send_text(
+                event,
                 f"无法识别的参数：{bad}\n\n"
                 "【房间列表用法】\n"
                 "/铁锈列表 [页码] [筛选] [搜索 关键词] [刷新]\n"
                 "筛选：房间中/游戏中、满/不满、真人/官方（空格分隔，可组合）\n"
                 "页码：纯数字，如 2　刷新：忽略缓存重抓\n"
                 "例：/铁锈列表 房间中 2　/铁锈列表 搜索 我的 世界\n"
-                "/铁锈下一页　/铁锈上一页"
+                "/铁锈下一页　/铁锈上一页",
             )
             async for _r in _ag:
                 yield _r
@@ -5403,13 +5754,19 @@ async for _r in _ag:
         if rooms_all is None:
             # 有具体原因就说具体原因：超时、探针脚本缺失、插件代码异常
             # 是三种完全不同的故障，统一回一句「请稍后重试」只会浪费排查时间。
-            msg = _lerr or "房间列表获取超时（90 秒无响应）。多为到官方列表服务器的连接卡住，可稍后重试"
+            msg = (
+                _lerr
+                or "房间列表获取超时（90 秒无响应）。多为到官方列表服务器的连接卡住，可稍后重试"
+            )
             _ag = self._send_text(event, msg)
             async for _r in _ag:
                 yield _r
             return
         if not rooms_all:
-            msg = _lerr or "官方列表返回了空结果。多半是列表服务临时异常，稍后重试一次；连续为空再查网络"
+            msg = (
+                _lerr
+                or "官方列表返回了空结果。多半是列表服务临时异常，稍后重试一次；连续为空再查网络"
+            )
             _ag = self._send_text(event, msg)
             async for _r in _ag:
                 yield _r
@@ -5428,8 +5785,9 @@ async for _r in _ag:
             if source != "all" and (r.get("source") or "") != source:
                 return False
             if keyword:
-                blob = " ".join([str(r.get("name") or ""), str(r.get("map") or ""),
-                                 str(r.get("desc") or "")]).lower()
+                blob = " ".join(
+                    [str(r.get("name") or ""), str(r.get("map") or ""), str(r.get("desc") or "")]
+                ).lower()
                 if keyword.lower() not in blob:
                     return False
             return True
@@ -5442,7 +5800,6 @@ async for _r in _ag:
             return
 
         # 只按每页条数分页，不限制总房间数
-        matched_total = len(rooms)
         page_size = 5
         try:
             page_size = max(1, int(self.cfg.get("list_page_size", 5)))
@@ -5451,20 +5808,30 @@ async for _r in _ag:
         total_pages = max(1, (len(rooms) + page_size - 1) // page_size)
         page = min(page, total_pages)
         start = (page - 1) * page_size
-        page_rooms = rooms[start:start + page_size]
+        page_rooms = rooms[start : start + page_size]
 
         # 保存该 QQ 的翻页/筛选状态
         # items 只存当前页, 与列表展示的序号一一对应; 查房时直接用 addr 或 room_id
         # join_a 非 0 表示该条是中继房, 地址需另行解析(仅内部使用, 不展示)
-        self._state_put(event, page, keyword, status, full, source,
-                        total_pages,
-                        [{
-                            "addr": str(r.get("addr") or ""),
-                            "room_id": str(r.get("room_id") or ""),
-                            "name": str(r.get("name") or ""),
-                            "uuid": str(r.get("id") or ""),
-                            "join_a": str(r.get("join_a") or "0"),
-                        } for r in page_rooms])
+        self._state_put(
+            event,
+            page,
+            keyword,
+            status,
+            full,
+            source,
+            total_pages,
+            [
+                {
+                    "addr": str(r.get("addr") or ""),
+                    "room_id": str(r.get("room_id") or ""),
+                    "name": str(r.get("name") or ""),
+                    "uuid": str(r.get("id") or ""),
+                    "join_a": str(r.get("join_a") or "0"),
+                }
+                for r in page_rooms
+            ],
+        )
         # 落盘到 KV：翻页状态要能撑过插件重启 / 长时间不操作。
         # 这里 await 而不是 create_task —— 列表指令本身是异步的，
         # 顺手写完更确定（见 _state_save_kv 的说明）。
@@ -5495,8 +5862,13 @@ async for _r in _ag:
             header += "　[缓存]"
 
         lines = [header, ""]
-        status_cn = {"battleroom": "房间中", "ingame": "游戏中",
-                     "locked": "已锁定", "chat": "聊天", "unknown": "-"}
+        status_cn = {
+            "battleroom": "房间中",
+            "ingame": "游戏中",
+            "locked": "已锁定",
+            "chat": "聊天",
+            "unknown": "-",
+        }
         # 官Q模式：标题留块外，房间正文整体进一个代码块（可滚动文本框）
         room_lines = []
         for idx, rm in enumerate(page_rooms, 1):
@@ -5673,10 +6045,11 @@ async for _r in _ag:
         uid = normalize_gid(event.get_sender_id())
         gid = normalize_gid(event.get_group_id())
         if not self._is_allowed(is_private, uid, gid):
-            _ag = self._send_text(event, 
+            _ag = self._send_text(
+                event,
                 "当前会话没有查房权限。\n"
                 "管理员可用 /铁锈模式 与 /铁锈白名 调整放行范围。"
-                + self._allowed_detail(is_private, uid, gid)
+                + self._allowed_detail(is_private, uid, gid),
             )
             async for _r in _ag:
                 yield _r
@@ -5698,7 +6071,7 @@ async for _r in _ag:
         # ---- 解析目标 ----
         target = ""
         desc = ""
-        _extra_rids = []   # 同一条指令里被忽略的其它房号（见下方说明）
+        _extra_rids = []  # 同一条指令里被忽略的其它房号（见下方说明）
         if IP_QUERY_RE.match(arg):
             target = arg
             desc = arg
@@ -5714,17 +6087,17 @@ async for _r in _ag:
                     items = self._state_addrs(event)
                 if not items:
                     _reason = _refill_err or "列表数据暂时不可用"
-                    _ag = self._send_text(event,
+                    _ag = self._send_text(
+                        event,
                         f"取不到列表序号对应的房间。\n原因是：{_reason}\n"
-                        "可直接用房号查询：{0}铁锈查房 r5132".format(self._prefix_of(event) or "/"))
+                        "可直接用房号查询：{0}铁锈查房 r5132".format(self._prefix_of(event) or "/"),
+                    )
                     async for _r in _ag:
                         yield _r
                     return
             n = int(arg)
             if n < 1 or n > len(items):
-                _ag = self._send_text(event, 
-                    f"序号超出范围：当前页共 {len(items)} 条"
-                )
+                _ag = self._send_text(event, f"序号超出范围：当前页共 {len(items)} 条")
                 async for _r in _ag:
                     yield _r
                 return
@@ -5732,8 +6105,9 @@ async for _r in _ag:
             if isinstance(item, dict):
                 label = str(item.get("name") or "").strip()
                 # qroom 房只有房号, official 房只有地址
-                target = (str(item.get("addr") or "").strip()
-                          or str(item.get("room_id") or "").strip())
+                target = (
+                    str(item.get("addr") or "").strip() or str(item.get("room_id") or "").strip()
+                )
                 # 中继房: 列表里是注册入口地址, 直连会被踢。这里静默换成真实
                 # 地址再连。解析过程不产生任何面向用户的消息。
                 try:
@@ -5746,13 +6120,14 @@ async for _r in _ag:
                         # 必须走 _run_in_thread：本文件兼容 Python 3.8，
                         # 没有 asyncio.to_thread；直接调会在 3.8 上抛
                         # AttributeError，整条指令无任何回复。
-                        real = await _run_in_thread(
-                            self._resolve_relay_addr, uuid_, join_a)
+                        real = await _run_in_thread(self._resolve_relay_addr, uuid_, join_a)
                     except Exception as e:
-                        self.logger.exception("解析中继房真实地址异常")
-                        _ag = self._send_text(event,
+                        self.logger.error("解析中继房真实地址异常", exc_info=True)
+                        _ag = self._send_text(
+                            event,
                             f"[插件错误] 解析第 {n} 条 {label} 的真实地址时异常"
-                            f"（{type(e).__name__}）：{e}")
+                            f"（{type(e).__name__}）：{e}",
+                        )
                         async for _r in _ag:
                             yield _r
                         return
@@ -5761,8 +6136,8 @@ async for _r in _ag:
                     else:
                         # 解析失败: 不能用 :5158 入口直连(会被踢或串到别的房),
                         # 明确报错而不是静默退回入口地址。
-                        _ag = self._send_text(event, 
-                            f"第 {n} 条 {label} 无法解析真实地址，暂时无法查询"
+                        _ag = self._send_text(
+                            event, f"第 {n} 条 {label} 无法解析真实地址，暂时无法查询"
                         )
                         async for _r in _ag:
                             yield _r
@@ -5771,9 +6146,7 @@ async for _r in _ag:
                 label = ""
                 target = str(item or "").strip()
             if not target:
-                _ag = self._send_text(event, 
-                    f"第 {n} 条没有可用的地址或房号，无法查询"
-                )
+                _ag = self._send_text(event, f"第 {n} 条没有可用的地址或房号，无法查询")
                 async for _r in _ag:
                     yield _r
                 return
@@ -5790,21 +6163,21 @@ async for _r in _ag:
             # 「一个词」的判据不限定字符集：房号是玩家随便起的，汉字、假名、
             # 连字符、下划线都可能出现，形态穷举不完。只排除会改变语义的分隔符
             # （空白、逗号顿号分号、冒号斜杠 @ #），那些交给正则去拆。
-            _single = (bool(_raw)
-                       and bool(re.fullmatch(
-                           r"[A-Za-z][^\s,，、;；:/@#]{0,31}", _raw)))
+            _single = bool(_raw) and bool(re.fullmatch(r"[A-Za-z][^\s,，、;；:/@#]{0,31}", _raw))
             if _single:
                 # 一个词也先过一遍正则：`r5132abc` 要提成 `r5132`（去掉尾巴），
                 # `s4932XYZ` 提成 `s4932`；提不出来才整词原样丢给探针。
-                rids = (extract_room_ids(_raw, allow_custom=True)
-                        or [normalize_room_id(strip_dup_prefix(_raw))])
+                rids = extract_room_ids(_raw, allow_custom=True) or [
+                    normalize_room_id(strip_dup_prefix(_raw))
+                ]
             else:
                 rids = extract_room_ids(arg, allow_custom=True)
             if not rids:
-                _ag = self._send_text(event,
+                _ag = self._send_text(
+                    event,
                     f"无法识别的房号：{arg}\n\n"
                     "房号必须以中继字母开头（如 r5132 / hytvvi / RKC497 / s九一大魔王），"
-                    "不能带空格。\n\n" + USAGE
+                    "不能带空格。\n\n" + USAGE,
                 )
                 async for _r in _ag:
                     yield _r
@@ -5852,30 +6225,37 @@ async for _r in _ag:
                         timeout=QUERY_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    result = (f"[房间查询失败] 查询超时（超过 {QUERY_TIMEOUT} 秒）——"
-                              f"探针进程没有按期返回，通常是到中继的连接卡住了")
+                    result = (
+                        f"[房间查询失败] 查询超时（超过 {QUERY_TIMEOUT} 秒）——"
+                        f"探针进程没有按期返回，通常是到中继的连接卡住了"
+                    )
                 except Exception as e:
                     # 代码错误 ≠ 房间问题。以前两者都落到「查房无响应」，
                     # 结果真出 bug 时反而更难查（要翻日志才知道是 AttributeError）。
-                    self.logger.exception(f"[查房] {target} 插件内部异常")
-                    result = (f"[插件错误] 查询 {target} 时插件内部抛异常"
-                              f"（{type(e).__name__}）：{e}"
-                              f"\n这是插件 bug，不是房间问题；日志里有完整堆栈")
+                    self.logger.error(f"[查房] {target} 插件内部异常", exc_info=True)
+                    result = (
+                        f"[插件错误] 查询 {target} 时插件内部抛异常"
+                        f"（{type(e).__name__}）：{e}"
+                        f"\n这是插件 bug，不是房间问题；日志里有完整堆栈"
+                    )
                 if is_room_info(result):
                     break
                 if not is_name_check_error(result):
                     break
-                self.logger.debug(
-                    f"{desc} 探针名被过滤，重试中（{attempt}/{max_retry}）"
-                )
+                self.logger.debug(f"{desc} 探针名被过滤，重试中（{attempt}/{max_retry}）")
         finally:
             self._release_probe(idx)
 
         # ---- 回传(显式查房不静默, 必须给出原因) ----
         _extra_note = ""
         if _extra_rids:
-            _extra_note = ("\n\n（这条指令里还有 " + "、".join(_extra_rids)
-                           + "，本次只查了 " + target + "；要查请单独发一条）")
+            _extra_note = (
+                "\n\n（这条指令里还有 "
+                + "、".join(_extra_rids)
+                + "，本次只查了 "
+                + target
+                + "；要查请单独发一条）"
+            )
             result = (result or "") + _extra_note if is_room_info(result) else result
         if is_room_info(result):
             # 记住「这个会话上次查的是哪个房」，供刷新/复述使用。
@@ -5889,9 +6269,8 @@ async for _r in _ag:
             await self._send_room_result(event, result)
             return
         if not result:
-            _ag = self._send_text(event, 
-                f"{desc} 查房无响应（房间不存在、中继繁忙或地址不可达）"
-                + _extra_note
+            _ag = self._send_text(
+                event, f"{desc} 查房无响应（房间不存在、中继繁忙或地址不可达）" + _extra_note
             )
             async for _r in _ag:
                 yield _r
@@ -5954,7 +6333,9 @@ async for _r in _ag:
             return
         self._write_config("global_enabled", (arg == "开"))
         self._save_config()
-        _ag = self._send_text(event, f"全局解析已{'开启' if self.cfg['global_enabled'] else '关闭'}")
+        _ag = self._send_text(
+            event, f"全局解析已{'开启' if self.cfg['global_enabled'] else '关闭'}"
+        )
         async for _r in _ag:
             yield _r
 
@@ -5982,13 +6363,16 @@ async for _r in _ag:
 
         arg = (arg or "").strip()
         MODE_MAP = {"白": "white", "黑": "black", "混合": "mixed"}
-        NAME = {"white": "白名单(仅名单内放行)", "black": "黑名单(名单内禁用)", "mixed": "混合模式(@用户优先于#群)"}
+        NAME = {
+            "white": "白名单(仅名单内放行)",
+            "black": "黑名单(名单内禁用)",
+            "mixed": "混合模式(@用户优先于#群)",
+        }
         if not arg:
             mode = self.cfg.get("mode", "black")
             # 配置里可能是历史值 / 大小写不一致（"White"），NAME[mode] 会 KeyError，
             # 表现为「/铁锈模式 完全没反应」。
-            _ag = self._send_text(event,
-                f"当前模式：{NAME.get(mode, f'未知模式（{mode}）')}")
+            _ag = self._send_text(event, f"当前模式：{NAME.get(mode, f'未知模式（{mode}）')}")
             async for _r in _ag:
                 yield _r
             return
@@ -6038,8 +6422,7 @@ async for _r in _ag:
             state = "开启" if self.cfg.get("show_players", False) else "关闭"
             # 这里不写「当前状态：关闭」——官Q 的 Markdown 会把
             # 「键：值」渲染成单行表格，一句回执套个表头很别扭。
-            _ag = self._send_text(
-                event, f"玩家列表显示当前为「{state}」")
+            _ag = self._send_text(event, f"玩家列表显示当前为「{state}」")
             async for _r in _ag:
                 yield _r
             return
@@ -6050,7 +6433,9 @@ async for _r in _ag:
             return
         self._write_config("show_players", (arg == "开"))
         self._save_config()
-        _ag = self._send_text(event, f"玩家列表显示已{'开启' if self.cfg['show_players'] else '关闭'}")
+        _ag = self._send_text(
+            event, f"玩家列表显示已{'开启' if self.cfg['show_players'] else '关闭'}"
+        )
         async for _r in _ag:
             yield _r
 
@@ -6124,6 +6509,7 @@ async for _r in _ag:
         _ag = self._send_text(event, text)
         async for _r in _ag:
             yield _r
+
     @filter.command("铁锈重试")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_retry(self, event: AstrMessageEvent, arg: str = ""):
@@ -6205,7 +6591,7 @@ async for _r in _ag:
         def _save(lst):
             self._write_config("忽略正则", lst)
             self._save_config()
-            self._ignore_cache = None   # 让下一条消息重新编译
+            self._ignore_cache = None  # 让下一条消息重新编译
 
         if not raw or low in ("列出", "列表", "查看"):
             L = [f"忽略开关：{'开' if self.cfg.get('忽略开关', True) else '关'}"]
@@ -6254,7 +6640,7 @@ async for _r in _ag:
             body = line[1:].strip() if sign else line
             if not body:
                 continue
-            if sign == "-" or (not sign and False):
+            if sign == "-":
                 # 按序号删
                 if body.isdigit() and 1 <= int(body) <= len(custom):
                     removed.append(custom.pop(int(body) - 1))
@@ -6356,24 +6742,30 @@ async for _r in _ag:
             if is_priv is True:
                 L.append(f"类型：私聊　用户：{normalize_gid(uid_raw) or '?'}")
             else:
-                L.append(f"类型：群聊　群号：{normalize_gid(gid_raw) or '?'}　"
-                         f"发送者：{normalize_gid(uid_raw) or '?'}")
-            L.append(f"管理员：{'是' if is_admin is True else '否'}　"
-                     f"（本插件判定：{'是' if self._is_admin(event) else '否'}）")
+                L.append(
+                    f"类型：群聊　群号：{normalize_gid(gid_raw) or '?'}　"
+                    f"发送者：{normalize_gid(uid_raw) or '?'}"
+                )
+            L.append(
+                f"管理员：{'是' if is_admin is True else '否'}　"
+                f"（本插件判定：{'是' if self._is_admin(event) else '否'}）"
+            )
             L.append(f"撤回配置匹配键：{_human_key(key) if key else '(未识别)'}")
             # 自动查房判定：把「这条消息里的房号会不会被处理」的三个闸门一次列清。
             # 「名单是空的，为什么还不解析房间」是最常被问的一句，
             # 有了这三行就不必翻代码猜配置（名单 → 全局开关 → 私聊开关）。
             try:
                 _allowed = self._is_allowed(
-                    bool(is_priv), normalize_gid(uid_raw), normalize_gid(gid_raw))
+                    bool(is_priv), normalize_gid(uid_raw), normalize_gid(gid_raw)
+                )
             except Exception:
                 _allowed = False
             _mode = self.cfg.get("mode", "black")
-            _mode_name = {"white": "白名单（仅名单内放行）",
-                          "black": "黑名单（名单外都放行）",
-                          "mixed": "混合（@用户优先于 #群）"}.get(
-                              _mode, f"未知：{_mode!r}")
+            _mode_name = {
+                "white": "白名单（仅名单内放行）",
+                "black": "黑名单（名单外都放行）",
+                "mixed": "混合（@用户优先于 #群）",
+            }.get(_mode, f"未知：{_mode!r}")
 
             def _cnt(_k):
                 _v = self.cfg.get(_k)
@@ -6390,9 +6782,14 @@ async for _r in _ag:
                 _why.append("私聊查房=关")
             L.append("自动查房：" + ("放行" if not _why else "拦截 —— " + "、".join(_why)))
             L.append(f"　模式：{_mode_name}")
-            _fmt = lambda v: "(非列表)" if v < 0 else f"{v} 条"
-            L.append(f"　名单：白 {_fmt(_cnt('白名单'))}　黑 {_fmt(_cnt('黑名单'))}"
-                     f"　混合白 {_fmt(_cnt('混合_白名单'))}　混合黑 {_fmt(_cnt('混合_黑名单'))}")
+
+            def _fmt(v):
+                return "(非列表)" if v < 0 else f"{v} 条"
+
+            L.append(
+                f"　名单：白 {_fmt(_cnt('白名单'))}　黑 {_fmt(_cnt('黑名单'))}"
+                f"　混合白 {_fmt(_cnt('混合_白名单'))}　混合黑 {_fmt(_cnt('混合_黑名单'))}"
+            )
             if _mode == "black" and _cnt("黑名单") == 0:
                 L.append("　说明：黑名单为空 = 名单外一律放行，不会拦任何群/人")
             elif _mode == "white" and _cnt("白名单") == 0:
@@ -6424,7 +6821,7 @@ async for _r in _ag:
                         else:
                             L.append(f"  {_human_key(p['key'])}  延迟 {_human_secs(p['延迟'])}")
                 if valid != len(store):
-                    L.append(f"  合法 {valid} 条、非法 {len(store)-valid} 条")
+                    L.append(f"  合法 {valid} 条、非法 {len(store) - valid} 条")
             else:
                 L.append("  (空：全部关闭)")
             L.append("改配置：/铁锈撤回 列出｜+｜-｜重置")
@@ -6439,7 +6836,7 @@ async for _r in _ag:
                 rows.append((m.get("key", ""), m.get("mid"), remain, m.get("delay", 0)))
             L.append(f"任务数：{len(rows)}")
             if rows:
-                rows.sort(key=lambda x: x[2])     # 最快到期的在前
+                rows.sort(key=lambda x: x[2])  # 最快到期的在前
                 for k, mid, remain, delay in rows:
                     state = "即将撤回" if remain <= 0 else f"还剩 {_human_secs(remain)}"
                     L.append(f"  {_human_key(k)}  {state}（设定 {_human_secs(delay)}）")
@@ -6451,8 +6848,10 @@ async for _r in _ag:
             L.append("")
             L.append("-- 探针池 --")
             st = self._probe_stats()
-            L.append(f"占用中：{len(st['占用中'])} 个　可复用：{len(st['可复用'])} 个　"
-                     f"空闲容量：{st['空闲容量']}/{st['容量']}")
+            L.append(
+                f"占用中：{len(st['占用中'])} 个　可复用：{len(st['可复用'])} 个　"
+                f"空闲容量：{st['空闲容量']}/{st['容量']}"
+            )
             if st["占用中"]:
                 L.append("  正在跑：" + "、".join(f"{i:02d}" for i in st["占用中"]))
             if st["可复用"]:
@@ -6507,11 +6906,15 @@ async for _r in _ag:
         if want("config"):
             L.append("")
             L.append("-- 主要配置 --")
-            L.append(f"全局解析：{'开' if self.cfg.get('global_enabled') else '关'}　"
-                     f"名单模式：{self.cfg.get('mode')}")
-            L.append(f"私聊查房：{'开' if self.cfg.get('私聊启用') else '关'}　"
-                     f"显示玩家：{'开' if self.cfg.get('show_players') else '关'}　"
-                     f"重试：{self.cfg.get('retry_times')}")
+            L.append(
+                f"全局解析：{'开' if self.cfg.get('global_enabled') else '关'}　"
+                f"名单模式：{self.cfg.get('mode')}"
+            )
+            L.append(
+                f"私聊查房：{'开' if self.cfg.get('私聊启用') else '关'}　"
+                f"显示玩家：{'开' if self.cfg.get('show_players') else '关'}　"
+                f"重试：{self.cfg.get('retry_times')}"
+            )
             L.append(f"每页 {self.cfg.get('list_page_size', 5)} 条（总数不限）")
             L.append(
                 f"白名单 {self._cfg_len('白名单')}、"
@@ -6520,23 +6923,26 @@ async for _r in _ag:
                 f"混合黑 {self._cfg_len('混合_黑名单')}"
             )
             L.append(f"房号冷却：{_human_secs(self._cooldown_secs())}")
-            L.append(f"冷却提示：{'开' if self.cfg.get('冷却提示') else '关'}　"
-                     f"官Q模式：{'开' if self.cfg.get('官Q模式') else '关'}　"
-                     f"debug：{'开' if self.cfg.get('debug') else '关'}")
+            L.append(
+                f"冷却提示：{'开' if self.cfg.get('冷却提示') else '关'}　"
+                f"官Q模式：{'开' if self.cfg.get('官Q模式') else '关'}　"
+                f"debug：{'开' if self.cfg.get('debug') else '关'}"
+            )
             try:
                 _cust = self.cfg.get("忽略正则", [])
                 _n_cust = len(_cust) if isinstance(_cust, list) else 0
             except Exception:
                 _n_cust = 0
-            L.append(f"忽略规则：{'开' if self.cfg.get('忽略开关', True) else '关'}　"
-                     f"内置 {len(IGNORE_PATTERNS)} 条　自定义 {_n_cust} 条")
+            L.append(
+                f"忽略规则：{'开' if self.cfg.get('忽略开关', True) else '关'}　"
+                f"内置 {len(IGNORE_PATTERNS)} 条　自定义 {_n_cust} 条"
+            )
 
         # 统一收口：分类标题前保证一个空行、去掉开头的空行
         # （section 指定某一节时 L 为空列表，首行就是标题）
         out = []
         for ln in L:
-            if ln.startswith("-- ") and ln.endswith(" --") \
-                    and out and out[-1].strip():
+            if ln.startswith("-- ") and ln.endswith(" --") and out and out[-1].strip():
                 out.append("")
             out.append(ln)
         return "\n".join(out).lstrip("\n")
@@ -6564,8 +6970,8 @@ async for _r in _ag:
             if tb is not None:
                 where = f" @ {os.path.basename(tb.tb_frame.f_code.co_filename)}:{tb.tb_lineno}"
             self.logger.warning(
-                f"诊断输出异常(已降级为部分输出): {type(err).__name__}: {err}{where}",
-                exc_info=True)
+                f"诊断输出异常(已降级为部分输出): {type(err).__name__}: {err}{where}", exc_info=True
+            )
             if section:
                 # 用户只要了这一分类 -> 直接说明它挂了，别假装成功
                 return f"（该分类生成时抛出 {type(err).__name__}：{err}{where}）"
@@ -6573,14 +6979,15 @@ async for _r in _ag:
             parts = []
             for key, name, _desc in self.DIAG_SECTIONS:
                 if key == "off":
-                    continue      # off 分类由 cmd_diag 转发给官机探测，不在这里生成
+                    continue  # off 分类由 cmd_diag 转发给官机探测，不在这里生成
                 try:
                     parts.append(self._diag_text(event, key))
                 except Exception as sub:  # noqa: BLE001
-                    parts.append(f"-- {name} --\n"
-                                 f"（该分类生成时抛出 {type(sub).__name__}：{sub}）")
-            parts.append(f"（注：全量输出曾在 {type(err).__name__}：{err}{where} 处中断，"
-                         f"以上为逐分类重跑结果）")
+                    parts.append(f"-- {name} --\n（该分类生成时抛出 {type(sub).__name__}：{sub}）")
+            parts.append(
+                f"（注：全量输出曾在 {type(err).__name__}：{err}{where} 处中断，"
+                f"以上为逐分类重跑结果）"
+            )
             # 每节自成一段：节与节之间留一个空行，和正常路径的排版一致
             return "\n\n".join(p.strip("\n") for p in parts if p.strip("\n"))
 
@@ -6618,12 +7025,26 @@ async for _r in _ag:
             if a.startswith(pfx):
                 return key
         alias = {
-            "会话": "session", "session": "session", "s": "session",
-            "撤回": "recall", "recall": "recall", "r": "recall",
-            "探针": "probe", "probe": "probe", "p": "probe",
-            "列表": "list", "list": "list", "l": "list",
-            "配置": "config", "config": "config", "cfg": "config", "c": "config",
-            "官机": "off", "off": "off", "o": "off", "official": "off",
+            "会话": "session",
+            "session": "session",
+            "s": "session",
+            "撤回": "recall",
+            "recall": "recall",
+            "r": "recall",
+            "探针": "probe",
+            "probe": "probe",
+            "p": "probe",
+            "列表": "list",
+            "list": "list",
+            "l": "list",
+            "配置": "config",
+            "config": "config",
+            "cfg": "config",
+            "c": "config",
+            "官机": "off",
+            "off": "off",
+            "o": "off",
+            "official": "off",
         }
         if a in alias:
             return alias[a]
@@ -6650,9 +7071,9 @@ async for _r in _ag:
             a = str(arg or "").strip()
             for pfx in ("官机", "official", "off"):
                 if a == pfx:
-                    return ""          # 本身就是分类名，没有子参数
+                    return ""  # 本身就是分类名，没有子参数
                 if a.startswith(pfx):
-                    return a[len(pfx):].strip().lower()
+                    return a[len(pfx) :].strip().lower()
             return ""
         return parts[1].strip().lower()
 
@@ -6729,9 +7150,13 @@ async for _r in _ag:
             sub = self._diag_sub(arg)
             if sub.startswith(("测试", "test", "t")):
                 # 「官机测试 e」-> 详细模式
-                detail = sub[len("测试"):].strip() if sub.startswith("测试") else \
-                         sub[len("test"):].strip() if sub.startswith("test") else \
-                         sub[1:].strip()
+                detail = (
+                    sub[len("测试") :].strip()
+                    if sub.startswith("测试")
+                    else sub[len("test") :].strip()
+                    if sub.startswith("test")
+                    else sub[1:].strip()
+                )
                 _src = self._do_official_test(event, detail)
                 async for r in self._as_async_iter(_src):
                     yield r
@@ -6743,8 +7168,7 @@ async for _r in _ag:
             return
 
         text = self._diag_text_safe(event, section)
-        name = next((n for k, n, _ in self.DIAG_SECTIONS if k == section),
-                    section)
+        name = next((n for k, n, _ in self.DIAG_SECTIONS if k == section), section)
         if not text.strip():
             text = f"【铁锈查房调试 · {name}】\n\n(无内容)"
         else:
@@ -6759,61 +7183,95 @@ async for _r in _ag:
 
         只列**能在聊天里改**的项，避免菜单变成第二份配置说明。
         """
-        onoff = lambda v: "开" if v else "关"
+
+        def onoff(v):
+            return "开" if v else "关"
+
         cd = self._cooldown_secs()
         prefix = self._prefix_of()
         return [
-            ("查房开关", [
-                ("全局解析",
-                 onoff(self.cfg.get("global_enabled", True)),
-                 "/铁锈全局解析 开|关"),
-                ("名单模式",
-                 str(self.cfg.get("mode", "black")),
-                 "/铁锈模式 白|黑|混合"),
-                ("私聊查房",
-                 onoff(self.cfg.get("私聊启用", True)),
-                 "/铁锈私聊开关 开|关"),
-                ("混合私聊策略",
-                 str(self.cfg.get("混合_私聊策略", "white")),
-                 "/铁锈私聊策略 白|黑"),
-                ("显示玩家",
-                 onoff(self.cfg.get("show_players", False)),
-                 "/铁锈玩家列表 开|关"),
-                ("探针重试次数",
-                 str(self.cfg.get("retry_times", 3)),
-                 "/铁锈重试 <0-10>"),
-            ]),
-            ("冷却与撤回", [
-                ("房号冷却", f"{cd} 秒", "配置文件：查房行为 → 房号冷却秒"),
-                ("冷却提示", onoff(self.cfg.get("冷却提示", False)),
-                 "配置文件：查房行为 → 冷却提示"),
-                ("自动撤回配置",
-                 f"{len(self._recall_store())} 条",
-                 "/铁锈撤回 列出 | + key:秒 | - key"),
-            ]),
-            ("排版与通道", [
-                ("官Q模式", onoff(self.cfg.get("官Q模式", False)),
-                 "配置文件：基础设置 → 官Q模式（含 Markdown + 按钮 + 换行规整）"),
-                ("压缩范围", self._compress_label(),
-                 f"配置文件：基础设置 → 压缩范围 | {prefix}铁锈压缩 <none|room|diag|all>"),
-                ("指令唤醒词", self._prefix_of(),
-                 "配置文件：基础设置 → 指令唤醒词（须与 AstrBot 主配置一致）"),
-                ("官方通道", self._official_channel_desc(),
-                 f"{prefix}铁锈查房调试 官机 查看通道详情"),
-                ("上次发送异常", (getattr(self, "_last_md_error", "") or "无")[:120],
-                 f"{prefix}铁锈查房调试 官机 e 查看详情"),
-                ("调试分类", onoff(self.cfg.get("调试菜单", True)),
-                 "配置文件：基础设置 → 调试菜单"),
-                ("调试日志", onoff(self.cfg.get("debug", False)),
-                 "配置文件：基础设置 → 调试日志"),
-             ]),
+            (
+                "查房开关",
+                [
+                    (
+                        "全局解析",
+                        onoff(self.cfg.get("global_enabled", True)),
+                        "/铁锈全局解析 开|关",
+                    ),
+                    ("名单模式", str(self.cfg.get("mode", "black")), "/铁锈模式 白|黑|混合"),
+                    ("私聊查房", onoff(self.cfg.get("私聊启用", True)), "/铁锈私聊开关 开|关"),
+                    (
+                        "混合私聊策略",
+                        str(self.cfg.get("混合_私聊策略", "white")),
+                        "/铁锈私聊策略 白|黑",
+                    ),
+                    ("显示玩家", onoff(self.cfg.get("show_players", False)), "/铁锈玩家列表 开|关"),
+                    ("探针重试次数", str(self.cfg.get("retry_times", 3)), "/铁锈重试 <0-10>"),
+                ],
+            ),
+            (
+                "冷却与撤回",
+                [
+                    ("房号冷却", f"{cd} 秒", "配置文件：查房行为 → 房号冷却秒"),
+                    (
+                        "冷却提示",
+                        onoff(self.cfg.get("冷却提示", False)),
+                        "配置文件：查房行为 → 冷却提示",
+                    ),
+                    (
+                        "自动撤回配置",
+                        f"{len(self._recall_store())} 条",
+                        "/铁锈撤回 列出 | + key:秒 | - key",
+                    ),
+                ],
+            ),
+            (
+                "排版与通道",
+                [
+                    (
+                        "官Q模式",
+                        onoff(self.cfg.get("官Q模式", False)),
+                        "配置文件：基础设置 → 官Q模式（含 Markdown + 按钮 + 换行规整）",
+                    ),
+                    (
+                        "压缩范围",
+                        self._compress_label(),
+                        f"配置文件：基础设置 → 压缩范围 | {prefix}铁锈压缩 <none|room|diag|all>",
+                    ),
+                    (
+                        "指令唤醒词",
+                        self._prefix_of(),
+                        "配置文件：基础设置 → 指令唤醒词（须与 AstrBot 主配置一致）",
+                    ),
+                    (
+                        "官方通道",
+                        self._official_channel_desc(),
+                        f"{prefix}铁锈查房调试 官机 查看通道详情",
+                    ),
+                    (
+                        "上次发送异常",
+                        (getattr(self, "_last_md_error", "") or "无")[:120],
+                        f"{prefix}铁锈查房调试 官机 e 查看详情",
+                    ),
+                    (
+                        "调试分类",
+                        onoff(self.cfg.get("调试菜单", True)),
+                        "配置文件：基础设置 → 调试菜单",
+                    ),
+                    (
+                        "调试日志",
+                        onoff(self.cfg.get("debug", False)),
+                        "配置文件：基础设置 → 调试日志",
+                    ),
+                ],
+            ),
         ]
+
     def _menu_text(self, event) -> str:
         """生成调试菜单正文（含可修改项与当前值）。"""
         try:
             gid = normalize_gid(event.get_group_id()) if event is not None else ""
-            self._menu_gid = gid if not (
-                event is not None and event.is_private_chat()) else ""
+            self._menu_gid = gid if not (event is not None and event.is_private_chat()) else ""
         except Exception:
             self._menu_gid = ""
 
@@ -6882,7 +7340,8 @@ async for _r in _ag:
 
         arg = self._raw_args(event, arg, "铁锈压缩").strip().lower()
         if not arg:
-            _ag = self._send_text(event,
+            _ag = self._send_text(
+                event,
                 f"当前压缩范围：{self._compress_label()}\n"
                 f"用法：/铁锈压缩 <范围>\n"
                 f"  关 - 不压缩\n"
@@ -6891,25 +7350,38 @@ async for _r in _ag:
                 f"  调试 - 只压缩调试输出\n"
                 f"  帮助 - 只压缩帮助与菜单\n"
                 f"  全部 - 全部压缩（覆盖前四项）\n"
-                f"说明：官方机器人（官Q模式）用 ``` 代码块折叠，个人机器人改用合并转发卡片"
+                f"说明：官方机器人（官Q模式）用 ``` 代码块折叠，个人机器人改用合并转发卡片",
             )
             async for _r in _ag:
                 yield _r
             return
 
         table = {
-            "关": "none", "不压缩": "none", "none": "none", "off": "none",
-            "查房": "room", "查房信息": "room", "room": "room",
-            "列表": "list", "房间列表": "list", "list": "list",
-            "调试": "diag", "调试信息": "diag", "diag": "diag",
-            "帮助": "help", "帮助信息": "help", "help": "help",
-            "全部": "all", "所有": "all", "all": "all",
+            "关": "none",
+            "不压缩": "none",
+            "none": "none",
+            "off": "none",
+            "查房": "room",
+            "查房信息": "room",
+            "room": "room",
+            "列表": "list",
+            "房间列表": "list",
+            "list": "list",
+            "调试": "diag",
+            "调试信息": "diag",
+            "diag": "diag",
+            "帮助": "help",
+            "帮助信息": "help",
+            "help": "help",
+            "全部": "all",
+            "所有": "all",
+            "all": "all",
         }
         val = table.get(arg)
         if val is None:
-            _ag = self._send_text(event,
-                f"无法识别的压缩范围：{arg}\n"
-                f"可用值：关 / 查房 / 列表 / 调试 / 帮助 / 全部")
+            _ag = self._send_text(
+                event, f"无法识别的压缩范围：{arg}\n可用值：关 / 查房 / 列表 / 调试 / 帮助 / 全部"
+            )
             async for _r in _ag:
                 yield _r
             return
@@ -6955,8 +7427,16 @@ async for _r in _ag:
         # ---- 1. event 上的候选属性 ----
         lines.append("")
         lines.append("-- event 属性 --")
-        for attr in ("bot", "_bot", "client", "api", "adapter", "platform",
-                     "self_id", "message_obj"):
+        for attr in (
+            "bot",
+            "_bot",
+            "client",
+            "api",
+            "adapter",
+            "platform",
+            "self_id",
+            "message_obj",
+        ):
             try:
                 v = getattr(event, attr, None)
             except Exception as e:
@@ -6974,8 +7454,11 @@ async for _r in _ag:
             names = [n for n in dir(event) if not n.startswith("__")]
         except Exception:
             names = []
-        hits = [n for n in names
-                if any(k in n.lower() for k in ("bot", "api", "client", "send", "post"))]
+        hits = [
+            n
+            for n in names
+            if any(k in n.lower() for k in ("bot", "api", "client", "send", "post"))
+        ]
         lines.append(", ".join(hits[:40]) if hits else "(无匹配)")
 
         # ---- 3. bot 对象的方法清单（关键） ----
@@ -6992,13 +7475,22 @@ async for _r in _ag:
         else:
             lines.append(f"类型：{type(bot).__module__}.{type(bot).__name__}")
             try:
-                meths = [n for n in dir(bot)
-                         if not n.startswith("__") and callable(getattr(bot, n, None))]
+                meths = [
+                    n
+                    for n in dir(bot)
+                    if not n.startswith("__") and callable(getattr(bot, n, None))
+                ]
             except Exception:
                 meths = []
             # 优先展示可能是发送口的
-            pri = [n for n in meths if any(k in n.lower() for k in
-                   ("send", "post", "message", "markdown", "keyboard", "group", "c2c"))]
+            pri = [
+                n
+                for n in meths
+                if any(
+                    k in n.lower()
+                    for k in ("send", "post", "message", "markdown", "keyboard", "group", "c2c")
+                )
+            ]
             lines.append("疑似发送方法：")
             lines.append("  " + (", ".join(pri[:25]) if pri else "(无)"))
             other = [n for n in meths if n not in pri]
@@ -7013,12 +7505,18 @@ async for _r in _ag:
             else:
                 lines.append(f"类型：{type(api).__module__}.{type(api).__name__}")
                 try:
-                    ameths = [n for n in dir(api)
-                              if not n.startswith("__") and callable(getattr(api, n, None))]
+                    ameths = [
+                        n
+                        for n in dir(api)
+                        if not n.startswith("__") and callable(getattr(api, n, None))
+                    ]
                 except Exception:
                     ameths = []
-                pri2 = [n for n in ameths if any(k in n.lower() for k in
-                        ("post", "send", "message", "markdown"))]
+                pri2 = [
+                    n
+                    for n in ameths
+                    if any(k in n.lower() for k in ("post", "send", "message", "markdown"))
+                ]
                 lines.append("发送相关：")
                 lines.append("  " + (", ".join(pri2[:25]) if pri2 else "(无)"))
 
@@ -7037,7 +7535,9 @@ async for _r in _ag:
         mid = self._passive_msg_id(event)
         lines.append(f"被动回复 msg_id：{mid if mid else '取不到'}")
         try:
-            lines.append(f"群号：{event.get_group_id()}（类型 {type(event.get_group_id()).__name__}）")
+            lines.append(
+                f"群号：{event.get_group_id()}（类型 {type(event.get_group_id()).__name__}）"
+            )
         except Exception as e:
             lines.append(f"群号读取失败：{type(e).__name__}")
 
@@ -7098,11 +7598,13 @@ async for _r in _ag:
         verbose = arg.strip().lower() in ("e", "error", "详情", "堆栈")
 
         # 用固定的假数据，不受真实房间状态影响
-        sample = ("房间版本：1.15\n"
-                  "地图名称：测试地图 (10p)\n"
-                  "初始资金：4000¤[1.0倍率]\n"
-                  "当前人数：7/10\n"
-                  "ID：test01")
+        sample = (
+            "房间版本：1.15\n"
+            "地图名称：测试地图 (10p)\n"
+            "初始资金：4000¤[1.0倍率]\n"
+            "当前人数：7/10\n"
+            "ID：test01"
+        )
         lines = ["【官机发送测试】"]
 
         md = self._to_markdown(sample)
@@ -7145,6 +7647,7 @@ async for _r in _ag:
             lines.append(f"调用抛异常：{type(e).__name__}：{e}")
             if verbose:
                 import traceback
+
                 lines.append(traceback.format_exc()[:1200])
 
         err = getattr(self, "_last_md_error", None)
@@ -7172,6 +7675,7 @@ async for _r in _ag:
                 if pgm is not None:
                     try:
                         import inspect
+
                         lines.append("post_group_message 签名：")
                         lines.append("  " + str(inspect.signature(pgm))[:400])
                         pk = getattr(api, "post_keyboard_message", None)
@@ -7219,10 +7723,11 @@ async for _r in _ag:
         arg = self._raw_args(event, arg, "铁锈探针时解")
         arg = (arg or "").strip()
         if not arg:
-            _ag = self._send_text(event, 
+            _ag = self._send_text(
+                event,
                 "用法：/铁锈探针时解 <5位后缀>\n"
                 "例：/铁锈探针时解 fkhk3　/铁锈探针时解 ABAB探针01_fkhk3\n"
-                "后缀是玩家列表里探针名的下划线后半部分"
+                "后缀是玩家列表里探针名的下划线后半部分",
             )
             async for _r in _ag:
                 yield _r
@@ -7241,18 +7746,18 @@ async for _r in _ag:
 
         # 校验: 长度 5, 字符都在 base36 字母表内
         if len(suffix) != 5:
-            _ag = self._send_text(event, 
+            _ag = self._send_text(
+                event,
                 f"后缀应为 5 位，你给的是 {len(suffix)} 位：{suffix!r}\n"
-                f"探针名形如 ABAB探针01_fkhk3，后缀取 _ 之后的 5 位"
+                f"探针名形如 ABAB探针01_fkhk3，后缀取 _ 之后的 5 位",
             )
             async for _r in _ag:
                 yield _r
             return
         bad = [c for c in suffix if c not in chars]
         if bad:
-            _ag = self._send_text(event, 
-                f"后缀含非法字符：{''.join(bad)!r}\n"
-                f"只允许 0-9 和 a-z（base36）"
+            _ag = self._send_text(
+                event, f"后缀含非法字符：{''.join(bad)!r}\n只允许 0-9 和 a-z（base36）"
             )
             async for _r in _ag:
                 yield _r
@@ -7267,11 +7772,17 @@ async for _r in _ag:
             return
 
         # 合理性校验: 月份 1-12, 日 1-31, 时 0-23, 分/秒 0-59
-        if not (1 <= month <= 12 and 1 <= day <= 31
-                and 0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= sec <= 59):
-            _ag = self._send_text(event, 
+        if not (
+            1 <= month <= 12
+            and 1 <= day <= 31
+            and 0 <= hour <= 23
+            and 0 <= minute <= 59
+            and 0 <= sec <= 59
+        ):
+            _ag = self._send_text(
+                event,
                 f"后缀 {suffix!r} 解出的时间不合理（{month}月{day}日 "
-                f"{hour:02d}:{minute:02d}:{sec:02d}），可能不是本插件生成的探针名"
+                f"{hour:02d}:{minute:02d}:{sec:02d}），可能不是本插件生成的探针名",
             )
             async for _r in _ag:
                 yield _r
@@ -7283,22 +7794,21 @@ async for _r in _ag:
         #  看似合法、但重新编码对不上的时间)。
         re_enc = self._ts_encode(month, day, hour, minute, sec)
         if re_enc != suffix:
-            _ag = self._send_text(event, 
+            _ag = self._send_text(
+                event,
                 f"后缀 {suffix!r} 不是有效的探针时间编码：解出 {month}月{day}日 "
                 f"{hour:02d}:{minute:02d}:{sec:02d}，重新编码却得到 {re_enc!r}\n"
-                f"请确认复制的是 ABAB探针NN_xxxxx 里下划线后的 5 位"
+                f"请确认复制的是 ABAB探针NN_xxxxx 里下划线后的 5 位",
             )
             async for _r in _ag:
                 yield _r
             return
 
-        _ag = self._send_text(event,
-            f"探针进房时间：{month}月{day}日 "
-            f"{hour:02d}:{minute:02d}:{sec:02d}"
+        _ag = self._send_text(
+            event, f"探针进房时间：{month}月{day}日 {hour:02d}:{minute:02d}:{sec:02d}"
         )
         async for _r in _ag:
             yield _r
-
 
     @filter.command("铁锈撤回")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -7342,14 +7852,15 @@ async for _r in _ag:
             arg = " ".join(parts)
         if not key and not wildcard:
             # 拿不到会话标识(平台差异): 明确告知, 不再静默吞掉
-            _ag = self._send_text(event, 
+            _ag = self._send_text(
+                event,
                 "无法识别当前会话，撤回配置未生效。\n"
-                "请在群聊或私聊中直接使用，或用 /铁锈查房调试 查看详情"
+                "请在群聊或私聊中直接使用，或用 /铁锈查房调试 查看详情",
             )
             async for _r in _ag:
                 yield _r
             return
-        scope = ("全部群" if wildcard else (f"本群({key})" if not is_private else "本私聊"))
+        scope = "全部群" if wildcard else (f"本群({key})" if not is_private else "本私聊")
 
         # ---- 列出 ----
         if arg in ("列出", "列表", "list", "ls"):
@@ -7400,9 +7911,8 @@ async for _r in _ag:
             spec = arg[1:].strip()
             # 支持 " - *" 这种把 '*' 附带在末尾的写法
             if not spec:
-                _ag = self._send_text(event, 
-                    "用法：/铁锈撤回 + #群号:60 @qq:30\n"
-                    "　　　/铁锈撤回 - #群号"
+                _ag = self._send_text(
+                    event, "用法：/铁锈撤回 + #群号:60 @qq:30\n　　　/铁锈撤回 - #群号"
                 )
                 async for _r in _ag:
                     yield _r
@@ -7431,8 +7941,7 @@ async for _r in _ag:
                 if add:
                     # 主动向平台拉取机器人加入的全部群, 不只是"见过"的群
                     all_groups = await self._recall_all_groups(event)
-                    added = self._recall_expand_wildcard(
-                        wc_delay, event, groups=all_groups)
+                    added = self._recall_expand_wildcard(wc_delay, event, groups=all_groups)
                     known = len(all_groups)
                     extra = ""
                     if known <= 1:
@@ -7440,9 +7949,10 @@ async for _r in _ag:
                             "\n（平台没有返回群列表；不同适配器能力不同，"
                             "如 OneBot v11 才支持 get_group_list）"
                         )
-                    _ag = self._send_text(event, 
+                    _ag = self._send_text(
+                        event,
                         f"已把 * 展开到 {known} 个群：新增 {added} 条，延迟 {wc_delay} 秒"
-                        f"{extra}\n用 /铁锈撤回 列出 查看具体群号"
+                        f"{extra}\n用 /铁锈撤回 列出 查看具体群号",
                     )
                     async for _r in _ag:
                         yield _r
@@ -7484,9 +7994,10 @@ async for _r in _ag:
         if not arg:
             cfg = self._get_recall_cfg(event, want_wildcard=wildcard)
             state = "开启" if cfg["开"] else "关闭"
-            _ag = self._send_text(event, 
+            _ag = self._send_text(
+                event,
                 f"{scope}自动撤回：{state}，延迟 {cfg['延迟']} 秒\n"
-                f"改配置：/铁锈撤回 列出｜+｜-｜重置"
+                f"改配置：/铁锈撤回 列出｜+｜-｜重置",
             )
             async for _r in _ag:
                 yield _r
@@ -7508,8 +8019,8 @@ async for _r in _ag:
 
         if arg in ("开", "开启", "on"):
             self._set_recall_cfg(event, delay=self.RECALL_DELAY_DEFAULT, wildcard=wildcard)
-            _ag = self._send_text(event, 
-                f"{scope}自动撤回已开启，延迟 {self.RECALL_DELAY_DEFAULT} 秒"
+            _ag = self._send_text(
+                event, f"{scope}自动撤回已开启，延迟 {self.RECALL_DELAY_DEFAULT} 秒"
             )
             async for _r in _ag:
                 yield _r
@@ -7522,7 +8033,8 @@ async for _r in _ag:
                 yield _r
             return
 
-        _ag = self._send_text(event, 
+        _ag = self._send_text(
+            event,
             "用法：/铁锈撤回 <子命令>\n"
             "  列出 - 列出全部配置\n"
             "  + #群号:60 - 添加/修改（可跟多条）\n"
@@ -7530,7 +8042,7 @@ async for _r in _ag:
             "  重置 - 清空全部配置\n"
             "  开|关|秒数 - 快捷设置本会话\n"
             "  + *:60 - 展开到所有已知群\n"
-            "不带参数 = 查看本会话配置；群聊末尾加 * 表示对全部群生效"
+            "不带参数 = 查看本会话配置；群聊末尾加 * 表示对全部群生效",
         )
         async for _r in _ag:
             yield _r
@@ -7575,7 +8087,11 @@ async for _r in _ag:
             return
         self._write_config("混合_私聊策略", "white" if arg == "白" else "black")
         self._save_config()
-        name = "跟随白名单(不在白名单拦截)" if self.cfg["混合_私聊策略"] == "white" else "跟随黑名单(在黑名单拦截)"
+        name = (
+            "跟随白名单(不在白名单拦截)"
+            if self.cfg["混合_私聊策略"] == "white"
+            else "跟随黑名单(在黑名单拦截)"
+        )
         _ag = self._send_text(event, f"混合模式私聊默认策略已设为：{name}")
         async for _r in _ag:
             yield _r
@@ -7660,7 +8176,7 @@ async for _r in _ag:
         # 早期实现把整串当一个标识丢给 fullmatch，所以 `+#111 +#222`
         # 必然报"无效标识" —— 文档承诺了连写，代码并不支持。
         op = arg[0] if arg[0] in "+-" else ""
-        tokens = [t for t in arg[1 if op else 0:].split() if t]
+        tokens = [t for t in arg[1 if op else 0 :].split() if t]
         if not tokens:
             return f"用法：/{cmd_name or label} [+@用户ID|+#群号]（可连写多条）"
         results = []
@@ -7680,8 +8196,7 @@ async for _r in _ag:
             ident = body[1:].strip()
             if not ident or not re.fullmatch(r"[0-9A-Za-z_\-]{3,64}", ident):
                 results.append(
-                    f"无效标识：{tok}\n"
-                    f"可用形式：#群号、#官方群openid、@QQ号、@用户openid"
+                    f"无效标识：{tok}\n可用形式：#群号、#官方群openid、@QQ号、@用户openid"
                 )
                 continue
             key_val = body[0] + ident  # 前缀 + 完整标识（不截断）
@@ -7765,8 +8280,7 @@ async for _r in _ag:
             # `。铁锈查房 r5132` 这些形态 —— 以前每一种都会多查一次房。
             _cmd = command_in_text(text)
             if _cmd:
-                self.logger.debug(
-                    f"[自动查房] 正文含指令「{_cmd}」，跳过房号解析")
+                self.logger.debug(f"[自动查房] 正文含指令「{_cmd}」，跳过房号解析")
                 return
 
             # 群聊按 #群号, 私聊按 @用户ID, 各自进黑/白名单判定
@@ -7793,7 +8307,8 @@ async for _r in _ag:
             if not self._is_allowed(is_private, uid, gid):
                 self.logger.debug(
                     f"[权限] 会话={'私聊' if is_private else '群聊'} "
-                    f"群号={gid or '-'} 发送者={uid or '-'} 不在名单内, 整条忽略")
+                    f"群号={gid or '-'} 发送者={uid or '-'} 不在名单内, 整条忽略"
+                )
                 return
 
             # ---- 检查 0.5: 全局解析开关（只影响自动触发）----
@@ -7817,8 +8332,7 @@ async for _r in _ag:
             # 命中就整条不解析：这类文本里的房号是「结果」，不是「请求」。
             _hit = self._is_ignored_text(text)
             if _hit:
-                self.logger.debug(
-                    f"[忽略] 群 {gid or '-'} 命中规则「{_hit}」，不解析房号")
+                self.logger.debug(f"[忽略] 群 {gid or '-'} 命中规则「{_hit}」，不解析房号")
                 return
 
             rids = extract_room_ids(text)
@@ -7845,17 +8359,20 @@ async for _r in _ag:
             except (TypeError, ValueError):
                 cooldown = COOLDOWN
             # 定期清理冷却字典, 防止长期运行无限膨胀
-            if (not self.room_cooldown or self._last_cleanup is None
-                    or now - self._last_cleanup > 300):
+            if (
+                not self.room_cooldown
+                or self._last_cleanup is None
+                or now - self._last_cleanup > 300
+            ):
                 stale = [k for k, ts in self.room_cooldown.items() if now - ts > cooldown * 2]
                 for k in stale:
                     del self.room_cooldown[k]
                 # 清理过期的"本机确实查到过房间"记录（只需覆盖冷却窗口）
-                for k in [k for k, ts in self._room_ok.items()
-                          if now - ts > max(cooldown * 2, 60)]:
+                for k in [k for k, ts in self._room_ok.items() if now - ts > max(cooldown * 2, 60)]:
                     del self._room_ok[k]
-                for k in [k for k, ts in self._recent_cmd.items()
-                          if now - ts > CMD_DEDUP_WINDOW * 3]:
+                for k in [
+                    k for k, ts in self._recent_cmd.items() if now - ts > CMD_DEDUP_WINDOW * 3
+                ]:
                     del self._recent_cmd[k]
                 self._last_cleanup = now
             to_query = []
@@ -7867,20 +8384,19 @@ async for _r in _ag:
             # 英文聊天会产出多个纯字母候选，若不排序，真房号可能被
             # 挤出 probe_max_per_msg 名额 —— 自动查房就漏报了。
             rids = sorted(rids, key=_relay_priority)
-            cooling = []          # 被冷却挡下、且**确实查到过房间**的房号（用于提示）
+            cooling = []  # 被冷却挡下、且**确实查到过房间**的房号（用于提示）
             for rid in rids:
                 ck = f"{sess}|{rid}"
                 # 兜底去重：同一条消息若已被显式指令查过，这里绝不再查一遍。
                 # 剥 @提及 已经堵住了主因，但唤醒词/前缀格式千奇百怪，
                 # 这一层不依赖文本解析，按「会话+房号」直接记账判定。
                 if now - self._recent_cmd.get(ck, 0) < CMD_DEDUP_WINDOW:
-                    self.logger.debug(
-                        f"房号 {rid} 刚被指令查询过, 跳过自动查房")
+                    self.logger.debug(f"房号 {rid} 刚被指令查询过, 跳过自动查房")
                     continue
                 last = self.room_cooldown.get(ck, 0)
                 hit = False
                 if now - last < cooldown:
-                    hit = True                       # 本机刚查过
+                    hit = True  # 本机刚查过
                 if hit:
                     # **只有「确实查到过有效房间」的房号才纳入提示候选。**
                     #
@@ -7916,9 +8432,8 @@ async for _r in _ag:
                                 left = max(left, int(cooldown - (now - ts)))
                         left = max(0, left)
                         await self._send_recallable(
-                            event,
-                            f"房号 {'、'.join(cooling)} 刚查过，"
-                            f"请 {left} 秒后再试")
+                            event, f"房号 {'、'.join(cooling)} 刚查过，请 {left} 秒后再试"
+                        )
                     except Exception as e:
                         self.logger.debug(f"冷却提示发送失败(忽略): {e}")
                 return
@@ -7949,8 +8464,7 @@ async for _r in _ag:
                 remaining = tasks.copy()
                 while remaining:
                     done, _ = await asyncio.wait(
-                        [t[2] for t in remaining],
-                        return_when=asyncio.FIRST_COMPLETED
+                        [t[2] for t in remaining], return_when=asyncio.FIRST_COMPLETED
                     )
                     for t in remaining[:]:
                         if t[2] in done:
@@ -7960,9 +8474,11 @@ async for _r in _ag:
                             except Exception as e:
                                 # 自动路径对群里保持静默（英文单词误报不能刷屏），
                                 # 但日志必须带堆栈 —— 代码错误和网络失败要能区分。
-                                self.logger.exception(
+                                self.logger.error(
                                     f"[查房] {rid} 插件内部异常（自动触发，未回传）: "
-                                    f"{type(e).__name__}: {e}")
+                                    f"{type(e).__name__}: {e}",
+                                    exc_info=True,
+                                )
                                 result = ""
                             if is_room_info(result):
                                 self.logger.info(f"房间 {rid} 查询成功, 回传")
@@ -7972,8 +8488,7 @@ async for _r in _ag:
                                 # 与显式查房同口径夹取 [1,10]：retry_times=0 时
                                 # 两处都应至少试 1 次，否则群里自动识别会一次都不查。
                                 try:
-                                    max_retry = max(1, min(10, int(
-                                        self.cfg.get("retry_times", 3))))
+                                    max_retry = max(1, min(10, int(self.cfg.get("retry_times", 3))))
                                 except (TypeError, ValueError):
                                     max_retry = 1
                                 retried = 0
@@ -7981,26 +8496,30 @@ async for _r in _ag:
                                     retried += 1
                                     # 重试过程静默, 只在 debug 日志留痕(避免刷屏)
                                     self.logger.debug(
-                                        f"房间 {rid} 探针名被过滤, "
-                                        f"重试({retried}/{max_retry})")
+                                        f"房间 {rid} 探针名被过滤, 重试({retried}/{max_retry})"
+                                    )
                                     # 重试时去掉时间后缀, 直接 _序号 最短, 最不容易被过滤
                                     # 用当前任务的 idx 构造, 避免 for 循环残留的 base_name 串号
                                     new_name = f"{self._probe_prefix()}探针{idx:02d}_{retried}"
                                     retry_result = ""
                                     retry_task = None
                                     try:
-                                        retry_task = asyncio.create_task(self._query_room(rid, new_name, gid))
+                                        retry_task = asyncio.create_task(
+                                            self._query_room(rid, new_name, gid)
+                                        )
                                         self.pending_tasks.add(retry_task)
                                         retry_task.add_done_callback(self.pending_tasks.discard)
-                                        retry_result = await asyncio.wait_for(retry_task, timeout=QUERY_TIMEOUT)
+                                        retry_result = await asyncio.wait_for(
+                                            retry_task, timeout=QUERY_TIMEOUT
+                                        )
                                     except asyncio.TimeoutError:
                                         retry_result = ""
                                     except Exception as e:
                                         # 其它异常若直接抛出，会中断 while remaining，
                                         # 同一批里其它房号已查到的结果也不会再回。
                                         self.logger.warning(
-                                            f"房间 {rid} 重试任务异常: "
-                                            f"{type(e).__name__}: {e}")
+                                            f"房间 {rid} 重试任务异常: {type(e).__name__}: {e}"
+                                        )
                                         retry_result = f"[插件错误] {rid} 重试时异常（{type(e).__name__}）：{e}"
                                     finally:
                                         # 确保重试任务被取消并回收, 避免协程泄漏
@@ -8015,39 +8534,35 @@ async for _r in _ag:
                                         break
                                     if not is_name_check_error(retry_result):
                                         if is_reportable_error(retry_result):
-                                            _ag = self._send_text(event, 
-                                                translate_error(retry_result))
+                                            _ag = self._send_text(
+                                                event, translate_error(retry_result)
+                                            )
                                             async for _r in _ag:
                                                 yield _r
                                         else:
                                             self.logger.debug(
-                                                f"房间 {rid} 重试失败(静默): "
-                                                f"{retry_result[:120]}")
+                                                f"房间 {rid} 重试失败(静默): {retry_result[:120]}"
+                                            )
                                         break
                                 else:
                                     # 重试次数用尽: 仅当失败原因值得回传才发
                                     if is_reportable_error(result):
-                                        _ag = self._send_text(event, 
-                                            translate_error(result))
+                                        _ag = self._send_text(event, translate_error(result))
                                         async for _r in _ag:
                                             yield _r
                                     else:
                                         self.logger.debug(
-                                            f"房间 {rid} 重试耗尽(静默): "
-                                            f"{result[:120]}")
+                                            f"房间 {rid} 重试耗尽(静默): {result[:120]}"
+                                        )
                             elif is_error_info(result):
                                 # 仅"房间确实存在"类错误回传, 其余静默
                                 if is_reportable_error(result):
-                                    self.logger.info(
-                                        f"房间 {rid} 查询失败，回传原因")
-                                    _ag = self._send_text(event, 
-                                        translate_error(result))
+                                    self.logger.info(f"房间 {rid} 查询失败，回传原因")
+                                    _ag = self._send_text(event, translate_error(result))
                                     async for _r in _ag:
                                         yield _r
                                 else:
-                                    self.logger.debug(
-                                        f"房间 {rid} 查询失败(静默): "
-                                        f"{result[:120]}")
+                                    self.logger.debug(f"房间 {rid} 查询失败(静默): {result[:120]}")
                             else:
                                 self.logger.debug(f"房间 {rid} 无有效信息, 静默丢弃")
                             released.add(idx)  # 先标记再释放, 确保 finally 不重复释放
