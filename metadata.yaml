@@ -35,5 +35,12 @@ desc: |
   - /铁锈查房调试 打印运行时状态, 便于排查配置问题
 version: 2.0.3
 astrbot_version: ">=4.9.0"
+# 声明的平台适配器（须是 AstrBot ADAPTER_NAME_2_TYPE 的 key）。
+# 本插件两条发送通道：QQ 个人号(aiocqhttp) 与 QQ 官方机器人(qq_official /
+# qq_official_webhook，代码里按平台名含 official 判定，两者共用官方 Markdown 通道)。
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - qq_official_webhook
 author: wcnmamrs
 repo: "https://github.com/wcnmamrs/astrbot_plugin_rwinfo"
