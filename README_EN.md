@@ -320,6 +320,40 @@ ID：hlbifz
   B2 (AI): AI - Hard
 ```
 
+### Map names are cleaned up
+
+The protocol's map field is not always a plain name. These are all real values seen in the wild:
+
+| Raw | Shown |
+|-----|-------|
+| `NEW_PATH|maps2/10p西班牙混战by-MP97.tmx` | `10p西班牙混战by-MP97` |
+| `MOD|36976564B8…6BBB5B6AC//maps/ai-弱智AI试炼场(2p)` | `ai-弱智AI试炼场(2p)` |
+| `/SD/rusted_warfare_maps/MOD|sw3058511896//maps/[p9]Coliding Powers (4v5).tmx` | `Coliding Powers (4v5)` |
+| `0    1941欧洲二战：至暗黄昏   40人  by哟西` | `1941欧洲二战：至暗黄昏 40人 by哟西` |
+| `[z;p10]Crossing Large (10p).tmx` | `Crossing Large (10p)` |
+
+Order is fixed: protocol prefix → mod id (hash or `sw` workshop id) → last path segment →
+repeated bracket-parameter and numeric-prefix stripping → collapse spaces → drop extension.
+Slashes inside names like `1v1/2v2 混战地图` are not treated as paths. If everything is
+stripped away the bot shows "未知地图" instead of pasting `MOD|<hash>//maps/` on screen.
+The room list's map and description columns use the same cleaning.
+
+### Mod detection
+
+`使用模组` has four shapes, all derived from the room info packet:
+
+| Shown | Meaning |
+|-------|---------|
+| `使用模组：炮塔科技1.4` | Mod detected; name comes from the display name the mod gave its custom units (up to 3, then "等 N 个") |
+| `使用模组：有（自定义单位 1277 个，未上报名称）` | Unit count far above vanilla 121 — mod detected, but the mod gave its units no names |
+| `使用模组：有（地图来自模组）` | Unit count is still 121, but the map is loaded from a mod folder (`MOD|` prefix) |
+| `使用模组：原版` | Vanilla unit count and a non-mod map |
+
+Mods that only change numeric values leave no trace in the packet, so they still show
+`使用模组：原版` — that is a limit of the protocol, not a parsing failure. Column 21 of the
+room list (the mod-name column) is still ignored: it is filled in by the host's client and
+is empty for exactly those mods.
+
 If the probe name is filtered, progress is sent before each retry:
 
 ```

@@ -1476,7 +1476,9 @@ def _normalize_official(room: dict) -> dict:
         "addr": oaddr,
         "name": display,
         "host": host,
-        "map": desc or "-",
+        # 描述列就是地图名，和查询结果走同一套清洗：官方列表里同样会出现
+        # `[z;p10]Crossing Large (10p).tmx`、`MOD|<哈希>//maps/xxx` 这些形态
+        "map": clean_mapname(desc) or "-",
         "players": _as_int(room.get("players"), 0),
         "max": _as_int(room.get("max"), 0),
         "status": status,
@@ -1652,7 +1654,14 @@ def _fmt_room_line(room: dict) -> str:
     st = STATUS_CN.get((room.get("status") or "").lower(), room.get("status") or "-")
     pl = room.get("players", 0)
     mx = room.get("max", 0)
-    desc = room.get("desc") or ""
+    # 描述列经常就是地图名的原串（`MOD|<哈希>//maps/xxx`）。清洗后如果跟地图列
+    # 一样就没必要重复贴一遍，否则一行里能出现两遍同样的脏路径。
+    # 洗完是空串时不能再退回原串：那说明原串整条都是协议残渣
+    # （`MOD|<哈希>//maps/[??10P??].tmx` 的方括号里就是全部内容）。
+    raw_desc = room.get("desc") or ""
+    desc = clean_mapname(raw_desc)
+    if not desc and not re.search(r"[A-Z][A-Z_]{2,}\|", raw_desc, re.IGNORECASE):
+        desc = raw_desc.strip()
     line = (
         f"{str(room.get('name') or '?')[:14]:<16}"
         f"{str(room.get('map') or '-')[:26]:<28}"
@@ -2061,27 +2070,77 @@ def detect_client(info):
 def clean_mapname(raw):
     """把 106 / 列表里的地图名洗成能看的样子。
 
-    联机协议里的地图名不止「纯名字」一种形态，实测收到过这三种：
-      · `NEW_PATH|maps2/10p西班牙混战by-MP97`        —— 自定义地图，带一整个路径
-      · `0    1941欧洲二战：至暗黄昏   40人  by哟西`   —— 模组地图，前面是「模组序号 + 连续空格」
-      · `[z;p10]Crossing Large (10p).tmx`             —— 老版式，方括号里是地图参数
-    这些前缀对玩家没有意义，原样贴出去就是一行怪东西。
+    联机协议里的地图名不止「纯名字」一种形态，实测收到过这些：
+      · `NEW_PATH|maps2/10p西班牙混战by-MP97`                        —— 自定义地图，带临时路径
+      · `MOD|36976564B8…6BBB5B6AC//maps/ai-弱智AI试炼场(2p)`         —— 地图来自模组，带模组哈希
+      · `/SD/rusted_warfare_maps/MOD|sw3058511896//maps/[p9]Coliding Powers (4v5)` —— 同一形态，但房主开的是安卓上的绝对路径
+      · `0    1941欧洲二战：至暗黄昏   40人  by哟西`                   —— 模组地图，前面是「模组序号 + 连续空格」
+      · `[z;p10]Crossing Large (10p).tmx`                            —— 老版式，方括号里是地图参数
+    这些前缀、路径、哈希对玩家没有意义，原样贴出去就是一行怪东西。
+
+    清洗顺序是有讲究的，不能随意调换：
+      1. 从第一个 `前缀|` 处截断（房主可能把整条 sd 卡路径带上来）；
+      2. `//` 之后（或模组 ID 之后）才是相对路径；
+      3. 切成文件名（只在确实像路径时切，`1v1/2v2 混战地图` 这种名字不能动）；
+      4. 再反复剥「数字序号 + 连续空格」与「方括号参数」—— 两者会交替出现；
+      5. 收空格、去扩展名。
+    每一步都记 `hit`：只有当一次都没命中时才回退原串，否则洗完变空就返回空串，
+    让调用方去显示「未知地图」，而不是把 `MOD|<哈希>//maps/` 这种残渣贴上屏。
     """
     name = str(raw or "").strip()
     if not name:
         return ""
-    # `NEW_PATH|maps2/xxx.tmx` / `NEW_PATH|C:\\maps\\xxx.tmx`：只留文件名
-    if name.upper().startswith("NEW_PATH|"):
-        name = name.split("|", 1)[1].replace("\\", "/").rsplit("/", 1)[-1]
-    # `[z;p10]xxx`：方括号里是地图参数
-    name = re.sub(r"^\[[^\]]*\]", "", name)
-    # `0    xxx`：模组地图前面带「模组序号 + 连续空格」，四个空格是它的分隔符
-    name = re.sub(r"^\d{1,3}\s{2,}", "", name)
-    # 名字内部的连续空格（作者常用它对齐）收成一个，否则一行里全是空洞
+
+    hit = False  # 是否命中过任何一步清洗
+
+    # 1) 名字前面可能挂着整条文件系统路径：/SD/rusted_warfare_maps/MOD|xxx//maps/y
+    #    从第一个 `大写字母+|` 处截断（大小写都认：协议里出现过小写 `mod|`）
+    m = re.search(r"[A-Z][A-Z_]{2,}\|", name, re.IGNORECASE)
+    if m:
+        name = name[m.start() :].split("|", 1)[1]
+        hit = True
+
+    # 2) `MOD|` 后面是模组标识：40~64 位十六进制，或 `sw3058511896` 这种工坊 ID。
+    #    `//` 之后才是相对路径；没有 `//` 时把开头的「标识 + 斜杠」剥掉。
+    if "//" in name:
+        name = name.split("//", 1)[1]
+        hit = True
+    else:
+        stripped = re.sub(r"^[0-9A-Za-z_]{6,}/+", "", name)
+        if stripped != name:
+            name, hit = stripped, True
+
+    # 3) 还剩路径就取最后一段。只在「确实像路径」时切：命中过前缀，或本身是
+    #    `.tmx`/`.rws` 文件。`1v1/2v2 混战地图`、`10p\皮亚韦河之战` 这类名字原样保留。
+    looks_like_file = name.lower().endswith((".tmx", ".rws"))
+    if ("/" in name or "\\" in name) and (hit or looks_like_file):
+        if name.endswith(("/", "\\")):
+            # 只有目录没有文件名（`MOD|<hash>//maps/`）：原串本身就是残渣
+            name = ""
+        else:
+            name = name.replace("\\", "/").split("//")[-1].rstrip("/").rsplit("/", 1)[-1]
+        hit = True
+
+    # 4) `0    [z;p10]xxx`：数字序号与方括号参数可能交替出现，反复剥到不动为止
+    for _ in range(3):
+        before = name
+        name = re.sub(r"^\[[^\]]*\]", "", name)
+        name = re.sub(r"^\d{1,3}\s{2,}", "", name)
+        if name == before:
+            break
+        hit = True
+
+    # 5) 名字内部的连续空格（作者常用它对齐）收成一个，否则一行里全是空洞
     name = re.sub(r"\s{2,}", " ", name).strip()
+
+    # 6) 扩展名
     if name.lower().endswith((".tmx", ".rws")):
-        name = name[:-4]
-    return name or str(raw or "").strip()
+        name = name[:-4].strip()
+
+    if name:
+        return name
+    # 洗空了：命中过清洗说明剩下的本来就是残渣，交给调用方显示「未知地图」
+    return "" if hit else str(raw or "").strip()
 
 
 def _mod_line(info) -> str:
@@ -2091,17 +2150,24 @@ def _mod_line(info) -> str:
       · 单位显示名（dname）：模组作者给自定义单位起的名字，通常就含模组名。
         原版 121 个内置单位都没有显示名，所以这里一旦有值就说明装了模组。
       · 单位数量：超过原版 121 个说明装了模组，但可能摸不到名字。
+      · 地图路径：`MOD|<哈希>//maps/xxx` 说明地图是从模组里加载的。
     只改数值、不加单位的模组两个信号都没有，只能显示「原版」—— 这是协议
     给的信息上限，不是解析失败。
     """
     names = [n for n in (info.get("mod_names") or []) if n]
     count = info.get("custom_unit_count") or 0
+    # `MOD|<哈希>//maps/xxx`：地图是从模组目录里加载的，说明这个房间装了模组。
+    # 模组只带地图、不带单位时，上面两个信号都是空的，靠这一条兜住。
+    # 前缀可能在字符串中间：`/SD/rusted_warfare_maps/MOD|xxx//maps/y`
+    map_from_mod = bool(re.search(r"MOD\|", str(info.get("mapname") or "").strip(), re.IGNORECASE))
     if names:
         shown = "、".join(names[:3])
         more = f" 等 {len(names)} 个" if len(names) > 3 else ""
         return f"使用模组：{shown}{more}"
     if count > VANILLA_UNIT_COUNT:
         return f"使用模组：有（自定义单位 {count} 个，未上报名称）"
+    if map_from_mod:
+        return "使用模组：有（地图来自模组）"
     if count == 0:
         # 连 customUnits 块都没读到（解析中断/老版本），不表态
         return ""

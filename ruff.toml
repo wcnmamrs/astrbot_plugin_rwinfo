@@ -7,6 +7,9 @@
 #   `noqa`，反而掩盖真正的问题。
 line-length = 100
 target-version = "py310"
+# 只管 Python 源码。Markdown 里的代码块是历史记录（CHANGELOG 贴的是当年真实片段），
+# 被格式化器改写会让「当时的写法」失真，也会制造巨大的噪音 diff。
+exclude = ["*.md"]
 
 [format]
 quote-style = "preserve"
