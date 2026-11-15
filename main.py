@@ -2831,8 +2831,13 @@ class RWInfoPlugin(Star):
         # 这类内容在 _render_text 里已经包进 ```txt 代码块，直接原样发送。
         elif self._guess_kind(text) == "room" or str(text).lstrip().startswith("```"):
             md = str(text)
-        else:
+        elif str(text).lstrip().startswith("【"):
             md = self._to_markdown(text)
+        else:
+            # 指令回执（「玩家列表显示已关闭」「重试次数已设置为：5」）不是内容型文本。
+            # _render_text 那边用 is_content 挡着不转换，这里必须同口径：
+            # 否则任何含「：」的回执都会被 kv_re 拆成「| 项目 | 值 |」两行表格。
+            md = str(text)
         if not md:
             return False, None
         if not target:
@@ -3060,7 +3065,11 @@ class RWInfoPlugin(Star):
                     out.append("")
                 continue
             # 玩家列表块的标题行：` 玩家列表:` / ` 玩家: ...`
-            if ln.lstrip().startswith("玩家列表"):
+            # **必须整行就是标题**：早期用 startswith("玩家列表")，
+            # 结果指令回执「玩家列表显示已关闭」也被当成标题行，
+            # 整句被替换成 `**玩家列表**` —— 用户在官Q 上只看到
+            # 「玩家列表」四个字，不知道到底开还是关。
+            if ln.strip().rstrip("：:").strip() == "玩家列表":
                 flush_kv()
                 flush_list()
                 out.append("**玩家列表**")
@@ -4521,7 +4530,10 @@ async for _r in _ag:
         except Exception:
             return ""
 
-    # ---- 指令（管理类在 handler 内再判 ADMIN 名单） ----
+    # ---- 指令 ----
+    # 写配置/发消息的指令一律挂 @filter.permission_type(ADMIN)；
+    # 权限由框架的 PermissionTypeFilter 判定（ADMIN = AstrBot 全局超管 admins_id），
+    # handler 内部**没有**第二次管理员校验 —— 漏挂装饰器就是真的不设防。
     @filter.command("铁锈查房帮助")
     async def cmd_help(self, event: AstrMessageEvent, arg: str = ""):
         """显示本插件全部指令与用法。
@@ -4609,11 +4621,15 @@ async for _r in _ag:
             "/铁锈玩家列表 开|关　/铁锈重试 [0-10]",
             "/铁锈撤回 列出|+|-|重置　* 表示所有群",
             "/铁锈忽略 +|-|测试|开|关　挡住别的机器人发的报告",
+            "/铁锈压缩 关|查房|列表|调试|帮助|全部　折叠长消息",
             "",
-            "—— 调试 ——",
+            "—— 调试（管理员）——",
             "/铁锈查房调试 [会话|撤回|探针|列表|配置|官机]",
             "/铁锈查房调试菜单 - 查看/修改内部数值",
-            "/铁锈探针时解 <5位后缀> - 还原探针进房时间",
+            "旧别名：/铁锈官机探测　/铁锈官机测试",
+            "",
+            "—— 其他 ——",
+            "/铁锈探针时解 <5位后缀> - 还原探针进房时间（人人可用）",
             "",
             "—— 自动触发 ——",
             "群聊/私聊发房号自动查房，无需指令",
@@ -5840,7 +5856,10 @@ async for _r in _ag:
         arg = (arg or "").strip()
         if not arg:
             state = "开启" if self.cfg.get("show_players", False) else "关闭"
-            _ag = self._send_text(event, f"玩家列表显示当前状态：{state}")
+            # 这里不写「当前状态：关闭」——官Q 的 Markdown 会把
+            # 「键：值」渲染成单行表格，一句回执套个表头很别扭。
+            _ag = self._send_text(
+                event, f"玩家列表显示当前为「{state}」")
             async for _r in _ag:
                 yield _r
             return
