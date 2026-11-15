@@ -33,7 +33,7 @@ desc: |
   - 探针脚本自愈: room_info.py 缺失或接口过旧时自动从仓库补齐
     (仅补探针脚本, 不会自动升级插件本体)
   - /铁锈查房调试 打印运行时状态, 便于排查配置问题
-version: 2.0.2
+version: 2.0.3
 astrbot_version: ">=4.9.0"
 author: wcnmamrs
 repo: "https://github.com/wcnmamrs/astrbot_plugin_rwinfo"

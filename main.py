@@ -105,7 +105,7 @@ CMD_DEDUP_WINDOW = 10
 PROBE_MIN, PROBE_MAX = 1, 99
 
 # 插件版本（菜单与元数据展示用，与 metadata.yaml 的 version 保持一致）
-PLUGIN_VERSION = "2.0.2"
+PLUGIN_VERSION = "2.0.3"
 
 # ---- 协议侧常量（与 room_info.py 保持一致）----
 # 官方 masterserver 列表。插件侧解析中继房真实地址时要用，
@@ -694,6 +694,19 @@ def _split_relay_run(head: str, digits: str):
     return out
 
 
+def strip_dup_prefix(tok: str) -> str:
+    """去掉重复的中继前缀字母: `rr5132` -> `r5132`, `rr九一` -> `r九一`。
+
+    只处理「同一个 oqrs 字母连写」这一种情况（手抖按重了）；
+    不同字母的前缀（`xr5132`、`abc123`）不动 —— 那可能是别的词，
+    乱剥会把普通英文单词切成房号。
+    """
+    tok = str(tok or "").strip()
+    while len(tok) > 2 and tok[0] in "oqrs" and tok[1] == tok[0]:
+        tok = tok[1:]
+    return tok
+
+
 def normalize_room_id(rid) -> str:
     """房号归一化: K 服(RKC/ KC) 转大写并补 R 前缀, 其余转小写。
 
@@ -754,6 +767,21 @@ def extract_room_ids(text: str, allow_custom: bool = False):
     rest = K_ROOM_RE.sub(" ", rest)
 
     # 1) 数字房(oqrs + 数字)：宽松匹配，再归一化拆分
+    # `_glue` 收集「和房号粘在一起的 ASCII 字母数字」区间（r5132abc / abc123），
+    # 这些是混合词、不是房号；必须整段屏蔽，否则剩下的 `abc` 会被下一步
+    # 当成字母房号抓出来（曾经的 bug：`r5132abc` -> 查出 `abc`）。
+    _glue = []
+
+    def _alnum_run(i):
+        """i 处所在的那串 ASCII 字母/数字/下划线的 [起, 止)。"""
+        a = i
+        while a > 0 and rest[a - 1].isascii() and (rest[a - 1].isalnum() or rest[a - 1] == "_"):
+            a -= 1
+        b = i
+        while b < len(rest) and rest[b].isascii() and (rest[b].isalnum() or rest[b] == "_"):
+            b += 1
+        return a, b
+
     for m in RELAY_NUM_LOOSE_RE.finditer(rest):
         start = m.start()
         # 左边界：紧邻「非 oqrs 字母」才说明是字母房号的一部分（如 abc123）。
@@ -761,21 +789,34 @@ def extract_room_ids(text: str, allow_custom: bool = False):
         # 不能跳过 —— 这正是「连写」要能识别的关键。
         if start > 0:
             prev = rest[start - 1]
-            if prev.isalpha() and prev.lower() not in "oqrs":
+            # 只把 ASCII 字母当「相邻词的一部分」：Python 的 str.isalpha() 对汉字
+            # 也返回 True，用它会把 `有人R95898` 里的房号当成 `有人…` 的尾巴跳过。
+            if prev.isascii() and prev.isalpha() and prev.lower() not in "oqrs":
+                _glue.append(_alnum_run(start))
                 continue
-        # 右边界：紧邻「非 oqrs 字母」才说明是字母房号的一部分（如 r5132abc）。
-        # 若紧跟 oqrs 字母，那是下一个连写房号的前缀（s1024r5132），不能跳过。
+        # 右边界：紧邻「非 oqrs 字母」说明这是个混合词（r5132abc）。
+        # 房号本身仍然有效 —— 取 r5132，把后面粘的字母丢掉；
+        # 但整段要屏蔽掉，否则 `abc` 会被字母房规则当成另一个房号。
+        # 若紧跟 oqrs 字母，那是下一个连写房号的前缀（s1024r5132），正常拆。
         end = m.end()
         if end < len(rest):
             nxt = rest[end]
-            if nxt.isalpha() and nxt.lower() not in "oqrs":
-                continue
+            # 汉字不算粘连（`R95898缺一` 只是句子贴着房号），照常保留房号。
+            if nxt.isascii() and nxt.isalpha() and nxt.lower() not in "oqrs":
+                _glue.append(_alnum_run(end))
         mm = _RELAY_NUM_HEAD_RE.match(m.group(0))
         if not mm:
             continue
         for rid in _split_relay_run(mm.group(1), mm.group(2)):
             add(rid)
-    # 从文本中移除已识别的数字房，避免其数字部分干扰字母房匹配
+    # 先屏蔽混合词，再从文本中移除已识别的数字房，
+    # 避免它们的残留字母/数字干扰后面的字母房匹配
+    if _glue:
+        _chars = list(rest)
+        for _a, _b in _glue:
+            for _i in range(_a, _b):
+                _chars[_i] = " "
+        rest = "".join(_chars)
     rest = RELAY_NUM_LOOSE_RE.sub(" ", rest)
 
     # 2) 字母房(非 oqrs 开头的纯字母)
@@ -5753,7 +5794,10 @@ async for _r in _ag:
                        and bool(re.fullmatch(
                            r"[A-Za-z][^\s,，、;；:/@#]{0,31}", _raw)))
             if _single:
-                rids = [normalize_room_id(_raw)]
+                # 一个词也先过一遍正则：`r5132abc` 要提成 `r5132`（去掉尾巴），
+                # `s4932XYZ` 提成 `s4932`；提不出来才整词原样丢给探针。
+                rids = (extract_room_ids(_raw, allow_custom=True)
+                        or [normalize_room_id(strip_dup_prefix(_raw))])
             else:
                 rids = extract_room_ids(arg, allow_custom=True)
             if not rids:
