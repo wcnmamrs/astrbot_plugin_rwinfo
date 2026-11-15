@@ -3,6 +3,8 @@
 """
 room_info.py - 铁锈战争房间信息查询工具（一体化, 1.15）
 用法:
+  python3 room_info.py                      # 终端里不带参数 = 交互模式
+  python3 room_info.py -i                   # 强制交互模式
   python3 room_info.py R5132               # 中继房间
   python3 room_info.py 18.216.139.119:5125  # 直连服务器
   python3 room_info.py --list               # 官方房间列表
@@ -15,6 +17,7 @@ import io
 import json
 import os
 import re
+import shlex
 import socket
 import ssl
 import struct
@@ -563,6 +566,8 @@ HELP_TEXT = """\
 铁锈战争 1.15 房间信息查询工具
 
 用法:
+  python3 room_info.py                    交互模式 (终端里不带参数自动进入)
+  python3 room_info.py -i                 强制交互模式 (--interactive / --shell 同义)
   python3 room_info.py <房间ID>           查询中继房间 (如 r5132 / a5132 / h1234 / hytvvi)
   python3 room_info.py <IP>:<端口>        直连服务器 (如 1.2.3.4:5123)
   python3 room_info.py --list             房间列表(真人房优先)
@@ -599,6 +604,11 @@ HELP_TEXT = """\
 房间列表数据源:
   Q Room List    https://www.rtsbox.cn/api/paiwei/room_last.php  (真人房, 有房主/地图/人数)
   Official       gs1.corrodinggames.com (官方 Auto Server)
+
+交互模式:
+  终端里直接运行本脚本（不带参数）即进入，也可用 -i / --interactive / --shell 强制进入。
+  常驻进程里一条一条敲房号，探针名字/玩家列表/推广/调试等设置保持在会话中，
+  查询结果仍走 stdout、提示与状态行走 stderr。进入后输入 help 看指令。
 """
 
 
@@ -615,9 +625,34 @@ def _find_arg(name, default=None):
 # 收集非选项参数 (第一个非 -- 开头的即房间ID/目标)
 # 注意: --list / --list-json 是"模式开关"而非带值选项, 需保留下来供模式判定
 _MODE_SWITCHES = ("--list", "--list-json", "--cleanup-bins")
-_positional = [a for a in sys.argv[1:]
-               if not a.startswith("--") or a in _MODE_SWITCHES]
+# 交互模式开关。`-i` 不以 `--` 开头，必须排除，否则会被当成房号。
+_INTERACTIVE_FLAGS = ("-i", "--interactive", "--shell")
+# 带值选项：值本身不能被当成房号（`--name abc r5132` 里的 abc）
+_VALUE_OPTS = ("--name", "--max-players", "--promote", "--promote-cooldown",
+               "--max-age", "--search", "--status", "--source", "--full")
+
+
+def _pick_positionals(argv):
+    """挑出真正的房号/模式开关，跳过选项与它们的值。"""
+    out, i = [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a in _VALUE_OPTS:
+            i += 2          # 连值一起跳过
+            continue
+        if a in _MODE_SWITCHES or not a.startswith("-"):
+            out.append(a)
+        i += 1
+    return out
+
+
+_positional = _pick_positionals(sys.argv[1:])
 _arg1 = _positional[0] if _positional else None
+# 终端里不带参数 → 直接进交互模式；管道/脚本调用仍打印帮助，避免破坏自动化。
+_AUTO_INTERACTIVE = (len(sys.argv) <= 1
+                     and getattr(sys.stdin, "isatty", lambda: False)())
+_INTERACTIVE = (any(a in _INTERACTIVE_FLAGS for a in sys.argv[1:])
+                or _AUTO_INTERACTIVE)
 
 # 帮助: 仅命令行直接运行时生效 (import 不触发)
 if __name__ == "__main__":
@@ -626,7 +661,23 @@ if __name__ == "__main__":
     if "--api-version" in sys.argv:
         print(ROOM_INFO_API)
         sys.exit(0)
-    if "--help" in sys.argv or "-h" in sys.argv or len(sys.argv) <= 1 or _arg1 is None:
+    _oneshot = [a for a in sys.argv[1:] if a in _MODE_SWITCHES]
+    if _arg1 and _arg1 not in _MODE_SWITCHES:
+        _oneshot.append(_arg1)
+    if _INTERACTIVE and ("-h" in sys.argv or "--help" in sys.argv):
+        # 帮助绝对优先：`-i --help` 应该看到帮助，而不是一个空提示符
+        print(HELP_TEXT)
+        sys.exit(0)
+    if _INTERACTIVE and _oneshot:
+        # `-i --list-json` / `-i r5132`：交互外壳转交不了一次性任务，
+        # 静默丢弃会让人以为卡住，所以按一次性模式跑完并说明原因。
+        _dprint("[提示] -i 与一次性参数互斥，本次按一次性模式执行；"
+                "要交互请去掉 " + " ".join(_oneshot))
+        _INTERACTIVE = False
+    if _INTERACTIVE:
+        # 交互模式要等文件末尾所有函数定义完才能启动，这里只放行。
+        pass
+    elif "--help" in sys.argv or "-h" in sys.argv or len(sys.argv) <= 1 or _arg1 is None:
         print(HELP_TEXT)
         sys.exit(0)
 
@@ -992,10 +1043,8 @@ def fetch_qroom_list(timeout=None) -> list:
     for r in obj.get("data") or []:
         if not isinstance(r, dict):
             continue
-        mapname = str(r.get("map_name") or "").strip()
-        # 去掉 .tmx 后缀, 便于展示与搜索
-        if mapname.lower().endswith(".tmx"):
-            mapname = mapname[:-4]
+        # 同一个清洗口径：列表里的 map_name 也会带 NEW_PATH| / 模组序号前缀
+        mapname = clean_mapname(r.get("map_name"))
         started = _as_int(r.get("is_started"), 0)
         # RW++ 客户端并不使用 host_ip / host_port:
         # qRoomListProvider (BaseNetImpl$init$6$1) 只读取 internal_id / map_name /
@@ -1783,6 +1832,32 @@ def detect_client(info):
     return '未知'
 
 
+def clean_mapname(raw):
+    """把 106 / 列表里的地图名洗成能看的样子。
+
+    联机协议里的地图名不止「纯名字」一种形态，实测收到过这三种：
+      · `NEW_PATH|maps2/10p西班牙混战by-MP97`        —— 自定义地图，带一整个路径
+      · `0    1941欧洲二战：至暗黄昏   40人  by哟西`   —— 模组地图，前面是「模组序号 + 连续空格」
+      · `[z;p10]Crossing Large (10p).tmx`             —— 老版式，方括号里是地图参数
+    这些前缀对玩家没有意义，原样贴出去就是一行怪东西。
+    """
+    name = str(raw or "").strip()
+    if not name:
+        return ""
+    # `NEW_PATH|maps2/xxx.tmx` / `NEW_PATH|C:\\maps\\xxx.tmx`：只留文件名
+    if name.upper().startswith("NEW_PATH|"):
+        name = name.split("|", 1)[1].replace("\\", "/").rsplit("/", 1)[-1]
+    # `[z;p10]xxx`：方括号里是地图参数
+    name = re.sub(r"^\[[^\]]*\]", "", name)
+    # `0    xxx`：模组地图前面带「模组序号 + 连续空格」，四个空格是它的分隔符
+    name = re.sub(r"^\d{1,3}\s{2,}", "", name)
+    # 名字内部的连续空格（作者常用它对齐）收成一个，否则一行里全是空洞
+    name = re.sub(r"\s{2,}", " ", name).strip()
+    if name.lower().endswith((".tmx", ".rws")):
+        name = name[:-4]
+    return name or str(raw or "").strip()
+
+
 def format_room(info, rid, players, capacity=None, players_detail=None, max_players_display=10, player_count=None, show_players=False):
     import re as _re
 
@@ -1795,10 +1870,7 @@ def format_room(info, rid, players, capacity=None, players_detail=None, max_play
     lines = []
     cver = detect_client(info)
 
-    mapname = info.get('mapname') or "(未知地图)"
-    if mapname.endswith('.tmx'):
-        mapname = mapname[:-4]
-    mapname = _re.sub(r'^\[[^\]]*\]', '', mapname).strip()
+    mapname = clean_mapname(info.get('mapname')) or "(未知地图)"
     # 首行必须仍以「房间版本：」开头：main.py 靠这个前缀切掉探针的调试输出
     lines.append(f"房间版本：{cver}")
     lines.append(f"地图名称：{mapname}")
@@ -2950,20 +3022,53 @@ def node_session(host, port, rid=None, depth=0, seen=None):
 # 而父进程 120 秒就 kill 了 —— 被 kill 时一行都吐不出来，用户只看到「无响应」。
 # 看门狗在这里兜底：到点先打印原因，再退出（退出码走 EXIT_PROTO）。
 WATCHDOG_SECONDS = 90
+# 交互模式下每条查询都要重新计时，所以看门狗必须可取消：
+# 旧版是「睡够秒数就 os._exit」，在 REPL 里第一条查询的看门狗会把整个会话杀掉。
+_WATCHDOG_LOCK = threading.Lock()
+_WATCHDOG_CANCEL = None
 
 
 def _start_watchdog(seconds=WATCHDOG_SECONDS):
+    """启动查询看门狗；重复调用会先取消上一个（交互模式）。"""
+    global _WATCHDOG_CANCEL
+    with _WATCHDOG_LOCK:
+        if _WATCHDOG_CANCEL is not None:
+            _WATCHDOG_CANCEL.set()
+        cancel = threading.Event()
+        _WATCHDOG_CANCEL = cancel
+
     def _fire():
-        time.sleep(seconds)
+        # 被取消时 wait 立即返回，不退出进程
+        cancel.wait(seconds)
+        if cancel.is_set():
+            return
         try:
             msg = (f"[房间查询失败] 查询超过 {seconds} 秒仍未完成"
                    f"（中继跳转过多或网络卡住），已主动中止")
-            _dprint(msg, flush=True)
-            _dprint(msg, file=sys.stderr, flush=True)
+            print(msg, flush=True)      # stdout：父进程靠这一行判断失败原因
+            # stderr 另写一句就够：同一句写两遍会让 `2>&1` 看起来像失败两次
+            _dprint(f"[看门狗] 查询超过 {seconds} 秒仍未完成，已中止")
         finally:
+            # os._exit 不跑 atexit/stdio 收尾：不显式 flush，缓冲区里的结果
+            # （含查询开始前就打印的内容）一个字都落不了盘
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
             os._exit(EXIT_PROTO)
+
     t = threading.Thread(target=_fire, name="rwinfo-watchdog", daemon=True)
     t.start()
+
+
+def _cancel_watchdog():
+    """查询结束后取消看门狗（交互模式用；一次性模式退出进程即可）。"""
+    global _WATCHDOG_CANCEL
+    with _WATCHDOG_LOCK:
+        if _WATCHDOG_CANCEL is not None:
+            _WATCHDOG_CANCEL.set()
+            _WATCHDOG_CANCEL = None
 
 
 # 退出码分档：父进程(main.py)靠它区分「房间问题」还是「探针所在机器的网络问题」。
@@ -2979,8 +3084,8 @@ EXIT_PROTO = 5       # 协议或链路异常（跳转环、解析失败、虚拟
 def _exit_code_for_failure(msg: str) -> int:
     """把失败文案归类成退出码（文案见各处 [房间查询失败] 前缀行）。"""
     m = str(msg or "")
-    if ("无法连接中继" in m or "连接中继失败" in m
-            or "网络不通" in m or "DNS" in m or "端口无效" in m):
+    if ("无法连接中继" in m or "连接中继失败" in m or "无法连接游戏节点" in m
+            or "连接超时" in m or "网络不通" in m or "DNS" in m or "端口无效" in m):
         return EXIT_NET
     if "房间不存在" in m or "找不到这个服务器" in m or "已关闭" in m:
         return EXIT_NO_ROOM
@@ -2992,23 +3097,33 @@ def _exit_code_for_failure(msg: str) -> int:
 def _handle_kicked(reason, sock=None):
     """统一处理被踢出房间的提示 (sock 非空时先关闭连接)"""
     reason = (reason or "").strip()
+    low = reason.lower()
     if "No free slots" in reason:
         print("[房间查询失败] 房间已满，无法加入")
         code = EXIT_ROOM_BUSY
-    elif "游戏已经开始" in reason or "game already started" in reason.lower():
+    elif ("游戏已经开始" in reason or "already been started" in low
+          or "already started" in low):
         # RELAY-CN 走错房间(节点默认房)时也会返回这句, 需加提示
         print("[房间查询失败] 游戏已经开始，无法加入")
         code = EXIT_ROOM_BUSY
+    elif ("client is different" in low or "newer then the server" in low
+          or "different to the server" in low or "can not be synchronized" in low):
+        # 服务端小版本更新后客户端跟不上：不是房间问题，也不该报成「未归类」
+        print("[房间查询失败] 客户端版本和服务器不一致（服务端已升级，"
+              "探针客户端较旧），无法加入")
+        code = EXIT_PROTO
     elif "绕过ID分配中心" in reason:
         # 178 跳到节点后节点拒绝: 房间已迁移/需走分配中心, 探针无法直连
         print("[房间查询失败] 该房间当前无法直接查询（RELAY-CN 节点限制，请稍后重试或联系房主）")
         code = EXIT_PROTO
-    elif "找不到这个服务器" in reason or "cant find this server" in reason.lower():
+    elif ("找不到这个服务器" in reason or "cant find this server" in low
+          or "不存在或已关闭" in reason):
         print("[房间查询失败] 房间不存在或已关闭")
         code = EXIT_NO_ROOM
     else:
         print(f"[房间查询失败] {reason}")
-        code = EXIT_UNKNOWN
+        # 复用同一套判据：以前这里一律「未归类」，等于把房间问题丢给用户猜
+        code = _exit_code_for_failure(reason)
     if sock is not None:
         sock.close()
     sys.exit(code)
@@ -3048,6 +3163,15 @@ def relay_main():
     finish_report(None, got_106, got_115, RID)
 
 
+def _reset_query_state():
+    """清空上一次查询留下的展示用状态（`.id` 与 K 服人数/上限）。"""
+    global _LAST_ROOM_ID, _K_ROOM_ID, _K_ROOM_CAPACITY, _K_ROOM_PLAYERS
+    _LAST_ROOM_ID = ""
+    _K_ROOM_ID = ""
+    _K_ROOM_CAPACITY = None
+    _K_ROOM_PLAYERS = None
+
+
 def main():
     if CLEANUP_MODE:
         # 独立清理: 阈值可用 --max-age 秒数覆盖(默认 3600)
@@ -3081,11 +3205,7 @@ def main():
         print(HELP_TEXT)
         return
     # 每次查询前清空上次的 `.id` / K 服状态，避免串到下一次查询
-    global _LAST_ROOM_ID, _K_ROOM_ID, _K_ROOM_CAPACITY, _K_ROOM_PLAYERS
-    _LAST_ROOM_ID = ""
-    _K_ROOM_ID = ""
-    _K_ROOM_CAPACITY = None
-    _K_ROOM_PLAYERS = None
+    _reset_query_state()
     _start_watchdog()
     if DIRECT_TARGET:
         direct_main()
@@ -3100,5 +3220,442 @@ def main():
     # 所有中继房间统一走 relay_main (含 h.relay.* 国际中继)
     relay_main()
 
+# ================================================================ 交互模式
+#
+# 为什么要有：这个文件是插件背后的协议核心，但平时只能用一次性参数调它
+# （`python3 room_info.py r5132 --debug`）。换个房号、改个筛选、开关玩家列表
+# 都要重敲一整行，而且每次都重新 DNS + 握手。交互模式下进程常驻，一条一条试，
+# 探针名字 / 玩家列表 / 推广 / 调试这些设置也保持在会话里。
+#
+# 输出约定：提示符与状态行走 stderr，查询结果走 stdout（与一次性模式一致），
+# 这样 `room_info.py -i < cmds.txt > out.txt` 依然只有干净的结果。
+
+EXIT_NAMES = {
+    EXIT_OK: "成功",
+    EXIT_UNKNOWN: "未归类",
+    EXIT_NET: "网络不通（本机到中继）",
+    EXIT_NO_ROOM: "房间不存在或已关闭",
+    EXIT_ROOM_BUSY: "房间已满或已开局",
+    EXIT_PROTO: "协议/链路异常",
+}
+
+REPL_HELP = """\
+交互指令：
+  <房号>                 查房，如 r5132 / hytvvi / RKC497
+  <IP>[:端口][/UUID]     直连节点，如 18.216.139.119:5158
+  query <房号> [选项]    查房并临时改选项（选项会留在会话里）：
+                         --show-players  --no-players  --debug  --no-debug
+                         --name <名字>   --limit <N>    --promote <文本>
+  list [选项]            房间列表：
+                         --search <关键词>   --status battleroom|ingame
+                         --full hide|only    --source all|qroom|official
+                         --joinable（只看可加入）  --all（official 全量）
+                         --addr（显示房号与 IP:端口/UUID，用于直连）
+  json [选项]            同 list，但 stdout 只输出一行 JSON
+  cleanup [秒]           清理 bin 缓存（默认 3600 秒前的）
+  name <名字>            设置探针名字（房主侧看到的就是它）
+  players on|off         查询时是否显示玩家列表
+  limit <N>              玩家列表最多显示几人
+  promote <文本>         进房后发这条消息（promote off 取消）
+  cooldown <秒>          同一房间的推广冷却
+  debug on|off           协议链路调试输出（每一跳连接 / 151 / 178 都打印）
+  status                 查看当前设置
+  help / ?               本帮助
+  exit / quit / q / Ctrl-D  退出
+"""
+
+
+_ON_WORDS = ("on", "1", "true", "yes", "开", "开启")
+_OFF_WORDS = ("off", "0", "false", "no", "关", "关闭")
+
+
+def _repl_onoff(value, current):
+    """解析 on/off/开/关，认不出来就保持原值。"""
+    v = (value or "").strip().lower()
+    if v in _ON_WORDS:
+        return True
+    if v in _OFF_WORDS:
+        return False
+    return current
+
+
+def _repl_onoff_checked(value, current):
+    """同上，但告诉调用方「这次到底认没认出来」，用于给用户一句提示。"""
+    v = (value or "").strip().lower()
+    if v in _ON_WORDS:
+        return True, True
+    if v in _OFF_WORDS:
+        return False, True
+    return current, False
+
+
+def _repl_banner():
+    _dprint(f"铁锈战争协议工具 · 交互模式（客户端 1.15，接口 {ROOM_INFO_API}）")
+    _dprint("直接敲房号即可查询，help 看全部指令，Ctrl-D 退出。")
+
+
+def _repl_status():
+    _dprint("当前设置：")
+    _dprint(f"  探针名字：{NAME}")
+    _dprint(f"  玩家列表：{'开' if SHOW_PLAYERS else '关'}"
+            f"（最多 {_MAX_PLAYERS_DISPLAY} 人）")
+    if PROMOTE_TEXT:
+        _dprint(f"  进房推广：{PROMOTE_TEXT}（冷却 {PROMOTE_COOLDOWN:.0f} 秒）")
+    else:
+        _dprint("  进房推广：关")
+    _dprint(f"  调试输出：{'开' if DEBUG_MODE else '关'}")
+    _dprint(f"  bin 缓存：{BIN_DIR}")
+
+
+def _repl_apply_query_opts(tokens):
+    """把 `query` 后面的选项写进全局设置（会话内一直有效）。"""
+    global SHOW_PLAYERS, NAME, _MAX_PLAYERS_DISPLAY, PROMOTE_TEXT, DEBUG_MODE, QUIET
+    i = 0
+    while i < len(tokens):
+        a = tokens[i]
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+        if a == "--show-players":
+            SHOW_PLAYERS = True
+        elif a == "--no-players":
+            SHOW_PLAYERS = False
+        elif a == "--debug":
+            DEBUG_MODE = True
+            QUIET = False
+        elif a == "--no-debug":
+            DEBUG_MODE = False
+        elif a in ("--name", "--limit", "--promote"):
+            if not nxt:
+                _dprint(f"[提示] {a} 缺少参数，已忽略")
+            elif a == "--name":
+                NAME = nxt.strip() or NAME
+            elif a == "--limit":
+                try:
+                    _MAX_PLAYERS_DISPLAY = max(1, int(nxt))
+                except (TypeError, ValueError):
+                    _dprint(f"[提示] --limit 需要整数，已忽略：{nxt!r}")
+            else:
+                PROMOTE_TEXT = nxt
+            i += 1
+        else:
+            _dprint(f"[提示] 忽略未知选项 {a!r}")
+        i += 1
+
+
+def _repl_query(target, opts=None):
+    """执行一次查房；返回退出码（被 Ctrl-C 打断返回 None）。
+
+    一次性模式靠 sys.exit 传递结果，这里必须接住 SystemExit，
+    否则一条「房间不存在」就会结束整个交互会话。
+    """
+    global RID, DIRECT_TARGET
+    target = (target or "").strip()
+    if not target:
+        _dprint("用法：query <房号> [选项]")
+        return None
+    RID = target
+    DIRECT_TARGET = target if _DIRECT_RE.match(target) else None
+    _reset_query_state()
+    if target.startswith("u_"):
+        # 先判目标再改设置：手滑打了 `u_xxx --promote 广告` 时不能留下推广文案，
+        # 否则下一条真查询会往真人房发消息。
+        print(f"[房间查询失败] {target} 是列表里的虚拟房号（Auto Server 房），"
+              f"没有真实房号可用；用 list --addr / json 看它的 IP:端口/UUID 再直连")
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+        _dprint(f"[结束] 未连接（虚拟房号）· 退出码 {EXIT_PROTO}"
+                f"（{EXIT_NAMES.get(EXIT_PROTO, '')}）")
+        return EXIT_PROTO
+    if opts:
+        _repl_apply_query_opts(opts)
+    _start_watchdog()
+    started = time.time()
+    code = EXIT_OK
+    try:
+        if DIRECT_TARGET:
+            direct_main()
+        else:
+            relay_main()
+    except SystemExit as e:
+        # 兼容 sys.exit()/sys.exit(0)/sys.exit("文本") 三种写法
+        if isinstance(e.code, int):
+            code = e.code
+        elif e.code is None:
+            code = EXIT_OK
+        elif isinstance(e.code, str):
+            # sys.exit("文本")：文本就是失败原因，静默吞掉会让失败看起来毫无征兆
+            print(f"[房间查询失败] {e.code}")
+            code = EXIT_UNKNOWN
+        else:
+            code = EXIT_UNKNOWN
+    except KeyboardInterrupt:
+        code = None
+    except Exception as e:  # 交互模式下任何意外都不该带走整个会话
+        print(f"[房间查询失败] 交互模式内部错误：{type(e).__name__}: {e}")
+        code = EXIT_UNKNOWN
+    finally:
+        _cancel_watchdog()
+        try:
+            sys.stdout.flush()   # 结果先落地，别让 `[结束]`（stderr）抢到前面
+        except Exception:
+            pass
+    cost = time.time() - started
+    if code is None:
+        _dprint(f"[结束] 被中断，用时 {cost:.2f} 秒")
+    else:
+        _dprint(f"[结束] 用时 {cost:.2f} 秒 · 退出码 {code}"
+                f"（{EXIT_NAMES.get(code, '未知')}）")
+    return code
+
+
+def _repl_list(argv, as_json=False):
+    """房间列表。JSON 模式沿用一次性模式的约定：stdout 只有一行 JSON。"""
+    global QUIET
+    source, include_all, only_joinable = "all", False, False
+    keyword = status = full = ""
+    show_addr = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        nxt = argv[i + 1] if i + 1 < len(argv) else ""
+        if a in ("--search", "-s") and nxt:
+            keyword = nxt
+            i += 1
+        elif a in ("--status",) and nxt:
+            status = nxt
+            i += 1
+        elif a in ("--source",) and nxt:
+            source = nxt
+            i += 1
+        elif a in ("--full",) and nxt:
+            full = nxt
+            i += 1
+        elif a in ("--joinable", "-j"):
+            only_joinable = True
+        elif a == "--all":
+            include_all = True
+        elif a in ("--addr", "-a"):
+            show_addr = True
+        else:
+            _dprint(f"[提示] 忽略未知参数 {a!r}")
+        i += 1
+
+    started = time.time()
+    if as_json:
+        import contextlib
+        # 抓取过程中的诊断行一律改投 stderr，stdout 只留 JSON
+        with contextlib.redirect_stdout(sys.stderr):
+            rooms = fetch_rooms(source=source, include_all=include_all,
+                                only_joinable=only_joinable, keyword=keyword,
+                                status=status, full=full)
+        print(json.dumps(rooms, ensure_ascii=False, default=str))
+        _dprint(f"[结束] {len(rooms)} 个房间 · 用时 {time.time() - started:.2f} 秒")
+        return rooms
+
+    _quiet = QUIET
+    QUIET = False  # room_list 只在非静默时打印表格
+    try:
+        if show_addr:
+            # 列表默认只给房主/地图/人数：official 房全是 18.x:5158/u_<uuid>，
+            # 不给地址就查不下去，所以单独开一列。
+            rooms = fetch_rooms(source=source, include_all=include_all,
+                                only_joinable=only_joinable, keyword=keyword,
+                                status=status, full=full)
+            # official 房的 id 是 u_<36 位 uuid>，固定 12 列会把地址挤到下一屏
+            rows = []
+            for r in rooms:
+                addr = r.get("addr") or r.get("room_id") or r.get("id") or "-"
+                rows.append((str(r.get("id") or "-"), str(addr),
+                             str(r.get("name") or "?")[:20]))
+            w1 = min(max([len(x[0]) for x in rows] + [4]), 40)
+            w2 = min(max([len(x[1]) for x in rows] + [4]), 42)
+            print(f"{'房号':<{w1}}  {'地址':<{w2}} 房主")
+            print("-" * (w1 + w2 + 12))
+            for c1, c2, c3 in rows:
+                print(f"{c1:<{w1}}  {c2:<{w2}} {c3}")
+            print("-" * (w1 + w2 + 12))
+            print(f"共 {len(rooms)} 个房间")
+        else:
+            rooms = room_list(source=source, include_all=include_all,
+                              only_joinable=only_joinable, keyword=keyword,
+                              status=status, full=full)
+    finally:
+        QUIET = _quiet
+    _dprint(f"[结束] 用时 {time.time() - started:.2f} 秒")
+    return rooms
+
+
+def _repl_cleanup(argv):
+    max_age = 3600
+    if argv:
+        try:
+            max_age = int(argv[0])
+            if max_age < 1:
+                # 0/负数等于「删掉所有缓存」，包括刚缓存好、下次能省十几秒的
+                _dprint("[提示] 秒数不能小于 1（=清空全部缓存），已按 1 秒执行")
+                max_age = 1
+        except (TypeError, ValueError):
+            _dprint(f"[提示] 秒数需要整数，用默认 3600：{argv[0]!r}")
+    cleanup_old_bin_files(max_age, verbose=True)
+    _dprint(f"[清理] 目录：{BIN_DIR}")
+
+
+def interactive_shell():
+    """交互模式主循环。任何一条指令出错都只影响这一条。"""
+    global SHOW_PLAYERS, NAME, _MAX_PLAYERS_DISPLAY
+    global PROMOTE_TEXT, PROMOTE_COOLDOWN, DEBUG_MODE, QUIET
+
+    try:
+        import readline  # noqa: F401  行编辑 + 上下键历史，没有也能用
+    except Exception:
+        pass
+
+    _repl_banner()
+    try:
+        # 一次性模式每次启动都会清过期 bin，交互模式同样该清一次，
+        # 否则长期挂着会话时 BIN_DIR 只增不减。
+        cleanup_old_bin_files()
+    except Exception as _e:
+        _dprint(f"[提示] 清理过期缓存出错（已忽略）：{_e}")
+    _ignored = [a for a in _positional
+                if a not in _MODE_SWITCHES] if _positional else []
+    if _ignored:
+        # `-i r5132` / `-i --list-json`：交互模式优先，但这些参数确实没用上
+        _dprint(f"[提示] 交互模式下忽略启动参数：{' '.join(_ignored)}"
+                f"（进去以后直接敲房号即可）")
+    # 管道喂指令时（room_info.py -i < cmds.txt）不刷提示符，输出更干净
+    show_prompt = sys.stdin.isatty()
+    while True:
+        try:
+            if show_prompt:
+                sys.stderr.write("rwinfo> ")
+                sys.stderr.flush()
+            # 必须用 input()：只有它走 readline 模块，sys.stdin.readline() 会绕过，
+            # 上面 import readline 就白装了（上下键会变成 ^[[A 字面量）。
+            line = input()
+        except EOFError:  # Ctrl-D
+            _dprint("")
+            return
+        except KeyboardInterrupt:
+            sys.stderr.write("\n")
+            continue
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # 行尾注释：`r5132 # 临时查一下`。要求 # 前有空格，避免切掉房号里的 #
+        line = re.sub(r"\s+#.*$", "", line).rstrip()
+        if not line:
+            continue
+        try:
+            toks = shlex.split(line)
+        except ValueError as e:
+            _dprint(f"[语法错误] {e}")
+            continue
+
+        cmd, args = toks[0], toks[1:]
+        low = cmd.lower()
+        try:
+            if low in ("exit", "quit", "q"):
+                return
+            elif low in ("help", "?", "h"):
+                _dprint(REPL_HELP)
+            elif low in ("status", "st"):
+                _repl_status()
+            elif low == "name":
+                if not args:
+                    _dprint(f"当前探针名字：{NAME}")
+                else:
+                    NAME = " ".join(args).strip() or NAME
+                    _dprint(f"探针名字已设为：{NAME}")
+            elif low == "players":
+                SHOW_PLAYERS, _known = _repl_onoff_checked(
+                    args[0] if args else "", SHOW_PLAYERS)
+                if args and not _known:
+                    _dprint(f"[提示] 只认 on/off（或 开/关），已保留原值：{args[0]!r}")
+                _dprint(f"玩家列表：{'开' if SHOW_PLAYERS else '关'}")
+            elif low == "limit":
+                if args:
+                    try:
+                        _MAX_PLAYERS_DISPLAY = max(1, int(args[0]))
+                    except (TypeError, ValueError):
+                        _dprint(f"[提示] 需要整数：{args[0]!r}")
+                _dprint(f"玩家列表最多显示：{_MAX_PLAYERS_DISPLAY} 人")
+            elif low == "promote":
+                if not args:
+                    _dprint(f"进房推广：{PROMOTE_TEXT or '关'}")
+                elif args[0].lower() in ("off", "关", "clear"):
+                    PROMOTE_TEXT = ""
+                    _dprint("进房推广已关闭")
+                else:
+                    # 取原始行而不是 shlex 结果：shlex 会吃掉反斜杠，
+                    # `promote C:\new\test` 会变成 `C:newtest`
+                    _raw = line.split(None, 1)
+                    PROMOTE_TEXT = _raw[1].strip() if len(_raw) > 1 else " ".join(args)
+                    _dprint(f"进房推广已设置：{PROMOTE_TEXT}")
+            elif low == "cooldown":
+                if args:
+                    try:
+                        PROMOTE_COOLDOWN = max(0.0, float(args[0]))
+                    except (TypeError, ValueError):
+                        _dprint(f"[提示] 需要数字：{args[0]!r}")
+                _dprint(f"推广冷却：{PROMOTE_COOLDOWN:.0f} 秒")
+            elif low == "debug":
+                if args:
+                    DEBUG_MODE, _known = _repl_onoff_checked(args[0], DEBUG_MODE)
+                    if not _known:
+                        _dprint(f"[提示] 只认 on/off（或 开/关），已保留原值：{args[0]!r}")
+                else:
+                    DEBUG_MODE = not DEBUG_MODE  # 不带参数就是切换
+                if DEBUG_MODE:
+                    QUIET = False
+                _dprint(f"调试输出：{'开' if DEBUG_MODE else '关'}")
+            elif low == "list":
+                _repl_list(args)
+            elif low == "json":
+                _repl_list(args, as_json=True)
+            elif low == "cleanup":
+                _repl_cleanup(args)
+            elif low == "query":
+                # `query --debug r5132`：房号可能在选项后面，取第一个非 - 开头
+                _target, _rest = "", []
+                for a in args:
+                    if not _target and not a.startswith("-"):
+                        _target = a
+                    else:
+                        _rest.append(a)
+                if not _target:
+                    _dprint("用法：query <房号> [选项]")
+                else:
+                    _repl_query(_target, _rest)
+            elif _DIRECT_RE.match(cmd) or re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", cmd):
+                # 裸房号 / 裸地址：最常见的用法，不要求 query 前缀。
+                # 全字母的词（foobar）也可能是房号（hytvvi 就是），所以不能按形态拒绝，
+                # 只能等它查失败了再提示一句「输入 help」。
+                _code = _repl_query(cmd, args)
+                if _code not in (0, None):
+                    _dprint("[提示] 如果这不是房号，输入 help 看指令。")
+            else:
+                _dprint(f"[提示] 看不懂 {cmd!r}：它既不是房号也不是指令。"
+                        f"输入 help 看指令，或直接敲 r5132 这样的房号。")
+        except KeyboardInterrupt:
+            _cancel_watchdog()
+            sys.stderr.write("\n")
+            _dprint("[已中断]")
+        except SystemExit as _e:
+            # 内部某处 sys.exit（例如清理逻辑），不该结束会话；留一行痕迹便于排查
+            _cancel_watchdog()
+            _dprint(f"[提示] 已拦截内部退出（{_e.code}），会话继续")
+        except Exception as e:
+            _cancel_watchdog()
+            _dprint(f"[错误] {type(e).__name__}: {e}")
+
+
 if __name__ == "__main__":
+    if _INTERACTIVE:
+        try:
+            interactive_shell()
+        except KeyboardInterrupt:
+            pass
+        sys.exit(EXIT_OK)
     main()

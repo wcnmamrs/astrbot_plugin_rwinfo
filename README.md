@@ -357,6 +357,7 @@ ID：hlbifz
 内置协议探针可独立使用，仅依赖 Python 标准库：
 
 ```bash
+python3 room_info.py                      # 不带参数：进交互模式（终端里）
 python3 room_info.py R5132                # 查询中继房间
 python3 room_info.py HLBIFZ               # 查询国际房
 python3 room_info.py 18.216.139.119:5125  # 直连查询
@@ -364,6 +365,38 @@ python3 room_info.py --list               # 拉取房间列表
 python3 room_info.py R5132 --show-players # 显示玩家列表
 python3 room_info.py R5132 --debug        # 调试输出
 ```
+
+### 交互模式
+
+一次性参数适合脚本调用，但排查问题时想连着试几个房号、换筛选条件、开关玩家列表，
+每次都重敲一整行很别扭。交互模式让进程常驻，一条一条敲：
+
+```bash
+python3 room_info.py -i        # 或 --interactive / --shell；终端里不带参数也会自动进入
+```
+
+```
+rwinfo> r5132                  # 直接敲房号就查
+rwinfo> q7765 --show-players   # 房号后面跟选项，效果同一次性模式
+rwinfo> list --joinable --search 生存
+rwinfo> list --addr             # 房号 / 直连地址 / 房主（official 房要靠这个拿 IP:端口/UUID）
+rwinfo> json --status battleroom
+rwinfo> debug                  # 不带参数 = 切换调试输出
+rwinfo> status                 # 看当前设置
+rwinfo> exit                   # Ctrl-D 也行
+```
+
+可用指令：`<房号>`、`query`、`list`、`json`、`cleanup`、`name`、`players`、`limit`、
+`promote`、`cooldown`、`debug`、`status`、`help`、`exit`。进房后推广、探针名字、
+玩家列表显示等设置都留在会话里，不用重复传参。
+
+输出约定与一次性模式一致：**查询结果走 stdout，提示符与状态行走 stderr**，
+所以 `python3 room_info.py -i < cmds.txt > out.txt` 拿到的仍是干净的结果。
+插件自己调用时永远带房号参数，不会误入交互模式。
+
+会话里支持行编辑与上下键历史（走 `readline`），行尾可以写 `# 注释`。
+`-i` 与一次性参数互斥：`-i --list-json`、`-i R5132` 这类组合会按一次性模式跑完并提示一句，
+`-i --help` 则永远优先打印帮助。
 
 ---
 

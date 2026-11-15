@@ -328,6 +328,7 @@ When the room cannot be joined, the reason is translated:
 The built-in probe runs standalone, standard library only:
 
 ```bash
+python3 room_info.py                      # no args in a terminal: interactive mode
 python3 room_info.py R5132                # query a relay room
 python3 room_info.py HLBIFZ               # query an international room
 python3 room_info.py 18.216.139.119:5125  # direct-connect query
@@ -335,6 +336,34 @@ python3 room_info.py --list               # fetch the room list
 python3 room_info.py R5132 --show-players # show the player list
 python3 room_info.py R5132 --debug        # debug output
 ```
+
+### Interactive mode
+
+One-shot flags are fine for scripts, but when you are debugging you usually want to try
+several room IDs in a row, switch filters, or toggle the player list without retyping a
+whole command line (and redoing DNS/handshake each time):
+
+```bash
+python3 room_info.py -i        # or --interactive / --shell
+```
+
+```
+rwinfo> r5132                  # a bare room ID queries it
+rwinfo> q7765 --show-players   # per-command options, same as one-shot
+rwinfo> list --joinable --search survival
+rwinfo> json --status battleroom
+rwinfo> debug                  # bare = toggle
+rwinfo> status                 # show current settings
+rwinfo> exit                   # Ctrl-D works too
+```
+
+Commands: `<room id>`, `query`, `list`, `json`, `cleanup`, `name`, `players`, `limit`,
+`promote`, `cooldown`, `debug`, `status`, `help`, `exit`. Probe name, player-list display,
+promote text and cooldown are kept for the whole session.
+
+Same output contract as one-shot mode: **results go to stdout, prompts and status lines to
+stderr**, so `python3 room_info.py -i < cmds.txt > out.txt` still yields clean results.
+The plugin always passes a room ID, so it never enters interactive mode by accident.
 
 ---
 
