@@ -62,7 +62,11 @@ def plugin_data_dir() -> str:
 
       1. 环境变量 `RWINFO_PLUGIN_DATA`（测试/特殊部署用）
       2. `StarTools.get_data_dir(PLUGIN_NAME)`（框架官方唯一入口）
-      3. 家目录兜底 `~/.rwinfo`（框架结构完全识别不到时的最后退路）
+
+    两者都拿不到时返回空串，调用方据此**不落盘**（统计只在内存里攒着，
+    推广/冷却状态走不到），而不是偷偷写到家目录。审核侧明确建议过：不要有
+    `~/.rwinfo` 这种家目录兜底，数据目录必须可审计 —— 插件的数据只应该
+    出现在框架给的那个目录里。
 
     不再自己按 `<插件目录>/../../plugin_data` 推算：那条路径看着对，其实
     依赖目录层级，改了布局就静默写到别处；而且审核会按「硬编码 plugin_data」
@@ -81,7 +85,6 @@ def plugin_data_dir() -> str:
             candidates.append(str(StarTools.get_data_dir()))
     except Exception as e:
         logger.warning(f"[数据] StarTools 不可用（{e}），改用回退路径")
-    candidates.append(os.path.join(os.path.expanduser("~"), ".rwinfo"))
     for d in candidates:
         try:
             # 必须 abspath：`--state-dir` 会传给 cwd=插件目录 的子进程，
@@ -92,7 +95,9 @@ def plugin_data_dir() -> str:
                 return d
         except OSError:
             continue
-    return os.path.abspath(os.path.join(os.path.expanduser("~"), ".rwinfo"))
+    # 没有可用目录：不落盘，也不猜一个"看起来能写"的位置
+    logger.error("[数据] 拿不到持久化目录（StarTools.get_data_dir 不可用），本次运行的数据不落盘")
+    return ""
 
 
 # ================================================================ 探针脚本定位
@@ -179,7 +184,7 @@ CMD_DEDUP_WINDOW = 10
 PROBE_MIN, PROBE_MAX = 1, 99
 
 # 插件版本（菜单与元数据展示用，与 metadata.yaml 的 version 保持一致）
-PLUGIN_VERSION = "2.0.6"
+PLUGIN_VERSION = "2.0.7"
 
 # ---- 协议侧常量（与 room_info.py 保持一致）----
 # 官方 masterserver 列表。插件侧解析中继房真实地址时要用，
@@ -232,7 +237,7 @@ _DOWNLOAD_SOURCES = (
 # 最后一环交给镜像运营者，等于把机器人的执行权外包出去。
 # 校验值随插件一起发布，用途是「恢复与本版本一模一样的探针」——
 # 不是「升级到最新探针」，所以哈希不匹配一律拒收，宁可让用户重装插件。
-ROOM_INFO_SHA256 = "b60ce4c1dc07a4913a308e33de7ddf0ebbf11786e548f13aed124b4348b093af"
+ROOM_INFO_SHA256 = "064ecc848eb1566405e2de4d62d236c530a25893fd57fc0615d576c6c47313ed"
 _DOWNLOAD_TIMEOUT = 15
 
 
@@ -582,7 +587,8 @@ def ensure_room_info(auto=True):
         return False, f"{reason}，但目标路径校验未通过，已放弃写入"
 
     # 写临时文件再原子替换；旧文件备份到数据目录（.bak 不留在插件目录里）
-    bak = os.path.join(plugin_data_dir(), rel + ".bak")
+    _dd = plugin_data_dir()
+    bak = os.path.join(_dd, rel + ".bak") if _dd else ""
     moved_old = False
     try:
         tmp = target + ".new"
@@ -590,10 +596,11 @@ def ensure_room_info(auto=True):
             f.write(txt)
         if os.path.exists(target):
             try:
-                if os.path.exists(bak):
-                    os.remove(bak)  # 只删我们自己生成的 .bak
-                shutil.copyfile(target, bak)
-                moved_old = True
+                if bak:
+                    if os.path.exists(bak):
+                        os.remove(bak)  # 只删我们自己生成的 .bak
+                    shutil.copyfile(target, bak)
+                    moved_old = True
             except OSError:
                 pass
         os.replace(tmp, target)
@@ -1336,7 +1343,8 @@ class RWInfoPlugin(Star):
         # 持久化到 data/plugin_data/<插件名>/（不能写插件目录 —— 插件更新会
         # 整个覆盖那个目录，用户数据会丢，也无法纳入框架的备份）。
         self._data_dir = plugin_data_dir()
-        self._stats_path = os.path.join(self._data_dir, "stats.json")
+        # 数据目录拿不到时 _data_dir 是空串：统计只在内存里，探针也不带 --state-dir
+        self._stats_path = os.path.join(self._data_dir, "stats.json") if self._data_dir else ""
         self._stats = self._load_stats()
         # bin 缓存定时清理任务(插件启动后开始循环)
         self._bin_cleanup_task = None
@@ -1366,6 +1374,9 @@ class RWInfoPlugin(Star):
         # 老版本把统计写在插件目录里。这里只**读**它一次并写到新位置，
         # 不删也不改旧文件（插件不往自身目录写任何东西）。
         legacy = os.path.join(_PLUGIN_DIR, ".rwinfo_stats.json")
+
+        if not self._stats_path:
+            return empty
 
         def _needs_migrate(p):
             try:
@@ -1407,7 +1418,9 @@ class RWInfoPlugin(Star):
         return empty
 
     def _save_stats(self):
-        """原子写入，避免多个查询同时结束时把 JSON 写坏。"""
+        """原子写入，避免多个查询结束时把 JSON 写坏；没有数据目录就只在内存里攒。"""
+        if not self._stats_path:
+            return
         try:
             tmp = f"{self._stats_path}.{os.getpid()}.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -1551,9 +1564,9 @@ class RWInfoPlugin(Star):
             "--cleanup-bins",
             "--max-age",
             str(int(max_age_sec)),
-            "--state-dir",
-            self._data_dir,
         ]
+        if self._data_dir:
+            cmd += ["--state-dir", self._data_dir]
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -4627,10 +4640,11 @@ class RWInfoPlugin(Star):
             probe_name,
             "--max-players",
             str(self.cfg.get("max_players_display", 10)),
-            # 推广冷却状态也写到插件数据目录，别落进插件自身目录
-            "--state-dir",
-            self._data_dir,
         ]
+        # 推广冷却状态也写到插件数据目录，别落进插件自身目录；
+        # 没有数据目录时不传，探针就只在本次进程内计数（不落盘）
+        if self._data_dir:
+            cmd_args += ["--state-dir", self._data_dir]
         if self.cfg.get("show_players", False):
             cmd_args.append("--show-players")
         # 进房推广：文案固定为项目地址，不开放配置 ——

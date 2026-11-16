@@ -807,6 +807,9 @@ def _dir_writable(path: str) -> bool:
         return False
 
 
+_STATE_HINT_SHOWN = False
+
+
 def _promote_state_path(create: bool = False) -> str:
     """算冷却状态文件路径。
 
@@ -819,7 +822,16 @@ def _promote_state_path(create: bool = False) -> str:
     cand = _find_arg("--state-dir") or os.environ.get("RWINFO_PLUGIN_DATA", "").strip()
     cand = (cand or "").strip()
     if not cand:
-        cand = os.path.join(os.path.expanduser("~"), ".rwinfo")
+        # 没有指定状态目录：不猜家目录，本次运行就不落盘。
+        # 只提示一次，避免每次调用都刷屏。
+        global _STATE_HINT_SHOWN
+        if not _STATE_HINT_SHOWN:
+            _STATE_HINT_SHOWN = True
+            sys.stderr.write(
+                "[提示] 未指定 --state-dir（也没有 RWINFO_PLUGIN_DATA），"
+                "推广冷却不落盘：脱离 AstrBot 单独运行时请显式指定目录\n"
+            )
+        return ""
     if create:
         ok = True
         try:
@@ -986,7 +998,9 @@ def _load_promote_state():
 
 
 def _save_promote_state(state):
-    """原子写，避免并发子进程写坏文件。"""
+    """原子写，避免并发子进程写坏文件。没有状态目录就跳过（不落盘）。"""
+    if not PROMOTE_STATE:
+        return
     try:
         # 状态目录是懒创建的（--list-json 之类不该建目录），这里兜一次
         os.makedirs(os.path.dirname(PROMOTE_STATE), exist_ok=True)
@@ -2726,8 +2740,8 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
 def bin_dir(create: bool = False) -> str:
     """bin 缓存目录（server_info_*.bin 落盘处）。
 
-    优先级：`--bin-dir` → `--state-dir`/bin_cache → `RWINFO_PLUGIN_DATA`/bin_cache
-    → `~/.rwinfo/bin_cache`。
+    优先级：`--bin-dir` → `--state-dir`/bin_cache → `RWINFO_PLUGIN_DATA`/bin_cache；
+    三者都没有就返回空串（不落盘），不回退家目录。
 
     **绝不回退到脚本所在目录**：那是插件本体，插件更新/重装会整体覆盖，
     运行时数据写进去必丢；插件市场审核也明确不允许往插件目录写数据。
@@ -2739,7 +2753,8 @@ def bin_dir(create: bool = False) -> str:
         if state:
             explicit = os.path.join(state, "bin_cache")
     if not explicit:
-        explicit = os.path.join(os.path.expanduser("~"), ".rwinfo", "bin_cache")
+        # 没给目录就不落盘：不去猜家目录（审核要求数据目录可审计）
+        return ""
     if create:
         try:
             os.makedirs(explicit, exist_ok=True)

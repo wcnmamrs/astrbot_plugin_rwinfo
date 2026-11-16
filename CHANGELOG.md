@@ -2,6 +2,28 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.0.7] - 2026-11-16
+
+### 数据目录收敛（插件市场建议项）
+
+2.0.6 上架后，审核给了一条**非强制**建议：「可去掉 `~/.rwinfo` 家目录兜底、严格限定数据目录」。
+本次按「删掉家目录兜底」执行——审核看不到数据落在哪里，就没法审计。
+
+- **插件侧** `plugin_data_dir()`：解析顺序只剩 `RWINFO_PLUGIN_DATA`（显式覆盖，测试用）
+  → `StarTools.get_data_dir(PLUGIN_NAME)`。两者都拿不到时返回空串，`__init__` 据此把
+  `_stats_path` 置空，统计只在内存里攒（`_save_stats` 直接返回），探针命令行也不再拼
+  `--state-dir`；改前是静默写 `~/.rwinfo`。
+- **探针侧** `bin_dir()` / `_promote_state_path()`：去掉 `~/.rwinfo` / `~/.rwinfo/bin_cache`
+  兜底。没有 `--bin-dir` / `--state-dir` / `RWINFO_PLUGIN_DATA` 时 `bin_dir()` 返回空串
+  （跳过落盘）、`PROMOTE_STATE` 为空（`_save_promote_state` 直接返回），并在 stderr
+  提示一次「未指定 --state-dir，推广冷却不落盘」——脱离 AstrBot 单独跑探针请显式加
+  `--state-dir`。
+- **自愈备份**：`room_info.py.bak` 的数据目录为空时跳过备份（不写插件目录、也不写家目录）。
+- `README.md` / `README_EN.md` 的 bin 缓存说明与数据目录表同步改写。
+
+新增 `_测试脚本/harness_datadir.py`（12 项：环境变量优先、StarTools 回落、拿不到返回空串、
+空路径不落盘、命令行有无 `--state-dir`、探针不建家目录、只给 `--state-dir` 时落对位置）。
+
 ## [2.0.6] - 2026-11-15
 
 ### 地图名清洗补全 + 模组判定的第三个信号

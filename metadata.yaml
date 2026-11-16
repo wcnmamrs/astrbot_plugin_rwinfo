@@ -33,7 +33,7 @@ desc: |
   - 探针脚本自愈: room_info.py 缺失或接口过旧时自动从仓库补齐
     (仅补探针脚本, 不会自动升级插件本体)
   - /铁锈查房调试 打印运行时状态, 便于排查配置问题
-version: 2.0.6
+version: 2.0.7
 astrbot_version: ">=4.9.0"
 # 声明的平台适配器（须是 AstrBot ADAPTER_NAME_2_TYPE 的 key）。
 # 本插件两条发送通道：QQ 个人号(aiocqhttp) 与 QQ 官方机器人(qq_official /

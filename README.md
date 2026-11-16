@@ -305,8 +305,9 @@ AstrBot 插件商店搜索安装，或在 WebUI 中安装：
 几个实现要点：
 
 - bin 缓存**不写插件目录**：优先 `--bin-dir`，其次 `--state-dir/bin_cache`
-  （插件传的就是 `data/plugin_data/astrbot_plugin_rwinfo/`），单独跑探针时退回
-  `~/.rwinfo/bin_cache`。写完与清理用的是同一个目录，不会"写在 A 目录、清的是 B 目录"。
+  （插件传的就是 `data/plugin_data/astrbot_plugin_rwinfo/`）。两个都没给就不落盘
+  （脱离 AstrBot 单独跑探针时请显式加 `--state-dir`，不会偷偷写到用户家目录）。
+  写完与清理用的是同一个目录，不会"写在 A 目录、清的是 B 目录"。
 - 目录不可写时直接跳过落盘并在 stderr 提示一句，查房结果和离房包不受影响。
 - 实际清理跑在独立子进程（`room_info.py --cleanup-bins`），不阻塞事件循环。
 - 清理失败不会终止循环，下一轮会重试。
@@ -476,6 +477,10 @@ astrbot_plugin_rwinfo/
 
 老版本的 `.rwinfo_stats.json` 若还在插件目录里，首次加载时会只读迁移到新位置
 （旧文件不删，可自行删除）。
+
+数据目录只认框架给的 `StarTools.get_data_dir()`（可用环境变量 `RWINFO_PLUGIN_DATA`
+显式覆盖，主要给测试用）。**两者都拿不到时不落盘**：统计只在内存里攒着、探针也
+不带 `--state-dir`，不会悄悄写到用户家目录 `~/.rwinfo`。
 
 ---
 
