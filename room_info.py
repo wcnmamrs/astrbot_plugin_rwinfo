@@ -40,11 +40,11 @@ import zlib
 # 纯内部修复（解析优化、bug 修复）不必递增，插件不用因此重新下载。
 #
 # 插件侧对应常量 ROOM_INFO_API_REQUIRED（见 main.py）。
-ROOM_INFO_API = 4
+ROOM_INFO_API = 5
 
-# 原版（1.15 / 客户端 176）的 106 一定带 121 个内置单位：实测原版房 s74788
-# （Small_Island 2p）custom_unit_count=121，而且这 121 个单位都没有显示名。
-# 模组房会在这个基础上塞进自定义单位（实测 Q29059 是 1277 个）。所以
+# 原版（1.15 / 客户端 176）的 106 一定带 121 个内置单位：原版房 s74788
+# （Small_Island 2p）的 custom_unit_count=121，且这 121 个单位都没有显示名。
+# 模组房在此基础上有自定义单位（Q29059 为 1277 个）。因此
 # 「数量多于原版」能判定装了模组，「单位显示名」能反推模组名。
 VANILLA_UNIT_COUNT = 121
 
@@ -57,9 +57,9 @@ VANILLA_UNIT_COUNT = 121
 #   DEBUG_MODE —— 是否输出「协议链路调试日志」(连接节点/161/178/110...)。
 #                 默认 False; 只有显式传 --debug 才打开。
 #
-# 历史 bug: 早期把链路调试日志也挂在 `if not QUIET` 上。插件是用子进程
-# `python3 room_info.py <房号>` 调用的, 此时 __name__ == "__main__",
-# QUIET 恒为 False, 于是用户在 QQ 里会看到 [4][5][6][*] 一大堆调试信息。
+# 链路调试日志不能挂在 `if not QUIET` 上：插件以子进程
+# `python3 room_info.py <房号>` 调用，此时 __name__ == "__main__"、
+# QUIET 恒为 False，[4][5][6][*] 等调试行会直接进入聊天输出。
 QUIET = True if __name__ != "__main__" else False
 DEBUG_MODE = False
 
@@ -112,8 +112,8 @@ def _decode_lenient(b: bytes) -> str:
             # 代理区 (U+D800-DFFF): 非法单字符, 视为代理对的一部分
             if (
                 0xD800 <= cp <= 0xDBFF
-                and i + 3 < n
-                and 0xED <= b[i + 3] <= 0xED
+                and i + 5 < n
+                and b[i + 3] == 0xED
                 and 0x80 <= b[i + 4] <= 0xBF
                 and 0x80 <= b[i + 5] <= 0xBF
             ):
@@ -263,7 +263,7 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 def read_frame(sock: socket.socket, timeout: float = 15.0):
     sock.settimeout(timeout)
     length, mtype = struct.unpack(">ii", _recv_exact(sock, 8))
-    # 上限 2MB：房间信息帧实际只有几百字节到几 KB。原来放 50MB，
+    # 上限 2MB：房间信息帧实际只有几百字节到几 KB；放到 50MB 时，
     # 一旦帧边界错位（半帧被当成新长度）就会一直等一个永远收不满的大包。
     if length < 0 or length > 2_000_000:
         raise ValueError(f"bad packet length {length} (type {mtype})")
@@ -399,10 +399,9 @@ class RWProbe:
     def _wait_161(self):
         """等待 161 握手。
 
-        注意: 中继(尤其 q/s 这类 RWHPS 中继)在房号存在时可能直接回 178 跳转,
-        而不是先回 161。早期版本没有 178 分支, 会落到 else 分支只打印一行,
-        然后继续死等 161 直到超时, 表现为 "握手失败/未收到房间服务器响应"。
-        这里把 178 也捕获下来, 交给调用方(relay_session)处理跳转。
+        中继（尤其 q/s 这类 RWHPS 中继）在房号存在时可能直接回 178 跳转，
+        而不先发 161。本函数把 178 也捕获下来，交给调用方 relay_session 处理；
+        只按 161 处理时会一直等到超时，表现为「握手失败/未收到房间服务器响应」。
         """
         self.jump_addr = None
         deadline = time.time() + 15
@@ -414,7 +413,9 @@ class RWProbe:
                 if self.jump_addr:
                     return
                 continue
-            except OSError:
+            except (OSError, ValueError):
+                # ValueError = 帧长度非法（半帧/错位）。握手阶段直接放弃，
+                # 让上层按「握手失败」回报，而不是抛穿到 __main__。
                 break
             if self.verbose:
                 _dprint(f"[DBG] recv mtype={mtype} len={len(payload)}")
@@ -437,9 +438,13 @@ class RWProbe:
                 r.byte(1)
                 self.sock.sendall(pack_frame(109, r.output()))
             elif mtype == 150:
-                raise RuntimeError("kicked: " + NetReader(payload).utf())
+                try:
+                    _kick = NetReader(payload).utf() if payload else ""
+                except (EOFError, struct.error, ValueError):
+                    _kick = ""
+                raise RuntimeError("kicked: " + (_kick or "服务端关闭了连接（未给出原因）"))
             elif mtype == 111:
-                raise RuntimeError("disconnected")
+                raise RuntimeError("kicked: 连接被服务端断开")
             else:
                 self.log(f"got {mtype} ({len(payload)}B)")
 
@@ -451,7 +456,7 @@ class RWProbe:
           然后 v8 in (5,6): utf s1 / utf s2 / int32 v10
                v8 == 7:     utf s2 / int32 v6
         应答 v0 的分支(客户端 line 5553-5620):
-          v8==0 → str(bf_i)          ← 早期版本发空串, 导致 q 中继 152 被忽略
+          v8==0 → str(bf_i)          ← 必须发 str(bf_i)，空串会使 q 中继忽略 152
           v8==1 → str(bf_j)
           v8==2 → challenge_e(bf_i)
           v8==3/4 → sha256("bf_i|bf_j") 前 14 位
@@ -532,9 +537,9 @@ class RWProbe:
             self._ack_sent = True
             self.log(f"152 sent (v8={v8}, v0={v0!r})")
         except Exception as e:
-            # 151 是挑战应答，失败就没法继续进房。log() 只在 verbose 时打印，
-            # 插件调用全是 verbose=False，所以这里必须同时写 stderr，
-            # 否则父进程只能看到「未收到房间信息」这种没法排查的结论。
+            # 151 是挑战应答，失败就无法继续进房。log() 只在 verbose 时打印，
+            # 插件调用一律 verbose=False，所以这里必须同时写 stderr，
+            # 否则父进程只看到「未收到房间信息」，无法定位原因。
             self.log(f"151 parse err: {e}")
             try:
                 _dprint(
@@ -643,6 +648,8 @@ HELP_TEXT = """\
   --promote-cooldown <秒>  同一房间推广冷却 (默认 180)
   --state-dir <目录>    运行时数据目录(统计/推广冷却), 由插件传入
   --bin-dir <目录>      bin 缓存目录(默认 <state-dir>/bin_cache)
+  --color <模式>        auto(默认, stdout 是终端才上色) / always / never
+                        也可用环境变量 RWINFO_COLOR；设了 NO_COLOR 则 auto 关色
   --api-version         打印接口版本号 (供插件判断是否兼容)
   --debug               调试输出
 
@@ -650,7 +657,7 @@ HELP_TEXT = """\
   o/q/r/s + 数字    数字房, 如 r5132 / s1024 / o9999 / q7777
   其他字母 + 纯字母  国际房, 如 hytvvi / aabcde / babc
 
-可用中继首字母 (实测 5123 端口开放):
+可用中继首字母 (5123 端口开放):
   a/b/h  官方中继 (Relay US1 / US2 / ASIA2)
   o/q/r/s 第三方中继 (RELAY-CN / Fancy-CN / Tiexiu.xyz)
   c/g/j/v 有域名但端口未开放
@@ -670,8 +677,8 @@ def _find_arg(name, default=None):
     """取 `--name value`（或 `--name=value`）形式的值。
 
     值缺失时后面紧跟的往往是另一个选项（`--state-dir --promote x`），
-    把选项名当值的后果很脏：会在当前目录建出一个叫 `--promote` 的文件夹。
-    所以以 `-` 开头的「值」一律视为缺失。
+    把选项名当值会在当前目录建出一个名为 `--promote` 的目录。
+    因此以 `-` 开头的「值」一律视为缺失。
     """
     for a in sys.argv:
         if a.startswith(name + "="):
@@ -702,7 +709,135 @@ _VALUE_OPTS = (
     "--full",
     "--state-dir",
     "--bin-dir",
+    "--color",
 )
+
+
+# ---------------------------------------------------------------- 终端颜色
+# 只给人看的输出上色（报告、错误行、列表、提示符）。写进 stdout 的正文
+# 会被插件原样回传到 QQ，所以颜色只在「终端」语义下开：
+#   --color=never 关；--color=always 强开；默认 auto = stdout 是终端才开。
+# NO_COLOR 环境变量（no-color.org）一律优先关掉。
+_COLOR_MODES = ("auto", "always", "never")
+
+
+def _color_choice():
+    raw = _find_arg("--color") or os.environ.get("RWINFO_COLOR") or "auto"
+    raw = str(raw).strip().lower()
+    return raw if raw in _COLOR_MODES else "auto"
+
+
+def _use_color(stream=None):
+    mode = _COLOR_CHOICE
+    if mode == "never":
+        return False
+    if mode == "always":
+        # 显式要求上色时压过 NO_COLOR：用户敲了 --color=always 就是想要颜色
+        return True
+    if os.environ.get("NO_COLOR"):
+        return False
+    target = stream or sys.stdout
+    try:
+        return bool(target.isatty())
+    except Exception:
+        return False
+
+
+def _c(text, code, stream=None):
+    if not _use_color(stream):
+        return str(text)
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _bold(text, stream=None):
+    return _c(text, "1", stream)
+
+
+def _dim(text, stream=None):
+    return _c(text, "2", stream)
+
+
+def _red(text, stream=None):
+    return _c(text, "31", stream)
+
+
+def _green(text, stream=None):
+    return _c(text, "32", stream)
+
+
+def _yellow(text, stream=None):
+    return _c(text, "33", stream)
+
+
+def _cyan(text, stream=None):
+    return _c(text, "36", stream)
+
+
+def _exit_code_color(code):
+    """退出码对应的着色函数：0 绿、3/4/6 黄、其余红。"""
+    if code == EXIT_OK:
+        return _green
+    if code in (EXIT_NO_ROOM, EXIT_ROOM_BUSY, EXIT_HUMAN):
+        return _yellow
+    return _red
+
+
+def _paint_line(text):
+    """按行首标记着色：失败/错误红，服务端提示与结束行暗色。"""
+    raw = str(text)
+    if raw.startswith(("[房间查询失败]", "[插件错误]")):
+        return _red(raw)
+    if raw.startswith(("　　服务端提示", "[提示]")):
+        return _dim(raw)
+    if raw.startswith("[结束]"):
+        return _dim(raw)
+    return raw
+
+
+def _out(text=""):
+    """CLI 输出：只在这里按行首标记上色。"""
+    print(_paint_line(text))
+
+
+def _color_report(text):
+    """给房间正文上色：`键：值` 的键加粗，ID 行整行高亮。"""
+    if not _use_color():
+        return text
+    out = []
+    for line in str(text).split("\n"):
+        head, sep, rest = line.partition("：")
+        if sep and len(head) <= 8:
+            if head.strip() == "ID":
+                out.append(_cyan(_bold(f"{head}{sep}{rest}")))
+            else:
+                out.append(f"{_bold(head + sep)}{rest}")
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+_STATUS_COLORS = {
+    "battleroom": _green,
+    "chat": _cyan,
+    "ingame": _yellow,
+    "locked": _dim,
+}
+
+
+def _color_status(line, status=""):
+    """给列表行的状态列上色。
+
+    只替换那个固定宽 7 的状态单元格，整行不动：列宽是按纯文本算好的，
+    整行上色会把描述列也染上颜色，读起来更乱。
+    """
+    if not _use_color():
+        return line
+    st = STATUS_CN.get((status or "").lower(), status or "-")
+    fn = _STATUS_COLORS.get((status or "").lower())
+    if fn is None:
+        return line
+    cell = f"{st:<7}"
+    return line.replace(cell, fn(cell), 1)
 
 
 def _pick_positionals(argv):
@@ -719,6 +854,7 @@ def _pick_positionals(argv):
     return out
 
 
+_COLOR_CHOICE = _color_choice()
 _positional = _pick_positionals(sys.argv[1:])
 _arg1 = _positional[0] if _positional else None
 # 终端里不带参数 → 直接进交互模式；管道/脚本调用仍打印帮助，避免破坏自动化。
@@ -773,7 +909,7 @@ if "--max-players" in sys.argv:
 # ================================================================ 进房推广
 # 探针进房后发一条推广消息（如仓库链接）。
 # 必须由插件显式传 --promote <文本> 才启用；命令行直接运行默认不发，
-# 避免调试时到处刷广告。
+# 避免调试时反复发广告。
 #
 # 冷却：同一房间 3 分钟内不重复推广。用文件持久化而不是内存变量，
 # 因为每次查房都是独立子进程，内存变量跨进程不生效。
@@ -790,7 +926,7 @@ if "--promote-cooldown" in sys.argv:
 # 规范要求插件不把运行时数据写进插件目录（更新会整体覆盖），所以这里
 # 优先用插件传进来的 `--state-dir`（= data/plugin_data/<插件名>/），其次
 # 环境变量 RWINFO_PLUGIN_DATA，最后才退回用户家目录 —— 命令行单独跑探针
-# 时也不会往仓库里拉屎。
+# 时也不会把状态写进仓库目录。
 def _dir_writable(path: str) -> bool:
     """真写一个探测文件判断目录可写。
 
@@ -817,7 +953,7 @@ def _promote_state_path(create: bool = False) -> str:
     这类根本用不到推广状态的模式，不该在用户家目录里留个空目录。
 
     目录不可写时**必须留一句话**（走 stderr，stdout 是给插件的契约）：
-    静默换落点会让冷却记录分裂，用户之间看到"每个房间第一次都多发一条"却查不出原因。
+    静默换落点会让冷却记录分裂：换落点后同一房间会重新推广一次，且难以排查。
     """
     cand = _find_arg("--state-dir") or os.environ.get("RWINFO_PLUGIN_DATA", "").strip()
     cand = (cand or "").strip()
@@ -843,13 +979,9 @@ def _promote_state_path(create: bool = False) -> str:
             ok = False
             err = "目录不可写"
         if not ok:
-            alt = os.path.join(os.path.expanduser("~"), ".rwinfo")
-            sys.stderr.write(f"[提示] 状态目录不可用（{cand}: {err}），改用 {alt}\n")
-            try:
-                os.makedirs(alt, exist_ok=True)
-            except OSError:
-                pass
-            cand = alt
+            # 不回退家目录：换落点会让冷却记录分裂，也违反数据目录契约。
+            sys.stderr.write(f"[提示] 状态目录不可用（{cand}: {err}），本次不落盘\n")
+            return ""
     return os.path.join(cand, "promote_state.json")
 
 
@@ -903,8 +1035,25 @@ def connect_and_161(host, port, rid=None):
     s.sendall(pack_frame(160, w.output()))
     probe = RWProbe('x', 0, NAME, unit_checksum=CK or 0, client_version=CLIENT_VER, verbose=False)
     probe.sock = s
-    probe._wait_161()
+    try:
+        probe._wait_161()
+    except BaseException:
+        # 握手阶段被踢或坏帧：这里不关，调用方的 except 拿不到 socket，
+        # 只能等 GC，连接会在房间服务器那边多挂一会儿。
+        try:
+            s.close()
+        finally:
+            raise
     return s, probe
+
+
+def _send_or_fail(sock, fn, *args) -> bool:
+    """发送不留异常：对端已关时 sendall 抛 OSError，冒到顶层就是 traceback。"""
+    try:
+        fn(*args)
+        return True
+    except OSError:
+        return False
 
 
 def send_110(sock, sid, ck, conn, chal=None):
@@ -945,7 +1094,7 @@ def send_chat(sock, text, channel=0):
         bg.b(int)    -> writeInt(频道, 0=公共)
     然后以包类型 0x8C(140) 发出。
     服务端会把消息内容当命令解析（`-` `.` `_` 三种前缀），
-    所以发 `.id` 就能触发服务端返回本房间的中继房号。
+    因此插件只在推广场景下主动发言，且需限制条数。
     """
     try:
         w = NetWriter()
@@ -960,24 +1109,42 @@ def send_chat(sock, text, channel=0):
 def _promote_key(rid, sid):
     """冷却用的房间标识。
 
-    **不能用服务端的 `server_id`**：实测中继/游戏服务器回的 sid 是
+    **不能用服务端的 `server_id`**：中继/游戏服务器回的 sid 是
     `RELAY-CN Team & Copyright dr@der.kim` 这类**中继自身标识**，
-    所有经过同一中继的房间都一样 —— 拿它当 key 会让「A 房发过推广，
+    同一中继下的所有房间都相同 —— 拿它当 key 会让「A 房发过推广，
     3 分钟内查 B 房就不发了」，等于随机漏发。
 
-    正确优先级：
-      1. `_LAST_ROOM_ID` —— 本次进房从服务端聊天里捕获到的真实房号
-         （如 s5132），这是房间的真实身份，最准
-      2. `rid` —— 本次查询用的入口（短号 / UUID / IP:端口）
+    优先级：
+      1. `_LAST_ROOM_ID` —— 本次进房从服务端聊天捕获到的真实房号（如 s5132）
+      2. 形如房号的 `sid`（见 `_looks_like_room_id`）
+      3. `rid` —— 本次查询用的入口（短号 / UUID / IP:端口）
 
-    同一房间用短号进能命中 `_LAST_ROOM_ID`；用 UUID/IP 进时若没捕获到，
-    退回 rid 记账（此时不同入口算不同房间，但至少不会互相误伤）。
+    用短号进能命中 `_LAST_ROOM_ID`；用 UUID/IP 进且未捕获到时退回 rid
+    （不同入口算不同房间，但不会互相误伤）。
     """
     for cand in (_LAST_ROOM_ID, sid if _looks_like_room_id(sid) else "", rid):
         k = str(cand or "").strip().lower()
         if k:
             return k
     return ""
+
+
+def _is_opaque_target(target):
+    """入口是否无法当作房号告诉别人：房间 UUID 或 IP:端口。
+
+    这两种形态只对本机本次连接有意义，展示时优先换成服务端给的短号。
+    其余形态（s5132、自定义的 s我去不早说、RKC497 等）直接展示入口。
+    """
+    t = str(target or "").strip()
+    if not t:
+        return True
+    if ":" in t:
+        return True
+    if re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", t
+    ):
+        return True
+    return bool(re.fullmatch(r"[0-9a-fA-F]{16,}", t))
 
 
 def _looks_like_room_id(v):
@@ -1020,10 +1187,10 @@ def maybe_promote_room(sock, rid, sid=None, tag=""):
       1. 插件传了 `--promote <文本>`（配置开关打开）
       2. 该房间距上次推广已超过 `PROMOTE_COOLDOWN`（默认 180 秒）
 
-    设计要点：
-      · 连接必须还开着 —— 所以调用点在收到 106 之后、`send_leave` 之前
-      · 冷却按**服务端 session id** 记账，不按 rid：
-        同一个房间用短号 / UUID / IP 查，都算同一个房间
+    约束：
+      · 连接必须还开着 —— 调用点在收到 106 之后、`send_leave` 之前
+      · 冷却按房间标识记账（见 `_promote_key`）：
+        同一房间用短号 / UUID / IP 查，都算同一个房间
       · 发送失败不影响查房主流程（全程 try/except）
       · 顺带清理超过 24 小时的陈旧条目，防止状态文件无限增长
 
@@ -1048,29 +1215,29 @@ def maybe_promote_room(sock, rid, sid=None, tag=""):
             return False
         if not send_chat(sock, PROMOTE_TEXT):
             if DEBUG_MODE:
-                print(f"{tag}!! 推广消息发送失败")
+                _dprint(f"{tag}!! 推广消息发送失败")
             return False
         state[key] = now
         _save_promote_state(state)
         if DEBUG_MODE:
-            print(f"{tag}    已发送进房推广: {PROMOTE_TEXT[:40]!r}")
+            _dprint(f"{tag}    已发送进房推广: {PROMOTE_TEXT[:40]!r}")
         return True
     except Exception as e:
         if DEBUG_MODE:
-            print(f"{tag}    推广流程异常(忽略): {e}")
+            _dprint(f"{tag}    推广流程异常(忽略): {e}")
         return False
 
 
-# 服务端 `.id` 回复里提取房号。
-# 实测 s5132 的返回: "SERVER: S5132"（只一条）
+# 从服务端自己推的聊天里提取中继房号（被动捕获，不主动提问）。
+# 服务端返回形如 "SERVER: S5132"（只一条）。
 # 也可能出现在更长的系统广播里，因此做宽松提取：
 #   · 优先匹配独立的大写房号（1 位前缀 + 2~8 位数字，如 S5132 / R454525）
 #   · 排除明显不是房号的词（SERVER / RELAY / ADMIN 等在 \b 边界下也不会命中，
 #     因为房号形如「单字母紧跟数字」，而 SERVER 是纯字母）
 _ID_REPLY_RE = re.compile(r'\b([A-Za-z])(\d{2,8})\b')
 
-# 最近一次通过 `.id` 拿到的房号（进程内单次查询用，用完即弃）。
-# 为什么用模块级变量而不是改返回值：relay_session/node_session 的返回值
+# 最近一次从服务端聊天里被动捕获到的房号（进程内单次查询用，用完即弃）。
+# 用模块级变量而不是扩展返回值：relay_session/node_session 的返回值
 # 被多处解包（got_106, got_115 = result），改结构会牵连所有调用点。
 _LAST_ROOM_ID = ""
 # CNKD K 服的「分享房号 / 优先分享房号 / 当前人数」是展示层权威信息。
@@ -1080,6 +1247,8 @@ _LAST_ROOM_ID = ""
 _K_ROOM_ID = ""
 _K_ROOM_CAPACITY = None
 _K_ROOM_PLAYERS = None
+# 服务端下发的人机验证提示（141 或 117 里出现），供「没拿到房间信息」的分支回报原因
+_HUMAN_HINT = ""
 
 
 def extract_k_room_id_from_chat(message):
@@ -1112,7 +1281,7 @@ def extract_room_id_from_chat(message):
 
     返回小写房号；提取不到返回 ""。
 
-    注意只接受「o/q/r/s」或已知中继首字母形态太严格 —— 中继可能随时
+    注意只接受「o/q/r/s」或已知中继首字母会过于严格 —— 中继可能随时
     开通新字母，因此这里接受任意「单字母 + 2~8 位数字」，
     由调用方（探针）去验证房间真实存在。
     """
@@ -1147,17 +1316,15 @@ def _as_int(v, default=0):
 def fetch_qroom_list(timeout=None) -> list:
     """拉取 Q Room List (真人房), 返回统一结构的房间字典列表。
 
-    统一结构:
-      source      "qroom"
-      id          平台内部编号(internal_id, 纯数字, 不能用于查房)
-      addr        直连地址 ip:port, 可直接用于查房(可能为空)
-      name        房主名
-      map         地图名(已去掉 .tmx 后缀)
-      players     当前人数
-      max         人数上限
-      status      "battleroom" / "ingame"
-      注意: 不解析 is_mod(见 fetch_qroom_list 内注释)
-      is_started  原始开局标记
+    source      "qroom"
+    id          平台内部编号(internal_id, 纯数字, 不能用于查房)
+    addr        直连地址 ip:port, 可直接用于查房(可能为空)
+    name        房主名
+    map         地图名(已去掉 .tmx 后缀)
+    players     当前人数
+    max         人数上限
+    status      "battleroom" / "ingame"
+    is_started  原始开局标记（不解析 is_mod，见函数内注释）
     """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
@@ -1375,13 +1542,13 @@ def _is_relay_entry(host: str, desc: str) -> bool:
     return bool(_RELAY_ENTRY_RE.search(blob))
 
 
-# 推广话术的正则判据(实测出来的)。
+# 推广话术的正则判据。
 #
 # 单靠"群"字会误杀: 「群雄单混」「[群雄单混]攻城掠地匹配」是正常玩法房名。
 # 也单靠人数不行: max 字段被大面积伪造(max=2000 有 54 条, 3334 有 34 条,
 # 9999 有 19 条, 89842 有 8 条), 真实上限一般是 10/20。
 #
-# 实测结论 —— 推广房名是"社会关系/拉人话术", 正常房名是"玩法+地图":
+# 判据 —— 推广房名是「社会关系/拉人话术」，正常房名是「玩法+地图」：
 #   推广: 𒀱EK群内有可爱男娘ABCD / 飞艇时代模组群 / 开学季高活跃铁锈群
 #         银杏社②群687958465 / 𒀱四军对峙群94600232 / 红温…来群338254
 #   正常: 群雄单混·多人排位赛 / [官方6v6]公平竞技赛 / 综合排位大厅|对战与生存
@@ -1477,10 +1644,10 @@ def _normalize_official(room: dict) -> dict:
     # 是否为官方自动房(Auto Server)。
     # 判据: 房主列(第 7 列)是 "SERVER" 且描述是 "Auto Server <N>+ [区域 #N]" 格式。
     # 不能只看 source == "official" —— official 源里绝大多数是玩家自己开的
-    # 中继房(自己公开后会进这张表), 早期把它们全标成"官方自动房"是错的。
+    # 中继房(自己公开后会进这张表), 只按 source 判断会把它们全标成"官方自动房"。
     # 也不能只看地图含 "Auto Server": 有玩家拿这张地图自己开房(如"世界征服1942"),
     # 那种房的房主不是 "SERVER"。
-    # 注意: 房名列(第 1 列)对 Auto Server 是 "Unnamed", 房主列才是 "SERVER"。
+    # 房名列(第 1 列)对 Auto Server 是 "Unnamed", 房主列才是 "SERVER"。
     raw_host = (room.get("host") or "").strip()
     is_auto = bool(raw_host.upper() == "SERVER" and _AUTO_SERVER_RE.match(desc))
 
@@ -1511,13 +1678,12 @@ def _normalize_official(room: dict) -> dict:
 def fetch_official_rooms(include_all: bool = False) -> list:
     """拉取 Official Room List (官方 masterserver), 筛掉不可信条目后返回统一结构。
 
-    注意: 内容判定不做 ip:port 聚合, 也不按控制字符判定。
-    RELAY-CN 把真人房开放到列表(UPList)时:
-      · 所有房间共用同一个入口 ip:port (18.216.139.119:5158)
+    内容判定不做 ip:port 聚合, 也不按控制字符判定: RELAY-CN 把真人房开放到
+    列表(UPList)时, 所有房间共用同一个入口 ip:port (18.216.139.119:5158),
       · 所有房间的房名/房主名/描述都带 \\x01 前缀
     这两种特征对真人房与推广房完全一样, 因此都不能作为判据。
 
-    真正的区别在文本内容:
+    实际区别在文本内容:
       1. classify_room   —— 链接条目 / 字段非法
       2. _is_relay_entry —— 房主名或描述是中继自身入口(且房间空置)
       3. _is_group_ad    —— 房主名或描述带群号/加群/直播等推广话术
@@ -1633,12 +1799,12 @@ def fetch_rooms(
         out.append(room)
 
     # 排序: 有人的排前面 > 玩家自开房优先 > 房间中优先 > 人数降序。
-    # 早期用 _has_target(有可直连地址) 排第一关键字, 导致两个问题:
-    #   1) 官方 Auto Server 空房(0/10)有直连 ip:port, 全部顶到前 20 条,
+    # 第一关键字不能用 _has_target（有无可直连地址）:
+    #   1) 官方 Auto Server 空房(0/10)也有直连 ip:port, 会占满前 20 条,
     #      把"随机生存挑战 18/21"这类热闹真人房挤到后面;
-    #   2) RELAY-CN 的 :5158 是注册入口, 被当成"不可查目标"沉底, 但中继房
-    #      现在能通过 join_a+uuid 向 masterserver 解析真实地址, 早已可查。
-    # 因此第一关键字改为"是否有人", 其次再区分玩家房 / Auto Server。
+    #   2) RELAY-CN 的 :5158 是注册入口, 会被当成"不可查目标"沉底, 但中继房
+    #      已能通过 join_a+uuid 向 masterserver 解析真实地址。
+    # 故第一关键字是"是否有人", 其次区分玩家房 / Auto Server。
     def _sort_key(r):
         players = int(r.get('players') or 0)
         st = (r.get('status') or '').strip().lower()
@@ -1668,9 +1834,9 @@ def _fmt_room_line(room: dict) -> str:
     st = STATUS_CN.get((room.get("status") or "").lower(), room.get("status") or "-")
     pl = room.get("players", 0)
     mx = room.get("max", 0)
-    # 描述列经常就是地图名的原串（`MOD|<哈希>//maps/xxx`）。清洗后如果跟地图列
-    # 一样就没必要重复贴一遍，否则一行里能出现两遍同样的脏路径。
-    # 洗完是空串时不能再退回原串：那说明原串整条都是协议残渣
+    # 描述列经常就是地图名的原串（`MOD|<哈希>//maps/xxx`）。清洗后若与地图列
+    # 相同就不再重复展示，否则一行里会出现两遍同样的路径。
+    # 洗完是空串时不能退回原串：那说明原串整条都是协议残渣
     # （`MOD|<哈希>//maps/[??10P??].tmx` 的方括号里就是全部内容）。
     raw_desc = room.get("desc") or ""
     desc = clean_mapname(raw_desc)
@@ -1679,7 +1845,8 @@ def _fmt_room_line(room: dict) -> str:
     line = (
         f"{str(room.get('name') or '?')[:14]:<16}"
         f"{str(room.get('map') or '-')[:26]:<28}"
-        f"{pl}/{mx:<7}{st:<7}"
+        f"{pl}/{mx}".ljust(7)
+        + f"{st:<7}"
     )
     if desc and desc != room.get("map"):
         line += desc[:24]
@@ -1719,7 +1886,7 @@ def room_list(
         print(f"{'房主':<16}{'地图':<28}{'人数':<7}{'状态':<7}描述")
         print("-" * 100)
         for room in rooms:
-            print(_fmt_room_line(room))
+            print(_color_status(_fmt_room_line(room), room.get("status")))
         print("-" * 100)
         print(f"共 {len(rooms)} 个房间")
     return rooms
@@ -1803,7 +1970,11 @@ def parse_106(data):
             block_name = utf()
             block_len = i32()
             if block_name != 'customUnits':
-                raise ValueError(f"bad mod block: {block_name!r}")
+                # 协议演进会加新块：不认识就只记一笔，下面的解析会在块边界上
+                # 撞 EOFError/struct.error 并被兜住，随后按块长跳到块尾，
+                # 不会让整份 106 报废。
+                if DEBUG_MODE:
+                    _dprint(f"[DEBUG] 106 未知块 {block_name!r} len={block_len}，已跳过")
             block_start = r.buf.tell()
             try:
                 ver = i32()
@@ -1839,7 +2010,7 @@ def parse_106(data):
             end = block_start + block_len
             if end > len(data):
                 end = len(data)
-            r.buf.seek(end)
+            r.buf.seek(max(block_start, end))
 
         # customUnits 块之后: 房间设置布尔 + seed (as.l/m/n/o/p/q)
         info['shared'] = boolean()  # as.l 共享控制
@@ -1849,7 +2020,7 @@ def parse_106(data):
         info['roomlock'] = boolean()  # as.p 房间锁定
         info['seed'] = i32()  # as.q
 
-    except EOFError:
+    except (EOFError, ValueError, struct.error):
         # 确保关键字段存在
         for k in ['shared', 'teamlock', 'spectators', 'roomlock', 'seed']:
             info.setdefault(k, None)
@@ -2084,22 +2255,20 @@ def detect_client(info):
 def clean_mapname(raw):
     """把 106 / 列表里的地图名洗成能看的样子。
 
-    联机协议里的地图名不止「纯名字」一种形态，实测收到过这些：
-      · `NEW_PATH|maps2/10p西班牙混战by-MP97`                        —— 自定义地图，带临时路径
-      · `MOD|36976564B8…6BBB5B6AC//maps/ai-弱智AI试炼场(2p)`         —— 地图来自模组，带模组哈希
-      · `/SD/rusted_warfare_maps/MOD|sw3058511896//maps/[p9]Coliding Powers (4v5)` —— 同一形态，但房主开的是安卓上的绝对路径
-      · `0    1941欧洲二战：至暗黄昏   40人  by哟西`                   —— 模组地图，前面是「模组序号 + 连续空格」
-      · `[z;p10]Crossing Large (10p).tmx`                            —— 老版式，方括号里是地图参数
-    这些前缀、路径、哈希对玩家没有意义，原样贴出去就是一行怪东西。
+    协议里的地图名除纯名字外还有这些形态：
+      · `NEW_PATH|maps2/10p西班牙混战by-MP97`           —— 自定义地图，带临时路径
+      · `MOD|36976564B8…6BBB5B6AC//maps/ai-弱智AI试炼场(2p)` —— 来自模组，带模组哈希
+      · `/SD/rusted_warfare_maps/MOD|sw3058511896//maps/[p9]Coliding Powers (4v5)`
+        —— 同一形态，但房主开的是安卓上的绝对路径
+      · `0    1941欧洲二战：至暗黄昏   40人  by哟西`     —— 模组序号 + 连续空格
+      · `[z;p10]Crossing Large (10p).tmx`               —— 老版式，方括号是地图参数
+    这些前缀、路径、哈希对玩家没有意义，原样展示就是一行怪东西。
 
-    清洗顺序是有讲究的，不能随意调换：
-      1. 从第一个 `前缀|` 处截断（房主可能把整条 sd 卡路径带上来）；
-      2. `//` 之后（或模组 ID 之后）才是相对路径；
-      3. 切成文件名（只在确实像路径时切，`1v1/2v2 混战地图` 这种名字不能动）；
-      4. 再反复剥「数字序号 + 连续空格」与「方括号参数」—— 两者会交替出现；
-      5. 收空格、去扩展名。
-    每一步都记 `hit`：只有当一次都没命中时才回退原串，否则洗完变空就返回空串，
-    让调用方去显示「未知地图」，而不是把 `MOD|<哈希>//maps/` 这种残渣贴上屏。
+    清洗顺序固定，不能调换：第一个 `前缀|` 截断 → 取 `//` 之后的相对路径 →
+    切成文件名（仅当确实像路径，`1v1/2v2 混战地图` 不能动）→ 反复剥「数字序号 +
+    连续空格」与「方括号参数」（两者交替出现）→ 收空格、去扩展名。每步记 `hit`：
+    一次都没命中才回退原串，否则洗完为空返回空串，由调用方显示「未知地图」，
+    而不是上屏 `MOD|<哈希>//maps/` 这类残渣。
     """
     name = str(raw or "").strip()
     if not name:
@@ -2160,13 +2329,13 @@ def clean_mapname(raw):
 def _mod_line(info) -> str:
     """拼「使用模组：…」这一行；说不清时返回空串（宁可不显示，也不猜）。
 
-    两个信号各有边界，所以文案要能看出我们到底看到了什么：
-      · 单位显示名（dname）：模组作者给自定义单位起的名字，通常就含模组名。
-        原版 121 个内置单位都没有显示名，所以这里一旦有值就说明装了模组。
-      · 单位数量：超过原版 121 个说明装了模组，但可能摸不到名字。
-      · 地图路径：`MOD|<哈希>//maps/xxx` 说明地图是从模组里加载的。
-    只改数值、不加单位的模组两个信号都没有，只能显示「原版」—— 这是协议
-    给的信息上限，不是解析失败。
+    各信号边界不同，文案需体现命中的是哪一条：
+      · 单位显示名（dname）：模组作者给自定义单位起的名字，通常含模组名。
+        原版 121 个内置单位都没有显示名，因此有值即说明装了模组。
+      · 单位数量：超过原版 121 个说明装了模组，但可能拿不到名字。
+      · 地图路径：`MOD|<哈希>//maps/xxx` 说明地图从模组里加载。
+    只改数值、不加单位的模组三条信号都没有，只能显示「原版」—— 这是协议
+    的信息上限，不是解析失败。
     """
     names = [n for n in (info.get("mod_names") or []) if n]
     count = info.get("custom_unit_count") or 0
@@ -2201,8 +2370,7 @@ def format_room(
     import re as _re
 
     # 排版约定：
-    #   · 一行一个字段，不做并排 —— 并排后群里一窄屏就折行，
-    #     读起来像「初始资金和地图模式粘在一起」，反而不如竖排清楚
+    #   · 一行一个字段，不做并排 —— 并排后在窄屏折行，相邻字段会粘连
     #   · 字段名与值之间统一用全角冒号
     #   · 行首不加半角空格（QQ 会当代码块）
     #   · 「玩家列表：」顶格，条目缩进两格，冒号同样全角
@@ -2232,8 +2400,9 @@ def format_room(
     lines.append(f"初始禁核：{_nuke_str}")
     lines.append(f"初始迷雾：{_fog_str}")
     # 默认单位: 客户端下拉 ae.d() = 1..4 + 可选起始单位(100+, RWPP isPickableStartingUnit)
-    # 100+ 是 g 列表索引 (客户端 ae.d 100+ 部分), 不是服务器 custom_unit_list 顺序!
-    # g: 100=experimentalDropship(飞行堡垒), 101=experimentalGunship(实验悬浮型气垫船), 102=experimentalSpider(实验型战斗蜘蛛), 103=modularSpider(模块蜘蛛)
+    # 100+ 是 g 列表索引 (客户端 ae.d 100+ 部分), 不是服务器 custom_unit_list 顺序。
+    # g: 100=experimentalDropship(飞行堡垒), 101=experimentalGunship(实验悬浮型气垫船),
+    #    102=experimentalSpider(实验型战斗蜘蛛), 103=modularSpider(模块蜘蛛)
     u = info.get('units', 0)
     dbg = []
     if u in UNIT_NAMES:
@@ -2257,10 +2426,11 @@ def format_room(
         unit_str = f"未知({u})"
     # 自定义单位ID: 剥 c_ 前缀后查中文翻译表 (客户端 e(): units.<id>.name)
     # aaBeamGunship -> AA激光射束战机, c_amphibiousJet -> 两栖喷气机
-    unit_str = UNIT_TRANSLATIONS.get(unit_str.lstrip('c_'), unit_str)
+    _lookup = unit_str[2:] if unit_str.startswith("c_") else unit_str
+    unit_str = UNIT_TRANSLATIONS.get(_lookup, unit_str)
     if DEBUG_MODE and dbg:
         dbg.append(f'final={unit_str}')
-        print('[DEBUG] 默认单位: ' + ' | '.join(dbg))
+        _dprint('[DEBUG] 默认单位: ' + ' | '.join(dbg))
 
     lines.append(f"默认单位：{unit_str}")
     cap = info.get('unit_cap')
@@ -2477,19 +2647,16 @@ def _parse_115_offset(
 ):
     """纯偏移解析 teams 块(标准协议), 严格复刻客户端 ae.smali 循环 + p.a()。
 
-    返回 (players, ok) —— players 为解析出的玩家列表; ok=False 表示
-    解析中途字段非法, 应回退到启发式扫描。
+    返回 (players, ok) —— ok=False 表示解析中途字段非法, 应回退到启发式扫描。
 
-    客户端 ae.smali 精确逻辑:
+    客户端 ae.smali 逻辑:
       for team_idx in range(team_count):
-          team = get_team(team_idx)
-          exists = readBoolean()
-          score  = readInt()
+          team = get_team(team_idx); exists = readBoolean(); score = readInt()
           if not full_load:             # v0 == 0
               p.a(reader, is_running)   # 完整玩家结构
           else:
               readByte(); readInt(); readBoolean(); readBoolean()  # 精简结构
-    注意: 无论 exists 与否、team 是否存在, score 之后都会读一条玩家/精简记录。
+    约束: 无论 exists 与否、team 是否存在, score 之后都会读一条玩家/精简记录。
     """
     r = NetReader(block_body)
     players = []
@@ -2542,10 +2709,10 @@ def _parse_115_offset(
                 r.int32()
                 r.boolean()
                 r.boolean()
-        # 读完所有队伍后, 检查是否还有尾部字段(as.d/as.c/as.e/as.f ...)
-        # 客户端循环结束后还会读公共尾部, 但我们只关心玩家列表, 忽略即可。
+        # 读完所有队伍后, 可能还有尾部字段(as.d/as.c/as.e/as.f ...)
+        # 客户端循环结束后会读公共尾部; 这里只取玩家列表, 其余忽略。
         return players, True
-    except (EOFError, struct.error, ValueError):
+    except (EOFError, struct.error, ValueError, IndexError):
         return [], False
 
 
@@ -2594,7 +2761,7 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
         block_body = r.read(block_len)
         if stream_ver >= 141:
             try:
-                # 限制解压后大小, 防 gzip 炸弹 (用 zlib 底层, 兼容 3.11/3.12 及魔改环境)
+                # 限制解压后大小, 防 gzip 炸弹 (用 zlib 底层, 兼容 3.11/3.12 及改造环境)
                 import zlib as _zlib
 
                 _d = _zlib.decompressobj(16 + _zlib.MAX_WBITS)
@@ -2642,11 +2809,11 @@ def parse_115(payload, stream_ver=DEFAULT_VER):
         players = []
         b = block_body
         # RCN 服务器: 玩家记录之间以 ff ff d8 f1 分隔, 每条记录一段。
-        # 段内可能含不定长 00 填充 + 真实记录。若整块逐字节滑动扫描,
-        # 会误匹配填充里的"假记录头"(exists=1 但 name=None、team 错位),
-        # 并因 o=o2+1 跳过真实记录 → 真人房主丢失(如 r12345 "一个无常人")。
-        # 修复: 按分隔符切段, 每段只取"名字非空且字段合法"的真实记录
-        # (填充误报的假记录 name=None 自动跳过), 每段至多一条。
+        # 段内可能含不定长 00 填充 + 真实记录。整块逐字节滑动扫描会误匹配
+        # 填充里的"假记录头"(exists=1 但 name=None、team 错位), 并因 o=o2+1
+        # 跳过真实记录, 导致真人房主缺失(如 r12345 "一个无常人")。
+        # 因此按分隔符切段, 每段只取"名字非空且字段合法"的真实记录
+        # (填充误报的假记录 name=None), 每段至多一条。
         for seg in b.split(b'\xff\xff\xd8\xf1'):
             if not seg:
                 continue
@@ -2777,7 +2944,7 @@ def cleanup_old_bin_files(max_age_seconds=3600, verbose=False):
     deleted = kept = 0
     current_time = time.time()
     # 不建目录：目录不存在就说明从来没落过盘，没什么可清的
-    # （每次 --list-json 都建一个空目录，等于在用户家目录里留垃圾）
+    # （否则每次 --list-json 都会在家目录留下一个空目录）
     _bd = bin_dir()
     if not _bd or not os.path.isdir(_bd):
         return deleted, kept
@@ -2808,90 +2975,30 @@ def cleanup_old_bin_files(max_age_seconds=3600, verbose=False):
     return deleted, kept
 
 
-def _ask_room_id_on_106(sock, probe, rid, tag=""):
-    """收到 106 后，若还没拿到房间短号，就发 `.id` 向服务端索取。
-
-    背景：从「房间列表」点进来的房间，客户端只知道 UUID / IP:端口，
-    不知道 s5132 这种中继短号，别人没法用短号直接进。
-    服务端（rwpp / IronCore 等）实现了 `.id` 命令，回一条 "SERVER: S5132"。
-
-    **这是备用手段，不是首选**：
-      1. 优先靠被动捕获 —— 部分中继（如 RELAY-CN）连上就主动推
-         `当前服务器ID是 您可以凭本ID在IP栏内重连 [S5132]`，
-         那条消息在 141 分支里已被捕获，写进 `_LAST_ROOM_ID`。
-      2. 只有被动没抓到（`_LAST_ROOM_ID` 为空）才发 `.id`。
-
-    另外只在 rid 不是短号形态时才问 —— 本来就是 s5132 进来的没必要问。
-
-    全程 try/except 包裹：`.id` 失败绝不能影响查房主流程。
-    """
-    global _LAST_ROOM_ID
-    try:
-        # ① 已经通过被动捕获拿到房号 -> 不再发，避免多余消息
-        if _LAST_ROOM_ID:
-            if DEBUG_MODE:
-                _dprint(f"{tag}    已有房间号 {_LAST_ROOM_ID}（被动捕获），跳过 .id")
-            return
-        # ② 本来就是短号进房 -> 无需询问
-        if re.match(r'^[A-Za-z]\d{2,8}$', str(rid or "")):
-            return
-        # ③ 兜底：主动发 .id
-        if not send_chat(sock, ".id"):
-            return
-        if DEBUG_MODE:
-            _dprint(f"{tag}    未捕获到房号，改发 .id 询问...")
-        deadline = time.time() + 3
-        while time.time() < deadline:
-            try:
-                mt, pl = read_frame(sock, 1)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            if mt == 141:
-                sender, message = parse_141(pl)
-                if DEBUG_MODE:
-                    _dprint(f"{tag}    [id回复] {sender}: {message!r}")
-                got = extract_room_id_from_chat(message)
-                if got:
-                    _LAST_ROOM_ID = got
-                    if DEBUG_MODE:
-                        _dprint(f"{tag}    => 房间号 {got}")
-                    return
-            elif mt == 150:
-                if DEBUG_MODE:
-                    _dprint(f"{tag}    .id 后被踢: {NetReader(pl).utf()}")
-                return
-            elif mt == 151:
-                probe._handle_relay_151(pl)
-            elif mt == 108:
-                r = NetWriter()
-                r.int64(NetReader(pl).int64())
-                r.byte(1)
-                sock.sendall(pack_frame(109, r.output()))
-    except Exception as e:
-        if DEBUG_MODE:
-            _dprint(f"{tag}    .id 流程异常(忽略): {e}")
-
-
 def _handle_chat_packet(payload, tag=""):
     """处理 141 聊天包：打印 + 尝试捕获房间短号。
 
-    `relay_session` 与 `node_session` 两条主循环都要接 141，
-    逻辑完全一致，因此抽到一处，避免两处各写一遍导致行为漂移。
+    `relay_session` 与 `node_session` 两条主循环都要接 141，逻辑一致，
+    因此抽到一处，避免两处各写一遍导致行为漂移。
 
     捕获说明：部分中继进房后会主动推
-    「当前服务器ID是 您可以凭本ID在IP栏内重连 [S5132]」，
+    「当前服务器ID是 您可以凭本ID在IP栏内重连 [S5132]」。
     这条消息可能落在中继连接上，也可能落在 178 跳转后的节点连接上，
     所以两条路径都必须调用本函数。
 
-    即使本次查询用的就是短号，也照样捕获：用短号查 ≠ 进的就是那个房，
+    即使本次查询用的就是短号也照样捕获：用短号查 ≠ 进的就是那个房，
     以服务端推送的为准。
     """
-    global _LAST_ROOM_ID, _K_ROOM_ID
+    global _LAST_ROOM_ID, _K_ROOM_ID, _HUMAN_HINT
     sender, message = parse_141(payload)
     if DEBUG_MODE:
         _dprint(f"[聊天] {sender}: {message}" if sender else f"[聊天] {message}")
+    # 验证提示可能以 141 聊天下发（有的服先发「正在做接入检查」再来确认码），
+    # 记下来让「没拿到房间信息」的分支能报出真实原因。
+    if not _HUMAN_HINT and _id_sender_ok(sender or "") and is_human_check(message):
+        _HUMAN_HINT = message
+        if DEBUG_MODE:
+            _dprint(f"{tag}    => 服务端要求人机接入验证")
     # 先读 K 服状态，即使已经拿到过普通房号也要继续更新人数。
     _update_k_room_status(message)
     krid = extract_k_room_id_from_chat(message)
@@ -2909,26 +3016,105 @@ def _handle_chat_packet(payload, tag=""):
 def _drain_115(sock, got_106, got_115, timeout=1.0):
     """收到 106 后补收 115（玩家/队伍信息）。
 
-    有的中继先发 106 再发 115；以前收到 106 立刻收尾，115 永远读不到，
-    表现成「当前人数：0」或玩家列表为空，和「确实没玩家」分不清。
+    部分中继先发 106 再发 115：收到 106 立即收尾时 115 读不到，
+    表现为「当前人数：0」或玩家列表为空，与「确实没玩家」无法区分。
     """
     if got_106 is None or got_115 is not None:
         return got_115
+    # read_frame 会把 socket 超时改成传入值，退出时必须还原，
+    # 否则后面的收尾动作（推广 / .id）会继承这个 1 秒预算。
+    try:
+        prev_timeout = sock.gettimeout()
+    except OSError:
+        prev_timeout = None
     end = time.time() + timeout
-    while time.time() < end:
+    try:
+        while time.time() < end:
+            try:
+                mtype, payload = read_frame(sock, max(1.0, timeout))
+            except (socket.timeout, OSError, ValueError):
+                # ValueError 是半帧/错位帧，继续读只会更乱，直接放弃补收
+                break
+            if mtype == 115:
+                return payload
+            if mtype == 150:
+                break
+        return got_115
+    finally:
+        if prev_timeout is not None:
+            try:
+                sock.settimeout(prev_timeout)
+            except OSError:
+                pass
+
+
+# 发 `.id` 之后窗内还会有玩家聊天，只有服务端/系统的 141 才可能带短号
+_ID_SENDER_RE = re.compile(r"(?i)(server|system|relay|admin|cnkd|guard|console|bot)")
+
+
+def _id_sender_ok(sender) -> bool:
+    """无发送者视为系统消息；有发送者时只认服务端/中继类名字。"""
+    name = str(sender or "").strip()
+    if not name:
+        return True
+    return bool(_ID_SENDER_RE.search(name))
+
+
+def _ask_room_id_fallback(sock, probe, rid, tag=""):
+    """入口与被动捕获都拿不到房号时，发 `.id` 向服务端要短号。
+
+    只有「入口本身是房间 UUID / 裸哈希 / IP:端口」且当前没有捕获到房号时
+    才走这里：从房间列表点进来的房间，展示 UUID 没法告诉别人怎么进。
+    入口已经是房号（含自定义房号）时一律跳过 —— 入口与房间一一对应，
+    再问一次只是多一条房内可见的聊天消息。
+
+    `.id` 会被服务端当命令解析，回包是 141 聊天（如「SERVER: S5132」），
+    解析复用 `extract_room_id_from_chat`；等不到回应就静默放弃。
+    """
+    global _LAST_ROOM_ID
+    if _LAST_ROOM_ID or _K_ROOM_ID:
+        return False
+    if not _is_opaque_target(rid):
+        return False
+    if not send_chat(sock, ".id"):
+        return False
+    if DEBUG_MODE:
+        _dprint(f"[{tag or '中继'}] 入口不可用，已发 .id 询问房号")
+    deadline = time.time() + 2.5
+    while time.time() < deadline:
         try:
-            mtype, payload = read_frame(sock, 1)
-        except (socket.timeout, OSError):
+            mtype, payload = read_frame(sock, max(0.1, deadline - time.time()))
+        except socket.timeout:
+            continue
+        except (OSError, ValueError):
             break
-        if mtype == 115:
-            return payload
-        if mtype == 150:
+        if mtype == 151:
+            # 窗内还可能来一次 POW 挑战，不答会被服务端踢
+            try:
+                probe._handle_relay_151(payload)
+            except Exception:
+                break
+            continue
+        if mtype != 141:
+            # 等的是聊天回包；别的帧（106/115/117…）说明房间信息已经在路上，
+            # 继续读只会把后面的帧吃掉。
             break
-    return got_115
+        _sender, message = parse_141(payload)
+        if not _id_sender_ok(_sender) and "ID" not in message.upper():
+            if DEBUG_MODE:
+                _dprint(f"[{tag or '中继'}] 窗内玩家聊天，跳过: {message[:40]!r}")
+            continue
+        got = extract_room_id_from_chat(message)
+        if got:
+            _LAST_ROOM_ID = got
+            if DEBUG_MODE:
+                _dprint(f"[{tag or '中继'}] .id 回应解析到房号 {got}")
+            return True
+    return False
 
 
 def _finalize_room(sock, got_106, got_115, probe, rid, tag=""):
-    """收到 106 后的统一收尾：验证码房识别 → 问房号 → 进房推广 → 离开。
+    """收到 106 后的统一收尾：验证码房识别 → 进房推广 → 必要时问房号 → 离开。
 
     `relay_session` 与 `node_session` 收尾步骤完全一致，抽到一处，
     保证新加的收尾动作（如推广）不会只在其中一条路径生效。
@@ -2942,11 +3128,19 @@ def _finalize_room(sock, got_106, got_115, probe, rid, tag=""):
             send_leave(sock)
             sock.close()
             return ("CAPTCHA", "验证码房无法继续")
-    except Exception:
-        pass
-    # 先问房号再推广：服务端若对连续消息有节流，优先保证关键信息发出。
-    _ask_room_id_on_106(sock, probe, rid, tag)
+    except Exception as e:
+        # 解析失败就无法排除验证码房。按「不可确认」处理：立刻离房，
+        # 不推广、不聊天 —— 继续交互可能被封 IP。
+        _dprint(f"{tag}[警告] 验证码房识别失败，按不可确认处理并立刻离房: {type(e).__name__}: {e}")
+        send_leave(sock)
+        sock.close()
+        return ("CAPTCHA", "106 解析失败，无法确认是否为验证码房")
+    # 推广先发：`.id` 的回包要在 socket 上读最多 2.5 秒，
+    # 排在推广后面才不会因为读帧把推广挤掉。
     maybe_promote_room(sock, rid, getattr(probe, "server_id", None), tag)
+    # 房号优先级：聊天输入 > 被动捕获 > `.id`。走到这里的只有
+    # 「入口是 UUID / IP:端口」且一条聊天都没捕获到的情况。
+    _ask_room_id_fallback(sock, probe, rid, tag)
     send_leave(sock)
     sock.close()
     return got_106, got_115
@@ -2975,28 +3169,26 @@ def finish_report(sock, got_106, got_115, target):
     else:
         current_players = 0
 
-    # 空行只是人类看 CLI 时舒服一点；插件拿 stdout 时它没有意义，
-    # 放在正文之前还会让 `out.find("房间版本：")` 之前多一行空白。
-    _dprint()
-    # ---- 展示用的房号：优先用 `.id` 从服务端拿到的中继短号 ----
-    # 从「房间列表」点进来的房间，target 是 UUID（一长串十六进制），
-    # 用户看到它没法告诉别人怎么进。`.id` 返回的才是 s5132 这种短号。
-    _disp_target = target
-    if _LAST_ROOM_ID:
-        _disp_target = _LAST_ROOM_ID
+    # ---- 展示用的房号：查询入口 > 被动捕获 ----
+    # 入口本来就是房号（s5132 / 自定义 s我去不早说 / RKC497）时直接展示入口，
+    # 它与房间一一对应，没有理由用被动捕获到的值覆盖。
+    # 只有入口是 UUID 或 IP:端口这种「别人没法用」的形态时，才拿服务端推送的短号。
+    _disp_target = _LAST_ROOM_ID if _is_opaque_target(target) and _LAST_ROOM_ID else target
     # K 房必须展示 RKC 分享号，不能被 [z;p10] 或 KC497 内部号覆盖。
     if _K_ROOM_ID:
         _disp_target = _K_ROOM_ID
     print(
-        format_room(
-            info,
-            _disp_target,
-            players_names,
-            capacity,
-            players_detail,
-            _MAX_PLAYERS_DISPLAY,
-            player_count=current_players,
-            show_players=SHOW_PLAYERS,
+        _color_report(
+            format_room(
+                info,
+                _disp_target,
+                players_names,
+                capacity,
+                players_detail,
+                _MAX_PLAYERS_DISPLAY,
+                player_count=current_players,
+                show_players=SHOW_PLAYERS,
+            )
         )
     )
 
@@ -3031,7 +3223,7 @@ def direct_main():
       · `IP:端口`                  —— 直接连节点（房间已分配到该节点）
       · `IP:端口/房间UUID`          —— 从「房间列表」点进来的形式：带着 UUID
                                        向分配中心请求，由它把连接转到正确节点
-    实测官方列表里所有真人房都指向同一个分配中心地址（如
+    官方列表里所有真人房都指向同一个分配中心地址（如
     18.216.139.119:5158），必须带 UUID 才能路由到目标房间。
     """
     target = DIRECT_TARGET
@@ -3045,7 +3237,7 @@ def direct_main():
         try:
             port = int(port or 5123)
         except ValueError:
-            print(f"[房间查询失败] 端口无效: {target}")
+            _out(f"[房间查询失败] 端口无效: {target}")
             sys.exit(EXIT_NET)
     else:
         ip, port = target, 5123
@@ -3054,8 +3246,8 @@ def direct_main():
         _dprint(f"=== 直连 {ip}:{port}{_u} (客户端 1.15) ===")
 
     # 统一走 node_session: 它会处理 161 之前的 178 跳转、151 挑战、106/115。
-    # 早期这里另写了一套 connect_and_161 流程, 只认 161, 遇到节点先回 178
-    # 就报 sid=None / 未收到106 —— 而同样的地址走 node_session 是能查到的。
+    # 不要另写只认 161 的连接流程: 节点先回 178 时会报 sid=None / 未收到 106,
+    # 而同样的地址走 node_session 是可查的。
     result = node_session(ip, port, room_uuid or None)
     if (
         isinstance(result, tuple)
@@ -3067,10 +3259,11 @@ def direct_main():
             _handle_kicked(msg)
         if DEBUG_MODE:
             _dprint(f"!! {msg}")
-        print(f"[房间查询失败] {msg}")
-        sys.exit(_exit_code_for_failure(msg))
+        _out(f"[房间查询失败] {msg}")
+        # 验证码房算「需要人工验证」，不能落进未归类（直连与中继口径要一致）
+        sys.exit(EXIT_HUMAN if kind == "CAPTCHA" else _exit_code_for_failure(msg))
     if result is None:
-        print("[房间查询失败] 房间不存在或已关闭")
+        _out("[房间查询失败] 房间不存在或已关闭")
         sys.exit(EXIT_NO_ROOM)
     got_106, got_115 = result
     # 展示用 target：带 UUID 时保留完整形式，便于用户回看
@@ -3140,6 +3333,15 @@ def relay_session(host, port, rid, depth=0, seen=None):
         if DEBUG_MODE:
             _dprint(f"{tag}!! 连接中继失败: {e}")
         return ("FAILED", f"无法连接中继 {host}:{port}（该首字母的中继未开放或网络不通）")
+    except RuntimeError as e:
+        # 握手阶段被 150 踢掉时原文是 "kicked: <服务端提示>"，
+        # 这条提示可能正是「需要人机验证」，不能压成异常类名。
+        text = str(e)
+        if text.startswith("kicked: "):
+            text = text[len("kicked: ") :]
+        if DEBUG_MODE:
+            _dprint(f"{tag}!! 握手阶段被拒: {text}")
+        return ("KICKED", text)
     except Exception as e:
         if DEBUG_MODE:
             _dprint(f"{tag}!! 握手异常: {e}")
@@ -3156,9 +3358,13 @@ def relay_session(host, port, rid, depth=0, seen=None):
         if DEBUG_MODE:
             _dprint(f"{tag}!! 握手失败，未收到房间服务器响应")
         s.close()
+        if _HUMAN_HINT:
+            return ("KICKED", _HUMAN_HINT)
         return ("FAILED", f"中继 {host}:{port} 未响应握手（房间不存在或中继繁忙）")
 
-    send_110(s, sid, CK, probe.conn_id, probe.challenge_y)
+    if not _send_or_fail(s, send_110, s, sid, CK, probe.conn_id, probe.challenge_y):
+        s.close()
+        return ("FAILED", "连接被服务端中断（发送时对端已关闭）")
     if DEBUG_MODE:
         _dprint(f"{tag}[2] 110已发送，等待验证/跳转/房间信息...")
 
@@ -3182,7 +3388,11 @@ def relay_session(host, port, rid, depth=0, seen=None):
             if DEBUG_MODE:
                 _dprint(f"{tag}    收到游戏服务器161: sid={probe.server_id!r} conn={probe.conn_id}")
             if probe.server_id:
-                send_110(s, probe.server_id, CK, probe.conn_id, probe.challenge_y)
+                if not _send_or_fail(
+                    s, send_110, s, probe.server_id, CK, probe.conn_id, probe.challenge_y
+                ):
+                    s.close()
+                    return ("FAILED", "连接被服务端中断（发送时对端已关闭）")
                 if DEBUG_MODE:
                     _dprint(f"{tag}    已重新发送110到游戏服务器")
         elif mtype == 163:
@@ -3213,9 +3423,18 @@ def relay_session(host, port, rid, depth=0, seen=None):
             r = NetWriter()
             r.int64(NetReader(payload).int64())
             r.byte(1)
-            s.sendall(pack_frame(109, r.output()))
+            try:
+                s.sendall(pack_frame(109, r.output()))
+            except OSError:
+                s.close()
+                return ("FAILED", "连接被服务端中断（发送时对端已关闭）")
         elif mtype == 150:
-            kick_reason = NetReader(payload).utf()
+            try:
+                kick_reason = (NetReader(payload).utf() if payload else "") or (
+                    "服务端关闭了连接（未给出原因）"
+                )
+            except Exception:
+                kick_reason = "服务端关闭了连接（未给出原因）"
             if DEBUG_MODE:
                 _dprint(f"{tag}KICKED:", kick_reason)
             break
@@ -3235,10 +3454,16 @@ def relay_session(host, port, rid, depth=0, seen=None):
                 hint = ""
             if DEBUG_MODE:
                 _dprint(f"{tag}[117] {hint!r}")
-            if hint:
+            if hint and (is_human_check(hint) or _is_kick_text(hint)):
+                s.close()
                 return ("KICKED", hint)
+            if hint and DEBUG_MODE:
+                _dprint(f"{tag}117 是公告类提示，继续等房间信息")
         elif mtype == 141:
             _handle_chat_packet(payload, tag)
+            if _HUMAN_HINT:
+                s.close()
+                return ("KICKED", _HUMAN_HINT)
         else:
             if DEBUG_MODE:
                 _dprint(
@@ -3253,6 +3478,8 @@ def relay_session(host, port, rid, depth=0, seen=None):
     if got_106 is None and DEBUG_MODE:
         _dprint(f"{tag}!! 未收到106（房间可能不存在/已关闭/需要密码）")
     # 静默模式也需要让调用方知道失败原因, 不能返回 None 让插件"无输出"
+    if _HUMAN_HINT:
+        return ("KICKED", _HUMAN_HINT)
     return ("FAILED", f"未收到房间信息（中继 {host}:{port} 无响应）")
 
 
@@ -3264,7 +3491,7 @@ def _follow_node_jump(addr, rid, depth=0, seen=None):
         [TCP]1.2.3.4:5123                -> 纯地址, 继续连节点
 
     客户端(ae.java)收到 178 后一律关闭当前连接再连新地址, 不把它当错误。
-    这里统一处理, 并做环检测与深度限制, 防止节点互相推诿造成死循环。
+    本函数统一处理, 并做环检测与深度限制, 防止节点间互相跳转造成死循环。
     """
     if seen is None:
         seen = set()
@@ -3351,7 +3578,7 @@ def node_session(host, port, rid=None, depth=0, seen=None):
     w.int32(4)
     w.int32(CLIENT_VER)
     w.int32(1)
-    # 注意: 此处必须不带房间号。节点是按 178 分配到的专用节点,
+    # 此处必须不带房间号。节点是按 178 分配到的专用节点,
     # 带 room_id 会触发 "绕过ID分配中心" 拒绝, 并导致 178 环路。
     w.nullable_str(None)
     w.utf(NAME)
@@ -3360,13 +3587,29 @@ def node_session(host, port, rid=None, depth=0, seen=None):
     s2.sendall(pack_frame(160, w.output()))
     probe2 = RWProbe('x', 0, NAME, unit_checksum=CK or 0, client_version=CLIENT_VER, verbose=False)
     probe2.sock = s2
-    probe2._wait_161()
+    try:
+        probe2._wait_161()
+    except RuntimeError as e:
+        text = str(e)
+        if text.startswith("kicked: "):
+            text = text[len("kicked: ") :]
+        s2.close()
+        if DEBUG_MODE:
+            _dprint(f"!! 节点握手阶段被拒: {text}")
+        return ("KICKED", text)
+    except Exception as e:
+        # 坏帧（bad packet length）等会抛 ValueError/struct.error；
+        # 不接住就会一路冒到 __main__，父进程只看到「探针没有任何输出」。
+        s2.close()
+        if DEBUG_MODE:
+            _dprint(f"!! 节点握手异常: {type(e).__name__}: {e}")
+        return ("FAILED", f"游戏节点握手异常: {type(e).__name__}")
     sid2 = probe2.server_id
     if DEBUG_MODE:
         _dprint(f"[5] 节点161: sid={sid2!r} conn={probe2.conn_id}")
-    # 有些节点在握手阶段就直接回 178(连 161 都不发): RELAY-CN / Tiexiu 的
-    # 分配节点就是这样, 回包形如 "[TCP]h1.example:5123/RA"。客户端收到后
-    # 会关掉连接继续跟随, 早期这里只认 161, 于是全部报"未响应握手"。
+    # 部分节点在握手阶段就直接回 178(连 161 都不发): RELAY-CN / Tiexiu 的
+    # 分配节点即如此, 回包形如 "[TCP]h1.example:5123/RA"。客户端收到后
+    # 会关掉连接继续跟随; 只认 161 时会一律报 "未响应握手"。
     jump_now = getattr(probe2, "jump_addr", None)
     if jump_now:
         s2.close()
@@ -3377,8 +3620,12 @@ def node_session(host, port, rid=None, depth=0, seen=None):
         if DEBUG_MODE:
             _dprint("!! 节点握手失败")
         s2.close()
+        if _HUMAN_HINT:
+            return ("KICKED", _HUMAN_HINT)
         return ("FAILED", f"游戏节点 {host}:{port} 未响应握手")
-    send_110(s2, sid2, CK, probe2.conn_id, probe2.challenge_y)
+    if not _send_or_fail(s2, send_110, s2, sid2, CK, probe2.conn_id, probe2.challenge_y):
+        s2.close()
+        return ("FAILED", "连接被服务端中断（发送时对端已关闭）")
     got_106 = None
     got_115 = None
     kick_reason = None
@@ -3398,7 +3645,11 @@ def node_session(host, port, rid=None, depth=0, seen=None):
             if DEBUG_MODE:
                 _dprint(f"[6] 收到游戏服务器161: sid={probe2.server_id!r} conn={probe2.conn_id}")
             if probe2.server_id:
-                send_110(s2, probe2.server_id, CK, probe2.conn_id, probe2.challenge_y)
+                if not _send_or_fail(
+                    s2, send_110, s2, probe2.server_id, CK, probe2.conn_id, probe2.challenge_y
+                ):
+                    s2.close()
+                    return ("FAILED", "连接被服务端中断（发送时对端已关闭）")
                 if DEBUG_MODE:
                     _dprint("[6] 已重新发送110到游戏服务器")
         elif mtype == 163:
@@ -3423,14 +3674,26 @@ def node_session(host, port, rid=None, depth=0, seen=None):
             r = NetWriter()
             r.int64(NetReader(payload).int64())
             r.byte(1)
-            s2.sendall(pack_frame(109, r.output()))
+            try:
+                s2.sendall(pack_frame(109, r.output()))
+            except OSError:
+                s2.close()
+                return ("FAILED", "连接被服务端中断（发送时对端已关闭）")
         elif mtype == 150:
-            kick_reason = NetReader(payload).utf()
+            try:
+                kick_reason = (NetReader(payload).utf() if payload else "") or (
+                    "服务端关闭了连接（未给出原因）"
+                )
+            except Exception:
+                kick_reason = "服务端关闭了连接（未给出原因）"
             if DEBUG_MODE:
                 _dprint("KICKED:", kick_reason)
             break
         elif mtype == 141:
             _handle_chat_packet(payload, "[6]")
+            if _HUMAN_HINT:
+                s2.close()
+                return ("KICKED", _HUMAN_HINT)
         elif mtype == 117:
             # 节点拒绝: byte 1 + int32 类型 + utf(文本)
             hint = ""
@@ -3443,9 +3706,11 @@ def node_session(host, port, rid=None, depth=0, seen=None):
                 hint = ""
             if DEBUG_MODE:
                 _dprint(f"[7] 节点提示: {hint!r}")
-            if hint:
+            if hint and (is_human_check(hint) or _is_kick_text(hint)):
                 kick_reason = hint
                 break
+            if hint and DEBUG_MODE:
+                _dprint("[7] 公告类提示，继续等房间信息")
         elif mtype == 178:
             # 178 是跳转指令, 不是拒绝。节点把房间转挂到别处时会再下发一跳
             # (如 62.234.56.66:5126/RB), 客户端收到后关掉当前连接继续跟随。
@@ -3465,6 +3730,8 @@ def node_session(host, port, rid=None, depth=0, seen=None):
         return ("KICKED", kick_reason)
     if got_106 is None and DEBUG_MODE:
         _dprint("!! 未收到106")
+    if _HUMAN_HINT:
+        return ("KICKED", _HUMAN_HINT)
     return ("FAILED", f"游戏节点 {host}:{port} 未返回房间信息")
 
 
@@ -3473,7 +3740,7 @@ def node_session(host, port, rid=None, depth=0, seen=None):
 # 看门狗在这里兜底：到点先打印原因，再退出（退出码走 EXIT_PROTO）。
 WATCHDOG_SECONDS = 90
 # 交互模式下每条查询都要重新计时，所以看门狗必须可取消：
-# 旧版是「睡够秒数就 os._exit」，在 REPL 里第一条查询的看门狗会把整个会话杀掉。
+# 否则「睡够秒数就 os._exit」会被 REPL 里第一条查询的计时杀掉整个会话。
 _WATCHDOG_LOCK = threading.Lock()
 _WATCHDOG_CANCEL = None
 
@@ -3531,11 +3798,42 @@ EXIT_NET = 2  # DNS/连接失败：bot 所在机器到中继不通
 EXIT_NO_ROOM = 3  # 房间不存在或已关闭
 EXIT_ROOM_BUSY = 4  # 房间已满 / 游戏已经开始
 EXIT_PROTO = 5  # 协议或链路异常（跳转环、解析失败、虚拟房号等）
+EXIT_HUMAN = 6  # 服务端要求人机接入验证，探针无法自动接入
+
+
+# 服务端人机接入验证的文案特征。命中即认定为「需要人工在客户端完成验证」，
+# 探针不做任何形式的自动应答或绕过。
+_HUMAN_CHECK_MARKERS = (
+    "接入确认码",
+    "交互验证",
+    "不得代答",
+    "绕过验证",
+)
+# 「请核对客户端版本」单看太泛（玩家名、地图名里都可能出现），
+# 只有和「重新连接 / 版本」一起出现时才算验证提示。
+_HUMAN_CHECK_PAIRS = (
+    ("核对客户端", "重新连接"),
+    ("核对客户端", "版本"),
+)
+
+
+def is_human_check(msg: str) -> bool:
+    """文案是否属于「服务端要求人机接入验证」。"""
+    m = str(msg or "")
+    if not m:
+        return False
+    if any(k in m for k in _HUMAN_CHECK_MARKERS):
+        return True
+    return any(a in m and b in m for a, b in _HUMAN_CHECK_PAIRS)
 
 
 def _exit_code_for_failure(msg: str) -> int:
     """把失败文案归类成退出码（文案见各处 [房间查询失败] 前缀行）。"""
     m = str(msg or "")
+    # 人机验证排最前：这类提示里常带「连接超时 / 重新连接」字样，
+    # 先判网络会把「要求人工验证」误报成「连不上」。
+    if is_human_check(m):
+        return EXIT_HUMAN
     if (
         "无法连接中继" in m
         or "连接中继失败" in m
@@ -3553,16 +3851,48 @@ def _exit_code_for_failure(msg: str) -> int:
     return EXIT_PROTO
 
 
+def _is_kick_text(msg: str) -> bool:
+    """117「服务器提示」里属于拒绝入房的那几种文案。
+
+    117 也用来发公告（「服务器将在 5 分钟后重启」），一律当失败会把正常房
+    判成查不到，所以只认明确的拒绝措辞。
+    """
+    m = str(msg or "")
+    low = m.lower()
+    return (
+        "No free slots" in m
+        or "already been started" in low
+        or "already started" in low
+        or "client is different" in low
+        or "newer then the server" in low
+        or "banned" in low
+        or "封禁" in m
+        or "不存在" in m
+        or "已关闭" in m
+        or "找不到这个服务器" in m
+        or "需要密码" in m
+        or "password required" in low
+    )
+
+
 def _handle_kicked(reason, sock=None):
     """统一处理被踢出房间的提示 (sock 非空时先关闭连接)"""
     reason = (reason or "").strip()
     low = reason.lower()
-    if "No free slots" in reason:
-        print("[房间查询失败] 房间已满，无法加入")
+    if is_human_check(reason):
+        # 服务端要求由玩家本人在客户端完成验证：探针只如实报告，不自动应答
+        _out(
+            "[房间查询失败] 该服务器启用了人机接入验证（或客户端白名单），"
+            "探针无法自动完成，需玩家本人在客户端接入"
+        )
+        _out(f"　　服务端提示：{reason}")
+        code = EXIT_HUMAN
+    elif "No free slots" in reason:
+        _out("[房间查询失败] 房间已满，无法加入")
         code = EXIT_ROOM_BUSY
     elif "游戏已经开始" in reason or "already been started" in low or "already started" in low:
         # RELAY-CN 走错房间(节点默认房)时也会返回这句, 需加提示
-        print("[房间查询失败] 游戏已经开始，无法加入")
+        _out("[房间查询失败] 游戏已经开始，无法加入")
         code = EXIT_ROOM_BUSY
     elif (
         "client is different" in low
@@ -3571,20 +3901,20 @@ def _handle_kicked(reason, sock=None):
         or "can not be synchronized" in low
     ):
         # 服务端小版本更新后客户端跟不上：不是房间问题，也不该报成「未归类」
-        print("[房间查询失败] 客户端版本和服务器不一致（服务端已升级，探针客户端较旧），无法加入")
+        _out("[房间查询失败] 客户端版本和服务器不一致（服务端已升级，探针客户端较旧），无法加入")
         code = EXIT_PROTO
     elif "绕过ID分配中心" in reason:
         # 178 跳到节点后节点拒绝: 房间已迁移/需走分配中心, 探针无法直连
-        print("[房间查询失败] 该房间当前无法直接查询（RELAY-CN 节点限制，请稍后重试或联系房主）")
+        _out("[房间查询失败] 该房间当前无法直接查询（RELAY-CN 节点限制，请稍后重试或联系房主）")
         code = EXIT_PROTO
     elif (
         "找不到这个服务器" in reason or "cant find this server" in low or "不存在或已关闭" in reason
     ):
-        print("[房间查询失败] 房间不存在或已关闭")
+        _out("[房间查询失败] 房间不存在或已关闭")
         code = EXIT_NO_ROOM
     else:
-        print(f"[房间查询失败] {reason}")
-        # 复用同一套判据：以前这里一律「未归类」，等于把房间问题丢给用户猜
+        _out(f"[房间查询失败] {reason}")
+        # 复用同一套判据：否则一律「未归类」，房间问题会变成无法定位的提示
         code = _exit_code_for_failure(reason)
     if sock is not None:
         sock.close()
@@ -3603,36 +3933,37 @@ def relay_main():
     try:
         socket.gethostbyname(host)
     except OSError:
-        print(f"[房间查询失败] 房号 {RID.upper()} 所属中继({host})不存在，请检查房号首字母")
+        _out(f"[房间查询失败] 房号 {RID.upper()} 所属中继({host})不存在，请检查房号首字母")
         sys.exit(EXIT_NET)
     result = relay_session(host, 5123, RID)
     if isinstance(result, tuple) and result[0] == "KICKED":
         _handle_kicked(result[1])
     if isinstance(result, tuple) and result[0] == "CAPTCHA":
-        print(f"[房间查询失败] {result[1]}")
-        sys.exit(_exit_code_for_failure(result[1]))
+        _out(f"[房间查询失败] {result[1]}")
+        sys.exit(EXIT_HUMAN)
     if isinstance(result, tuple) and result[0] == "LOOP":
         if DEBUG_MODE:
             _dprint(f"!! {result[1]}")
-        print("[房间查询失败] 房间查询链路异常（跳转环路），该房间当前无法查询")
+        _out("[房间查询失败] 房间查询链路异常（跳转环路），该房间当前无法查询")
         sys.exit(EXIT_PROTO)
     if isinstance(result, tuple) and result[0] == "FAILED":
-        print(f"[房间查询失败] {result[1]}")
+        _out(f"[房间查询失败] {result[1]}")
         sys.exit(_exit_code_for_failure(result[1]))
     if result is None:
-        print("[房间查询失败] 房间不存在或已关闭")
+        _out("[房间查询失败] 房间不存在或已关闭")
         sys.exit(EXIT_NO_ROOM)
     got_106, got_115 = result
     finish_report(None, got_106, got_115, RID)
 
 
 def _reset_query_state():
-    """清空上一次查询留下的展示用状态（`.id` 与 K 服人数/上限）。"""
-    global _LAST_ROOM_ID, _K_ROOM_ID, _K_ROOM_CAPACITY, _K_ROOM_PLAYERS
+    """清空上一次查询留下的展示用状态（房号与 K 服人数/上限）。"""
+    global _LAST_ROOM_ID, _K_ROOM_ID, _K_ROOM_CAPACITY, _K_ROOM_PLAYERS, _HUMAN_HINT
     _LAST_ROOM_ID = ""
     _K_ROOM_ID = ""
     _K_ROOM_CAPACITY = None
     _K_ROOM_PLAYERS = None
+    _HUMAN_HINT = ""
 
 
 def main():
@@ -3651,7 +3982,7 @@ def main():
     cleanup_old_bin_files()
     if LIST_JSON:
         # 抓取过程中会 print 各种 [qroom]/[master]/[DEBUG] 诊断行；
-        # 这些一律改投 stderr，stdout 只留一行 JSON，否则父进程 json 解析必炸。
+        # 这些一律改投 stderr，stdout 只留一行 JSON，否则父进程 json 解析会失败。
         import contextlib
 
         with contextlib.redirect_stdout(sys.stderr):
@@ -3678,7 +4009,7 @@ def main():
     if not RID:
         print(HELP_TEXT)
         return
-    # 每次查询前清空上次的 `.id` / K 服状态，避免串到下一次查询
+    # 每次查询前清空上次的房号 / K 服状态，避免串到下一次查询
     _reset_query_state()
     _start_watchdog()
     if DIRECT_TARGET:
@@ -3686,9 +4017,9 @@ def main():
         return
     if RID.startswith("u_"):
         # u_ 是列表接口给 Auto Server 房用的虚拟房号，没有真实房间 ID，
-        # 探针拿它进不了房。这里以前静默 return —— 父进程只看到「零输出」，
+        # 探针无法进房。此处不能静默 return —— 父进程只看到「零输出」，
         # 只能回一句「查房无响应」，把「用错房号」误报成「网络故障」。
-        print(
+        _out(
             f"[房间查询失败] {RID} 是列表里的虚拟房号（Auto Server 房），"
             f"没有真实房号可用；请用 /铁锈列表 的序号查，或直连它的 IP:端口"
         )
@@ -3699,9 +4030,9 @@ def main():
 
 # ================================================================ 交互模式
 #
-# 为什么要有：这个文件是插件背后的协议核心，但平时只能用一次性参数调它
-# （`python3 room_info.py r5132 --debug`）。换个房号、改个筛选、开关玩家列表
-# 都要重敲一整行，而且每次都重新 DNS + 握手。交互模式下进程常驻，一条一条试，
+# 用途：本文件是插件背后的协议核心，平时只能用一次性参数调用
+# （`python3 room_info.py r5132 --debug`）。换房号、改筛选、开关玩家列表
+# 都要重敲整行，且每次都重新 DNS + 握手。交互模式进程常驻，可逐条试，
 # 探针名字 / 玩家列表 / 推广 / 调试这些设置也保持在会话里。
 #
 # 输出约定：提示符与状态行走 stderr，查询结果走 stdout（与一次性模式一致），
@@ -3714,6 +4045,7 @@ EXIT_NAMES = {
     EXIT_NO_ROOM: "房间不存在或已关闭",
     EXIT_ROOM_BUSY: "房间已满或已开局",
     EXIT_PROTO: "协议/链路异常",
+    EXIT_HUMAN: "需要人工验证",
 }
 
 REPL_HELP = """\
@@ -3739,6 +4071,7 @@ REPL_HELP = """\
   status                 查看当前设置
   help / ?               本帮助
   exit / quit / q / Ctrl-D  退出
+  Ctrl-C                 放弃当前这行输入（查询中则中止本次查询）
 """
 
 
@@ -3767,8 +4100,11 @@ def _repl_onoff_checked(value, current):
 
 
 def _repl_banner():
-    _dprint(f"铁锈战争协议工具 · 交互模式（客户端 1.15，接口 {ROOM_INFO_API}）")
-    _dprint("直接敲房号即可查询，help 看全部指令，Ctrl-D 退出。")
+    _dprint(_bold(_cyan(f"铁锈战争协议工具 · 交互模式（客户端 1.15，接口 {ROOM_INFO_API}）")))
+    _dprint(
+        f"直接敲房号即可查询，{_bold('help')} 看全部指令，"
+        f"{_bold('Ctrl-C')} 放弃当前输入，{_bold('exit')} 或 {_bold('Ctrl-D')} 退出。"
+    )
 
 
 def _repl_status():
@@ -3837,9 +4173,9 @@ def _repl_query(target, opts=None):
     DIRECT_TARGET = target if _DIRECT_RE.match(target) else None
     _reset_query_state()
     if target.startswith("u_"):
-        # 先判目标再改设置：手滑打了 `u_xxx --promote 广告` 时不能留下推广文案，
+        # 先判目标再改设置：目标非法（如 `u_xxx --promote 广告`）时不能留下推广文案，
         # 否则下一条真查询会往真人房发消息。
-        print(
+        _out(
             f"[房间查询失败] {target} 是列表里的虚拟房号（Auto Server 房），"
             f"没有真实房号可用；用 list --addr / json 看它的 IP:端口/UUID 再直连"
         )
@@ -3868,27 +4204,30 @@ def _repl_query(target, opts=None):
         elif e.code is None:
             code = EXIT_OK
         elif isinstance(e.code, str):
-            # sys.exit("文本")：文本就是失败原因，静默吞掉会让失败看起来毫无征兆
-            print(f"[房间查询失败] {e.code}")
+            # sys.exit("文本")：文本就是失败原因，静默吞掉会让失败无任何征兆
+            _out(f"[房间查询失败] {e.code}")
             code = EXIT_UNKNOWN
         else:
             code = EXIT_UNKNOWN
     except KeyboardInterrupt:
         code = None
     except Exception as e:  # 交互模式下任何意外都不该带走整个会话
-        print(f"[房间查询失败] 交互模式内部错误：{type(e).__name__}: {e}")
+        _out(f"[房间查询失败] 交互模式内部错误：{type(e).__name__}: {e}")
         code = EXIT_UNKNOWN
     finally:
         _cancel_watchdog()
         try:
-            sys.stdout.flush()  # 结果先落地，别让 `[结束]`（stderr）抢到前面
+            sys.stdout.flush()  # 结果先落地，否则 `[结束]`（stderr）会抢先输出
         except Exception:
             pass
     cost = time.time() - started
     if code is None:
         _dprint(f"[结束] 被中断，用时 {cost:.2f} 秒")
     else:
-        _dprint(f"[结束] 用时 {cost:.2f} 秒 · 退出码 {code}（{EXIT_NAMES.get(code, '未知')}）")
+        _dprint(
+            f"{_dim('[结束]')} 用时 {cost:.2f} 秒 · "
+            f"{_exit_code_color(code)(f'退出码 {code}')}（{EXIT_NAMES.get(code, '未知')}）"
+        )
     return code
 
 
@@ -4021,20 +4360,22 @@ def interactive_shell():
         # `-i r5132` / `-i --list-json`：交互模式优先，但这些参数确实没用上
         _dprint(f"[提示] 交互模式下忽略启动参数：{' '.join(_ignored)}（进去以后直接敲房号即可）")
     # 管道喂指令时（room_info.py -i < cmds.txt）不刷提示符，输出更干净
-    show_prompt = sys.stdin.isatty()
+    # stdout 也要是终端：`-i > out.txt` 时把提示符写出去会污染结果文件
+    show_prompt = sys.stdin.isatty() and sys.stdout.isatty()
+    # 提示符交给 input()：readline 知道它的位置，查询输出后行编辑、上下键、Ctrl-C 才能正常重绘。
+    # 自己 write 到 stderr 会让 readline 以为当前行是空的，输出一多就跑版。
+    prompt = _cyan("rwinfo> ") if show_prompt else ""
     while True:
         try:
-            if show_prompt:
-                sys.stderr.write("rwinfo> ")
-                sys.stderr.flush()
-            # 必须用 input()：只有它走 readline 模块，sys.stdin.readline() 会绕过，
-            # 上面 import readline 就白装了（上下键会变成 ^[[A 字面量）。
-            line = input()
+            # 必须用 input()：只有它走 readline 模块；sys.stdin.readline() 会绕过，
+            # 上面 import readline 便无效（上下键会变成 ^[[A 字面量）。
+            line = input(prompt) if show_prompt else input()
         except EOFError:  # Ctrl-D
             _dprint("")
+            _dprint(_dim("[结束] 交互模式退出"))
             return
-        except KeyboardInterrupt:
-            sys.stderr.write("\n")
+        except KeyboardInterrupt:  # Ctrl-C：只放弃当前输入，不退出
+            _dprint(_dim("[提示] 已放弃当前输入（exit 或 Ctrl-D 退出）"))
             continue
         line = line.strip()
         if not line or line.startswith("#"):
@@ -4127,13 +4468,13 @@ def interactive_shell():
                 r"[A-Za-z][A-Za-z0-9_\u4e00-\u9fff]{0,23}", cmd
             ):
                 # 裸房号直查：字母房 r5132 / hytvvi，也支持自定义房号
-                # （中继字母 + 汉字，如 s九一大魔王）。这里只做形态过滤，
+                # （中继字母 + 汉字，如 s九一大魔王）。此处只做形态过滤，
                 # 合法性由探针判断。
                 # 裸房号 / 裸地址：最常见的用法，不要求 query 前缀。
-                # 全字母的词（foobar）也可能是房号（hytvvi 就是），所以不能按形态拒绝，
-                # 只能等它查失败了再提示一句「输入 help」。
+                # 全字母的词（foobar）也可能是房号（如 hytvvi），因此不能按形态拒绝，
+                # 只能在查询失败后提示「输入 help」。
                 _code = _repl_query(cmd, args)
-                if _code not in (0, None):
+                if _code not in (0, None, EXIT_HUMAN):
                     _dprint("[提示] 如果这不是房号，输入 help 看指令。")
             else:
                 _dprint(

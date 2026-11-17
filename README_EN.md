@@ -6,59 +6,16 @@
 [![Python](https://img.shields.io/badge/Python-3.9%2B-green)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-Detects Rusted Warfare room IDs in messages and dispatches probe bots (`<prefix>探针01~99`, prefix configurable) to join rooms and report back: room version / map / credits / fog / no-nukes / multiplier / mode / unit cap / default unit / shared control / spectators / team lock / player count / player list.
+Detects Rusted Warfare room IDs in messages and dispatches probe bots (`<prefix>探针01~99`) to join rooms and report back: room version / map / credits / fog / no-nukes / multiplier / mode / unit cap / default unit / shared control / spectators / team lock / player count / player list / room short ID.
 
 Protocol notes in [PROTOCOL.md](PROTOCOL.md), version history in [CHANGELOG.md](CHANGELOG.md).
 
----
-
 ## Features
 
-- **Auto room-ID detection**, try everything and send only on success, silently drop on failure, no filter wordlist needed
-  - Numeric rooms: `o` `q` `r` `s` + digits, e.g. `r5132`, `s1024`, `o9999`, `q7777`
-  - Alphabetic rooms: other leading letters + pure letters, e.g. `hytvvi`, `aabcde`, `babc`
-  - Custom rooms: relay letter + CJK characters, e.g. `s九一大魔王`. **Explicit command only** —
-    auto-parsing never picks these up, because the shape can't be enumerated and would
-    misfire on ordinary sentences (letter + Chinese) and burn probe slots.
-  - The two paths are deliberately asymmetric: auto-parsing keeps the fixed regexes above
-    (rather miss than misfire); `/铁锈查房` **force-parses** — a single letter-leading word is
-    queried as-is, and the probe explains the failure (no such room / already started / timeout).
-    If nothing can be parsed the command says so explicitly instead of staying silent.
-  - Both forms require the whole token to be ≥ 3 chars; bare digits, mixed forms (`a1b2c3`), URL fragments and `u_` prefixes are rejected
-- **Room list**: `/铁锈列表` paged browser
-- **Look up straight from the list**: `/铁锈查房 <index>` reuses the last list result
-- **Localized failure reasons**: full room / game started / room locked return clear hints
-- **Auto-retry on probe-name filter**: configurable count (default 3), retry names carry each probe index to avoid collisions
-- **Auto-recall**: room info and retry progress can be auto-recalled, per-group / per-private config, off by default
-- **Probe pool**: `<prefix>探针01`~`<prefix>探针99` concurrent reuse (prefix configurable, default `ABAB`), max 5 room IDs per message (configurable via `probe_max_per_msg`)
-- **Room cooldown**: same room ID not re-parsed within 10 seconds
-- **Permission control**: global switch plus white/black lists, per-user (`@userID`) and per-group (`#groupID`)
-- **Fully self-contained**: built-in protocol probe, no third-party deps, no hardcoded absolute paths
-
-### Detection basis
-
-The client (`ae.smali` lines 7129~7139) only checks six conditions before treating the input as a
-room ID: non-empty, no `:` `.` `/` `\`, and not `localhost`. It then takes the **first character**
-and builds `<first letter>.relay.corrodinggames.com/<room ID>`, so the client itself imposes no
-character restrictions.
-
-The two accepted forms are therefore determined by the **relay servers**, verified on-device:
-
-| Leading letters | Form | Example |
-|---|---|---|
-| `o` `q` `r` `s` | numeric only | `r5132`, `s1024`, `o9999`, `q7777` |
-| other letters (`a` `b` `h` …) | pure alphabetic only | `hytvvi`, `aabcde`, `babc` |
-
-Measured relay availability:
-
-| Letter | Relay | Status |
-|--------|-------|--------|
-| a / b / h | Official Relay US1 / US2 / ASIA2 | reachable |
-| o / q / r / s | RELAY-CN / Fancy-CN / Tiexiu.xyz | reachable |
-| c / g / j / v | DNS exists, port closed | connect fails |
-| others | no DNS record | resolve fails |
-
----
+- **Auto room-ID detection**: numeric rooms (`o`/`q`/`r`/`s` + digits) and alphabetic rooms, ≥3 chars; failures are dropped silently
+- Paged browser with `/铁锈列表`; `/铁锈查房 <index>` looks up a room from the last list
+- Configurable probe names with auto-retry on name filtering; auto-recall, room cooldown, concurrent probe pool (`探针01~99`)
+- In-room promotion (off by default), white/black list permission control per user and per group, built-in protocol probe with no third-party dependencies
 
 ## Install
 
@@ -68,75 +25,63 @@ Install from the AstrBot plugin store, or via WebUI:
 2. Paste `https://github.com/wcnmamrs/astrbot_plugin_rwinfo` to auto-fetch, or upload a zipped package
 3. Enable the plugin after install
 
-If `room_info.py` is missing or too old, it is downloaded from the repository.
-
----
+Requires AstrBot and Python 3.9+, no third-party packages. If `room_info.py` is missing or too old, it is downloaded from the repository.
 
 ## Commands
 
-Two permission tiers:
-
-- **Query** (help / list / lookup / paging): available to everyone, gated by the plugin's own
-  allow/deny lists. With no lists configured, everyone in the group can use them.
-- **Config & diagnostics**: AstrBot admin only (`PermissionType.ADMIN`).
+Two permission tiers that do not overlap: **query** commands (help / list / lookup / paging) are available to everyone and are gated by the plugin's own white/black lists, mixed mode and private-chat policy — with no lists configured everyone in the group can use them; **config and diagnostics** commands are AstrBot admin only (`PermissionType.ADMIN`). An unrecognized `/铁锈xxx` command automatically returns the help menu.
 
 | Command | Permission | Description |
 |---------|-----------|-------------|
 | `/铁锈查房帮助` | Everyone | Show command menu. Aliases `/铁锈查房菜单` `/铁锈帮助` `/rwhelp` |
 | `/铁锈列表 [args]` | Allowlist | Paged room list. Aliases `/房间列表` `/铁锈房列表` `/rwlist` |
-| `/铁锈下一页` `/铁锈上一页` | Allowlist | Page navigation |
-| `/铁锈查房 <index\|roomID\|IP:port>` | Allowlist | Explicit lookup, including CNKD K rooms such as `RKC497`, or a raw `IP` / `IP:port` |
-| `/铁锈查房 状态` | Everyone | Today's query count, success rate, failure categories, latency and K-room success rate |
+| `/铁锈下一页` `/铁锈上一页` | Allowlist | Room list paging |
+| `/铁锈查房 <index\|roomID\|IP:port>` | Allowlist | Explicit lookup, including CNKD K rooms such as `RKC497` and raw `IP:port` |
+| `/铁锈查房 状态` | Everyone | Today's query count, success rate, failure categories and latency |
+| `/铁锈探针时解 <5-char suffix>` | Everyone | Decode the join time embedded in a probe name, e.g. `/铁锈探针时解 fkhk3`; a full probe name `<prefix>探针01_fkhk3` also works |
 | `/铁锈全局解析 开\|关` | Admin | Global parsing switch, default on |
-| `/铁锈模式 白\|黑\|混合` | Admin | List mode, default black. In mixed mode `@` takes precedence over `#`, same name is exclusive |
-| `/铁锈白名 +@userID` `/铁锈白名 +#groupID` | Admin | Whitelist add/remove, prints list with no args |
-| `/铁锈黑名 +@userID` `/铁锈黑名 +#groupID` | Admin | Blacklist add/remove, prints list with no args |
-| `/铁锈私聊策略 白\|黑` | Admin | Mixed-mode private default policy |
+| `/铁锈模式 白\|黑\|混合` | Admin | List mode, default black; in mixed mode `@` takes precedence over `#`, names are exclusive |
+| `/铁锈白名 +@userID` `/铁锈白名 +#groupID` | Admin | Whitelist add/remove, prints the list with no args |
+| `/铁锈黑名 +@userID` `/铁锈黑名 +#groupID` | Admin | Blacklist add/remove, prints the list with no args |
+| `/铁锈私聊策略 白\|黑` | Admin | Mixed-mode private-chat default policy |
 | `/铁锈私聊开关 开\|关` | Admin | Enable private-chat lookup, default on |
 | `/铁锈玩家列表 开\|关` | Admin | Show player list, default off |
-| `/铁锈重试 [0-10]` | Admin | Retry count when probe name is filtered |
-| `/铁锈查房调试 [category]` | Admin | Runtime diagnostics (session / recall / probe / list / config / official) |
-| `/铁锈查房调试菜单` | Admin | List adjustable settings and current values |
-| `/铁锈压缩 <scope>` | Admin | Fold scope: `none` / `room` / `list` / `diag` / `help` / `all` |
-| `/铁锈官机探测` | Admin | Detect the official-bot channel |
-| `/铁锈官机测试` | Admin | Send a test message through the official-bot channel |
-| `/铁锈探针时解 <suffix>` | Everyone | Decode the timestamp embedded in a probe name |
-| `/铁锈忽略 [列出\|+\|-\|测试\|开\|关]` | Admin | Ignore regex: matching messages are never parsed for room IDs. 9 built-in rules cover room reports / lists / error dumps from this plugin and other bots; add your own with `+ <regex>` |
-| `/铁锈撤回 列出\|+\|-\|重置` | Admin | Auto-recall config, `key:delay` entries, `*` expands to all known groups. See the Chinese README for the full syntax |
-
-Unrecognized `/铁锈xxx` commands automatically return the help menu.
+| `/铁锈重试 [0-10]` | Admin | Retry count when a probe name is filtered |
+| `/铁锈压缩 [scope]` | Admin | Message fold scope |
+| `/铁锈撤回 [列出\|+\|-\|重置]` | Admin | Auto-recall config. `列出` shows all, `+`/`-` add or remove, `重置` clears; no args shows this session; `+ *:60` expands to every known group |
+| `/铁锈忽略 [列出\|+\|-\|测试\|开\|关]` | Admin | Ignore regexes: matching messages are never parsed. 9 built-in rules block this plugin's and common lookup bots' output; add your own with `+ <regex>` |
+| `/铁锈查房调试 [category]` | Admin | Print runtime state: sessions, recall, probe pool, list cache, config, official bot |
+| `/铁锈查房调试菜单` | Admin | Show adjustable internal values and how to change them |
+| `/铁锈官机探测` | Admin | Dump the official-bot channel structure (read-only) |
+| `/铁锈官机测试` | Admin | Send a Markdown sample to verify the channel |
 
 ### Room list
 
 ```
-/铁锈列表 [page]|[waiting|started]
-         |[full|notfull]|[player|official]|[search keyword]|[refresh]
+/铁锈列表 [page]|[filters]|[搜索 keyword]|[刷新]
 /铁锈下一页 / 铁锈上一页
-e.g. /铁锈列表 房间中 真人 2
 ```
 
 | Argument | Description |
 |----------|-------------|
-| page | Number, jump to that page |
-| `房间中` / `游戏中` | Filter by room status |
-| `满` / `不满` | Filter by whether the room is full |
-| `真人` / `官方` | Filter by data source |
+| page | Number, `2` means page 2 |
+| `房间中` / `游戏中` | Room status |
+| `满` / `不满` | Whether the room is full |
+| `真人` / `官方` | Data source |
 | `搜索 keyword` | Fuzzy search by host name / map name |
 | `刷新` | Ignore cache and refetch |
 
-**Filter inheritance**
+Arguments combine freely, e.g. `/铁锈列表 房间中 真人 2` is page 2 of the "waiting + player-hosted" result.
 
-| Usage | Behavior |
+| Usage | Filter inheritance |
 |-------|----------|
 | `/铁锈列表` (no arguments) | Fresh query, all filters cleared |
 | `/铁锈列表 2` (page only) | Reuse last filters, jump to page 2 |
-| `/铁锈下一页` / `/铁锈上一页` | Reuse last filters when paging |
+| `/铁锈下一页` `/铁锈上一页` | Reuse last filters (same as passing only a page) |
 | `/铁锈列表 房间中` (with filters) | Replace all old filters with this query's |
 
-Filter state is isolated per "group + user"; **page number never expires**
-and survives a plugin restart via AstrBot KV persistence.
+Filter and page state is isolated per "group + user" and persisted through AstrBot KV; page numbers never expire, so paging can continue after a plugin restart. Display format (5 entries per page by default):
 
-Display format (5 entries per page by default):
 ```
 1. 萧逸  1/10  房间中
    map: Crossing Large (10p)
@@ -144,8 +89,14 @@ Display format (5 entries per page by default):
    map: Two Sides Remake (10p)
 ```
 
-When the room name is `Unnamed`, the host name is shown instead (CSV column 1 is the room name,
-column 7 is the host name).
+When the room name is `Unnamed` the host name is shown instead (CSV column 1 is the room name, column 7 is the host name). Two sources are merged: player rooms first, then waiting rooms, then by player count descending:
+
+| Source | Description |
+|--------|-------------|
+| Q Room List | `https://www.rtsbox.cn/api/paiwei/room_last.php`, player-hosted rooms with host / map / players / status |
+| Official | Full official `masterserver` list (Auto Server and relay rooms), placed after player rooms |
+
+Only queryable player rooms are kept: link entries, malformed fields, empty relay placeholders, promotional wording, and entries whose player cap exceeds the game limit (100 max) are skipped. Room data is shared globally (60-second sliding expiry); the index-to-room mapping lasts 10 minutes and is rebuilt silently from the same page afterwards.
 
 ### Room lookup
 
@@ -155,159 +106,139 @@ column 7 is the host name).
 
 | Form | Description | Example |
 |---|---|---|
-| index | Number from the latest `/铁锈列表` result (per current page; mapping valid 10 min, auto-rebuilt silently when stale) | `/铁锈查房 2` |
+| index | Number from the latest `/铁锈列表` result (per current page, mapping valid 10 min, silently rebuilt when stale) | `/铁锈查房 2` |
 | numeric room | `o` `q` `r` `s` + digits, at least 3 chars | `/铁锈查房 r5132` |
-| alphabetic room | Other letters, pure alphabetic, at least 3 chars | `/铁锈查房 hytvvi` |
-| custom room (explicit only) | Relay letter + CJK characters (letters/digits allowed), 3–24 chars | `/铁锈查房 s九一大魔王` |
+| alphabetic room | Other leading letters, pure alphabetic, at least 3 chars | `/铁锈查房 hytvvi` |
+| custom room (explicit only) | Relay letter + CJK characters (letters/digits allowed), 3~24 chars | `/铁锈查房 s九一大魔王` |
 | any custom shape (explicit only) | A single word starting with a letter (`rsh`, `abc123`, `s4932XYZ`, …) | `/铁锈查房 rsh` |
-| K room | CNKD share ID `RKC` / `KC` + 2–8 digits, or a full share link | `/铁锈查房 RKC497` |
+| K room | CNKD share ID `RKC` / `KC` + 2~8 digits, or a full share link | `/铁锈查房 RKC497` |
 | direct | `IP` or `IP:port` (port defaults to 5123) | `/铁锈查房 45.76.27.30:5125` |
 
-**Daily query statistics**
+The room ID is extracted as its core, so surrounding text does not matter: `R95898缺一` / `q12345来人` / `r5132缺一` → `r95898` / `q12345` / `r5132`; trailing letters are dropped `r5132abc` → `r5132`; a repeated prefix is collapsed `rr5132` → `r5132`; two IDs written back to back are split `s1024r5132` → `s1024`, `r5132` (`r5132r5132` is deduplicated).
 
-`/铁锈查房 状态` (also `统计` or `status`) reports today's total, successes,
-failures, success rate, average latency, K-room success rate, failure categories
-and probe usage. Explicit and automatic lookups are included; probe-name retries
-are counted as actual probe attempts. Data lives in
-`data/plugin_data/astrbot_plugin_rwinfo/stats.json` (never in the plugin directory),
-survives reloads, and resets on the next local day. A legacy `.rwinfo_stats.json`
-in the plugin directory is migrated read-only on first load (the old file is kept).
+Auto-detection and the command follow different rules: auto-parsing only accepts the fixed regexes above (numeric / alphabetic / K rooms), because room-ID shapes cannot be enumerated and mixing them into auto-parsing would misread ordinary sentences and waste probe slots — better to miss than to misfire. `/铁锈查房` force-parses: any single letter-leading word (CJK, kana, emoji and hyphens included, e.g. `h阿巴阿巴` / `rsh` / `s4932XYZ`) is queried as-is instead of being split by regex; failures are explained by the probe (no such room / already started / no response), and an argument that yields no room ID produces an explicit error rather than silence.
 
-**Permissions**
-
-Both `/铁锈列表` and `/铁锈查房` follow the white/black lists: with the default `black`
-mode and empty lists, everyone in the group can use them. Admins can narrow access with
-`/铁锈模式`, `/铁锈白名` and `/铁锈黑名`. When blocked, the reason is reported instead of
-being silently dropped.
-
-**Automatic detection vs explicit lookup**
-
-| | Auto-detect (room ID posted in chat) | Explicit lookup |
+| | Auto-detect (room ID posted in chat) | Explicit lookup (`/铁锈查房`) |
 |---|---|---|
 | Allow raw IP | No | Yes |
-| On failure | **Silent**, nothing posted | **Reason reported** |
+| On failure | Silent, nothing posted | Reason reported |
 | Purpose | Avoid spam from English words misread as room IDs | User asked explicitly, must answer |
 
-In auto-detect mode only failures that imply "the room really exists" are reported
-(full / locked / game already started / banned); "room not found", "relay not responding"
-and "address unreachable" are silently dropped.
+Auto-detection only reports failures that imply the room really exists (full / locked / game already started / banned); "room not found", "relay not responding" and "address unreachable" are dropped silently. `房号冷却秒` (default 10) is isolated per session and stops the same room ID from being queried repeatedly in one conversation.
 
-Two sources merged, player rooms first, then waiting rooms, then by player count descending:
+**Daily query statistics**: `/铁锈查房 状态` (also `统计` or `status`) reports today's total, successes, failures, success rate, average latency, success latency, failure categories and current probe usage; explicit and automatic lookups are both counted, and probe-name retries count as actual attempts. Data lives in `data/plugin_data/astrbot_plugin_rwinfo/stats.json` (never in the plugin directory), survives reloads and resets on the next local day; a legacy `.rwinfo_stats.json` is migrated read-only on first load (the old file is kept).
 
-| Source | Description |
-|--------|-------------|
-| Q Room List | `https://www.rtsbox.cn/api/paiwei/room_last.php`, player-hosted rooms with host / map / players / status |
-| Official | Full official `masterserver` list (Auto Server + relay rooms), placed after player rooms |
+### Ignore regex
 
-Only queryable player rooms are kept: link entries, malformed fields, empty relay
-placeholders, promotional wording, and entries whose player cap exceeds the game
-limit (100 max) are skipped.
+Auto-detection only asks "does this message contain a room ID", but room reports, room lists and error dumps posted by other bots (or by another instance of this plugin) are full of room IDs; without a guard they cascade into bots querying each other. Two layers, and a hit on either means the whole message is not parsed:
 
-Cache: room data is shared globally with a 60-second sliding expiry; paging and filter state are isolated per "group + user", kept in memory (optionally mirrored to KV) and never expire. The index-to-room mapping lasts 10 minutes.
+| Layer | Content | Editable |
+|---|---|---|
+| 9 built-in rules | Room info blocks (fields with a colon such as `房间版本：` `地图名称：`), field lines (`ID：` `当前人数：`), room-ID labels (`房号：r5132`), room lists, error reports (`[房间查询失败]` `[插件错误]` `查房无响应`), probe output, relay diagnostics, recall receipts, plugin UI | No |
+| Custom | Config key `忽略正则`, one Python regex per entry, multi-line matching | Yes |
 
----
+```
+/铁锈忽略                     show built-in/custom rules
+/铁锈忽略 + <regex>           add (several lines at once allowed, compile is validated first)
+/铁锈忽略 - <index|regex>     remove
+/铁锈忽略 测试 <text>         show which rule this text would hit
+/铁锈忽略 开|关               master switch (on by default)
+```
+
+It only affects auto-detection; an explicit `/铁锈查房 s5132` still runs. Built-in rules require the field name to be followed by a colon (or a table separator), so `s5132 地图名称是什么` still triggers while `地图名称：Crossing 10p` is blocked.
 
 ## Configuration
 
-Auto-persisted by the AstrBot framework, editable via WebUI or commands.
+Auto-persisted by the AstrBot framework, editable via WebUI, and saved immediately when changed by command.
 
-| Key | Description |
-|-----|-------------|
-| `global_enabled` | Global parsing switch, default true |
-| `mode` | List mode: `white` / `black` / `mixed`, default black |
-| `白名单` / `黑名单` | White/black lists (user/group) |
-| `混合_白名单` / `混合_黑名单` | Mixed-mode independent lists; the plain lists stay intact when switching back |
-| `混合_私聊策略` | Mixed-mode private policy: `white`=block if not whitelisted / `black`=block if blacklisted |
-| `私聊启用` | Enable private-chat lookup, default true |
-| `debug` | Enable debug logging |
-| `官Q模式` | Use QQ official-bot layout (Markdown cards + buttons), default false. Keep off for third-party bots |
-| `压缩范围` | Fold scope: `none` / `room` / `list` / `diag` / `help` / `all`, default none. Third-party bots fold via a forward card; official bots fold via a Markdown code block |
-| `指令唤醒词` | Must match AstrBot's global wake word, default `/` |
-| `显示项目地址` | Show the project address, default true. Official bot = button at the card bottom (room info / room list only); third-party bot = small dotted line at the end of content messages (no footer on command replies or debug output) |
-| `调试菜单` | Enable categorized debug output, default true |
-| `max_players_display` | Max players shown, folds beyond, default 10 |
-| `show_players` | Show player list, default false |
-| `retry_times` | Retry count when probe name filtered, 0-10, default 3 |
-| `list_page_size` | Room list page size, default 5 (controls message length only, no total room limit) |
-| `list_default_full` | Default full-room filter, `hide` hides full rooms |
-| `probe_max_per_msg` | Max probes per message, default 5 (1-20) |
-| `探针名前缀` | Probe name prefix, default `ABAB`. 1-4 chars, CJK/letters/digits/`_`/`-` only |
-| `推广开关` | Send project URL when a probe enters a room, default false |
-| `推广冷却秒` | Per-room promo cooldown, default 180 |
-| `房号冷却秒` | Per-room lookup cooldown, default 10 |
-| `bin_cleanup_enabled` | Enable periodic bin cache cleanup while the plugin runs, default true |
-| `bin_cleanup_interval_hours` | Cleanup check interval in hours, default 24 (once a day), min 1 |
-| `bin_cleanup_max_age_hours` | Only delete bin files older than N hours, default 1 |
-| `机器人QQ号` | Bot QQ, only used as sender uin for forward cards. Empty = auto-detect |
-| `冷却提示` | Reply when a room is still cooling down, default false |
-| `忽略开关` | Enable ignore rules, default true. When off, only the "plugin's own UI text" guard stays |
-| `忽略正则` | Custom ignore regexes (one per entry); matching messages are not parsed for room IDs. Default empty, maintain with `/铁锈忽略` |
-| `撤回` | Auto-recall config, `key:delaySeconds`; `#groupID` / `@userID` / `*`. An explicit `#groupID:off` entry means "closed here" and overrides an inherited `*` default |
+| Key | Default | Description |
+|-----|---------|-------------|
+| `global_enabled` | true | Global parsing switch |
+| `mode` | black | List mode: `white` / `black` / `mixed` |
+| `白名单` / `黑名单` | empty | White/black lists (users / groups) |
+| `混合_白名单` / `混合_黑名单` | empty | Mixed-mode independent lists; the plain lists stay intact when switching back |
+| `混合_私聊策略` | white | Mixed-mode private policy: `white` block if not whitelisted / `black` block if blacklisted |
+| `私聊启用` | true | Enable private-chat lookup handling |
+| `debug` | false | Enable debug logging |
+| `官Q模式` | false | Use the QQ official-bot layout (Markdown cards + buttons); keep off for third-party bots. Buttons appear only on lookup results, room lists and the help menu |
+| `压缩范围` | none | Fold scope: `none` / `room` / `list` / `diag` / `help` / `all`; third-party bots fold via a forward card, official bots via a Markdown code block |
+| `指令唤醒词` | `/` | Must match AstrBot's global wake word |
+| `显示项目地址` | true | Official bot = button at the card bottom; third-party bot = small dotted line at the end of content messages (not on command replies or debug output) |
+| `调试菜单` | true | Show debug commands in categorized form |
+| `max_players_display` | 10 | Max players shown, folded beyond |
+| `show_players` | false | Show the player list |
+| `retry_times` | 3 | Retry count when a probe name is filtered (0-10) |
+| `房号冷却秒` | 10 | Minimum interval for the same room ID in one session |
+| `冷却提示` | false | Reply while a room ID is still cooling down (fully silent by default) |
+| `probe_max_per_msg` | 5 | Max probes summoned per message (1-20) |
+| `探针名前缀` | ABAB | Prefix of `<prefix>探针01`, 1-4 chars, CJK/letters/digits/`_`/`-` only; invalid chars dropped, over-long values truncated, empty result falls back to the default |
+| `list_page_size` | 5 | Room list page size (controls message length only, no total room limit) |
+| `list_default_full` | empty | Default player-count filter; `hide` hides full rooms |
+| `推广开关` | false | Send the project URL after a probe joins a room |
+| `推广冷却秒` | 180 | Per-room promotion cooldown; switching rooms allows it immediately |
+| `机器人QQ号` | empty | Only used as the forward-card sender uin; empty = auto-detect |
+| `bin_cleanup_enabled` | true | Periodically clean the bin cache while the plugin runs |
+| `bin_cleanup_interval_hours` / `bin_cleanup_max_age_hours` | 24 / 1 | Cleanup check interval (hours, min 1) / only delete caches older than this many hours |
+| `忽略开关` | true | Enable ignore rules; when off only the "plugin's own UI text" layer remains |
+| `忽略正则` | empty | Custom ignore regexes (one Python regex per entry); matching messages are not parsed, maintained with `/铁锈忽略` |
+| `撤回` | empty | Auto-recall config, `key:delaySeconds`, enabled when written and disabled when deleted; e.g. `#123456:60` / `@3856554669:30` / `*:60` |
+
+Recall maintenance commands:
+
+| Command | Effect |
+|---|---|
+| `/铁锈撤回` / `/铁锈撤回 列出` | Show this session's config / list all entries |
+| `/铁锈撤回 + #group:60 @qq:30` | Add or modify (several entries allowed) |
+| `/铁锈撤回 - #group @qq` | Remove (several entries allowed) |
+| `/铁锈撤回 重置` | Clear everything |
+| `/铁锈撤回 + *:60` | Expand to every known group; `列出` shows the resulting coverage |
+| `/铁锈撤回 开\|关\|30` | Quick setting for this session |
+
+`关` also works in a group that merely inherits the `*` default: it leaves `*` untouched and writes an explicit `#groupID:off` entry for that group (shown as "closed (overrides default)" in `列出`); send `开` or a number of seconds to restore it.
+
+All of the following state is isolated per "session + user" and never leaks across groups:
+
+| State | Key format | Description |
+|---|---|---|
+| `/铁锈列表` paging and filters | `g#groupID@userID` (group) / `p@userID` (private) | Holds the real address cached for that page index; a leak would query the wrong room |
+| Room cooldown | `session_key\|roomID` | A room queried in group A does not affect group B |
+| Auto-recall config | `#groupID` / `@userID` / `*` | One list, prefix distinguishes groups and users, `*` acts as the global default in groups |
 
 ### Project address display
 
-`显示项目地址` is on by default, with different behaviour per platform:
+`显示项目地址` is on by default and behaves differently per platform:
 
 | Platform | How it shows |
 |---|---|
-| Official bot (`官Q模式` on) | An extra "项目主页" jump button under room info and room list cards; no address text in the body |
-| Third-party bot (`官Q模式` off) | **One extra dotted line at the end of every message** `⋯⋯ https://github.com/...` |
+| Official bot (`官Q模式` on) | An extra "项目主页" jump button at the card bottom of lookup results, room lists and the help menu; no address text in the body |
+| Third-party bot (`官Q模式` off) | One extra dotted line with the address `⋯⋯ https://github.com/...` at the end of lookup results, room lists and help; not appended to command replies, debug output or errors |
 
-The address is a hardcoded constant and cannot be changed. Turning `显示项目地址` off hides both.
+The address is a hardcoded constant and cannot be changed; turning `显示项目地址` off hides both.
 
 ### bin cache cleanup
 
-After each successful lookup, `room_info.py` dumps the raw 106/115 payloads to
-`server_info_<version>_<target>_<timestamp>.bin` for protocol debugging. They are only
-useful while debugging and pile up during long-running deployments.
+After each successful lookup `room_info.py` dumps the raw 106/115 payloads to `server_info_<version>_<target>_<timestamp>.bin`, useful only for protocol debugging. Policy: starting from plugin load, every `bin_cleanup_interval_hours` (default 24h) it deletes bin files whose mtime is older than `bin_cleanup_max_age_hours` (default 1h).
 
-Policy: **starting from plugin load, every `bin_cleanup_interval_hours` (default 24h)
-it deletes bin files whose mtime is older than `bin_cleanup_max_age_hours` (default 1h).**
-
-Implementation notes:
-
-- The bin cache never lives in the plugin directory: `--bin-dir` first, then
-  `--state-dir/bin_cache` (the plugin passes `data/plugin_data/astrbot_plugin_rwinfo/`).
-  With neither given nothing is written — a standalone probe run must pass
-  `--state-dir` explicitly; there is no silent fallback into the home directory.
-  Writer and cleaner share one path, so they can never disagree.
-- If that directory is not writable the dump is skipped with a single stderr note; the
-  room output and the leave packet are unaffected.
-- The actual deletion runs in a separate subprocess (`room_info.py --cleanup-bins`) so it
-  never blocks the event loop.
-- A failed run does not kill the loop; it retries on the next tick.
-- `terminate()` cancels the loop so nothing keeps running after unload.
-- If the event loop is not ready at construction time, it is lazily started on the first
-  incoming message.
-- Interval and age threshold both have a 60-second floor to prevent a misconfigured 0
-  from hammering the disk.
-
-Manual cleanup:
+- The cache never lives in the plugin directory: `--bin-dir` first, then `--state-dir/bin_cache` (the plugin passes `data/plugin_data/astrbot_plugin_rwinfo/`); with neither nothing is written, so a standalone probe run must pass `--state-dir`. Writer and cleaner share one path
+- If the directory is not writable the dump is skipped with a single stderr note; room output and the leave packet are unaffected. Deletion runs in a separate subprocess (`room_info.py --cleanup-bins`), never blocks the event loop, and a failed run retries next tick
+- `terminate()` cancels the loop, and if the event loop is not ready at construction time it starts lazily on the first message; interval and age threshold both have a 60-second floor
 
 ```bash
 python3 room_info.py --cleanup-bins               # delete files older than 1 hour
 python3 room_info.py --cleanup-bins --max-age 600 # delete files older than 10 minutes
 ```
 
----
-
 ## Message example
 
-Someone posts:
-
-```
-ADMIN: Other players can type HLBIFZ in 'direct join' to connect to this room.
-```
-
-The bot replies:
+Someone posts `ADMIN: Other players can type HLBIFZ in 'direct join' to connect to this room.` and the bot replies automatically:
 
 ```
 房间版本：1.15
 地图名称：Crossing Large (10p)
 初始资金：4000¤[1x倍率]
+地图模式：遭遇战
 初始禁核：未禁用核蛋蛋
 初始迷雾：重雾
-地图模式：遭遇战
 默认单位：常规模式（1个建造者）
 单位上限：1100
 共享控制：否
@@ -316,54 +247,16 @@ The bot replies:
 使用模组：原版
 当前人数：2/10
 ID：hlbifz
- 玩家列表:
-  A1: abab
-  B2 (AI): AI - Hard
+ 玩家列表：
+  A1：abab
+  A3 (AI)：AI - Hard
 ```
 
-### Map names are cleaned up
+`使用模组` has four shapes, all derived from the room info packet itself: the display name reported by the mod (`使用模组：炮塔科技1.4`, up to 3 names, then "等 N 个"), `使用模组：有（自定义单位 1277 个，未上报名称）` (unit count far above vanilla 121 but the mod named nothing), `使用模组：有（地图来自模组）` (count still 121 but the map starts with `MOD|`), and `使用模组：原版`. Mods that only change numeric values leave no trace in the packet and still show `原版` — a limit of the protocol, not a parsing failure; column 21 of the room list (the mod-name column) is ignored because the host's client fills it in and such mods leave it empty.
 
-The protocol's map field is not always a plain name. These are all real values seen in the wild:
+Map names are not always plain names: values seen in the wild include `NEW_PATH|maps2/10p西班牙混战by-MP97.tmx`, `MOD|36976564B8…6BBB5B6AC//maps/ai-弱智AI试炼场(2p)`, `/SD/rusted_warfare_maps/MOD|sw3058511896//maps/[p9]Coliding Powers (4v5).tmx`, `0    1941欧洲二战：至暗黄昏   40人  by哟西` and `[z;p10]Crossing Large (10p).tmx`; the protocol/path junk in front is stripped and only the map name remains (e.g. `ai-弱智AI试炼场(2p)`). Cleaning order is fixed: protocol prefix → mod marker (hash or `sw` workshop ID) → last path segment → repeated bracket-parameter and numeric-prefix stripping → collapse spaces → drop extension. Slashes inside names such as `1v1/2v2 混战地图` are not paths and are kept; an empty result shows "未知地图". The room list's map and description columns use the same cleaning.
 
-| Raw | Shown |
-|-----|-------|
-| `NEW_PATH|maps2/10p西班牙混战by-MP97.tmx` | `10p西班牙混战by-MP97` |
-| `MOD|36976564B8…6BBB5B6AC//maps/ai-弱智AI试炼场(2p)` | `ai-弱智AI试炼场(2p)` |
-| `/SD/rusted_warfare_maps/MOD|sw3058511896//maps/[p9]Coliding Powers (4v5).tmx` | `Coliding Powers (4v5)` |
-| `0    1941欧洲二战：至暗黄昏   40人  by哟西` | `1941欧洲二战：至暗黄昏 40人 by哟西` |
-| `[z;p10]Crossing Large (10p).tmx` | `Crossing Large (10p)` |
-
-Order is fixed: protocol prefix → mod id (hash or `sw` workshop id) → last path segment →
-repeated bracket-parameter and numeric-prefix stripping → collapse spaces → drop extension.
-Slashes inside names like `1v1/2v2 混战地图` are not treated as paths. If everything is
-stripped away the bot shows "未知地图" instead of pasting `MOD|<hash>//maps/` on screen.
-The room list's map and description columns use the same cleaning.
-
-### Mod detection
-
-`使用模组` has four shapes, all derived from the room info packet:
-
-| Shown | Meaning |
-|-------|---------|
-| `使用模组：炮塔科技1.4` | Mod detected; name comes from the display name the mod gave its custom units (up to 3, then "等 N 个") |
-| `使用模组：有（自定义单位 1277 个，未上报名称）` | Unit count far above vanilla 121 — mod detected, but the mod gave its units no names |
-| `使用模组：有（地图来自模组）` | Unit count is still 121, but the map is loaded from a mod folder (`MOD|` prefix) |
-| `使用模组：原版` | Vanilla unit count and a non-mod map |
-
-Mods that only change numeric values leave no trace in the packet, so they still show
-`使用模组：原版` — that is a limit of the protocol, not a parsing failure. Column 21 of the
-room list (the mod-name column) is still ignored: it is filled in by the host's client and
-is empty for exactly those mods.
-
-If the probe name is filtered, progress is sent before each retry:
-
-```
-[房间查询] 重试中(1/3)
-[房间查询] 重试中(2/3)
-[房间查询] 重试中(3/3)
-```
-
-When the room cannot be joined, the reason is translated:
+When a probe name is filtered the plugin reports progress from `[房间查询] 重试中(1/3)` through `(3/3)` before retrying; when the room cannot be joined the reason is translated:
 
 ```
 [房间查询失败] 房间已满，无法加入
@@ -371,11 +264,9 @@ When the room cannot be joined, the reason is translated:
 [房间查询失败] 房间已锁定
 ```
 
----
-
 ## Command-line tool
 
-The built-in probe runs standalone, standard library only:
+The built-in probe runs standalone with the standard library only:
 
 ```bash
 python3 room_info.py                      # no args in a terminal: interactive mode
@@ -383,81 +274,55 @@ python3 room_info.py R5132                # query a relay room
 python3 room_info.py HLBIFZ               # query an international room
 python3 room_info.py 18.216.139.119:5125  # direct-connect query
 python3 room_info.py --list               # fetch the room list
-python3 room_info.py R5132 --show-players # show the player list
-python3 room_info.py R5132 --debug        # debug output
+python3 room_info.py R5132 --show-players # show the player list, add --debug for debug output
 ```
 
 ### Interactive mode
 
-One-shot flags are fine for scripts, but when you are debugging you usually want to try
-several room IDs in a row, switch filters, or toggle the player list without retyping a
-whole command line (and redoing DNS/handshake each time):
-
-```bash
-python3 room_info.py -i        # or --interactive / --shell
-```
+A resident process taking one line at a time, handy for trying several room IDs, switching filters or toggling the player list. Start it with `python3 room_info.py -i` (or `--interactive` / `--shell`; no args in a terminal also enters it):
 
 ```
 rwinfo> r5132                  # a bare room ID queries it
-rwinfo> q7765 --show-players   # per-command options, same as one-shot
+rwinfo> q7765 --show-players   # per-command options, same as one-shot mode
 rwinfo> list --joinable --search survival
-rwinfo> json --status battleroom
-rwinfo> debug                  # bare = toggle
-rwinfo> status                 # show current settings
-rwinfo> exit                   # Ctrl-D works too
+rwinfo> list --addr             # room ID / direct address / host (needed for official rooms' IP:port/UUID)
+rwinfo> json --status battleroom / debug / status / exit
 ```
 
-Commands: `<room id>`, `query`, `list`, `json`, `cleanup`, `name`, `players`, `limit`,
-`promote`, `cooldown`, `debug`, `status`, `help`, `exit`. Probe name, player-list display,
-promote text and cooldown are kept for the whole session.
+Commands: `<room id>`, `query`, `list`, `json`, `cleanup`, `name`, `players`, `limit`, `promote`, `cooldown`, `debug`, `status`, `help`, `exit`. `Ctrl-C` discards the current line (or aborts a running query); leave with `exit` or `Ctrl-D`. Promotion, probe name and player-list settings stay in the session, so they need not be repeated. Results go to stdout while prompts and status lines go to stderr, so `python3 room_info.py -i < cmds.txt > out.txt` still yields clean results; the session supports line editing and arrow-key history (via `readline`) and `# comments` at line end. `-i` is mutually exclusive with one-shot flags: `-i --list-json` or `-i R5132` run in one-shot mode with a notice, while `-i --help` always prints help. The plugin always passes a room ID, so it never enters interactive mode.
 
-Same output contract as one-shot mode: **results go to stdout, prompts and status lines to
-stderr**, so `python3 room_info.py -i < cmds.txt > out.txt` still yields clean results.
-The plugin always passes a room ID, so it never enters interactive mode by accident.
-
----
+Colors are enabled on a terminal: report field names bold, the `ID` line highlighted, the list status cell colored by state, failures in red, the closing line dimmed with a colored exit code, and a cyan prompt. Colors affect terminal output only: `--color` takes `auto` (default, on only when stdout is a terminal), `always`, or `never`, and `RWINFO_COLOR` works as an env fallback. With `NO_COLOR` set, `auto` turns colors off while `--color=always` still honors the explicit request. Pipes and files get no escape sequences.
 
 ## Directory structure
 
 ```
 astrbot_plugin_rwinfo/
-├── main.py            # plugin logic (message listen / room-ID extract / query schedule / retry / translate)
-├── room_info.py       # protocol probe (room-info query core, runs standalone)
+├── main.py            # plugin logic (message listen / ID extract / query schedule / retry / translate)
+├── room_info.py       # protocol probe (room-info core, runs standalone)
 ├── PROTOCOL.md        # protocol reverse-engineering notes
 ├── CHANGELOG.md       # version history
-├── README.md          # Chinese doc
-├── README_EN.md       # this doc
-├── metadata.yaml      # plugin metadata
-├── _conf_schema.json  # config schema
-├── LICENSE            # MIT license
-└── .gitignore
+├── README.md / README_EN.md   # Chinese / English docs
+├── metadata.yaml / _conf_schema.json   # plugin metadata / config schema
+└── LICENSE / .gitignore
 ```
 
-Runtime data is **not** written here (plugin updates replace this directory).
-It lives in `data/plugin_data/astrbot_plugin_rwinfo/`:
+Runtime data is not written here (plugin updates replace this directory) but in `data/plugin_data/astrbot_plugin_rwinfo/`:
 
 | File | Content |
 | --- | --- |
 | `stats.json` | Today's counters behind `/铁锈查房 状态` (resets daily) |
-| `promote_state.json` | Per-room cooldown for the in-room promotion message |
+| `promote_state.json` | Per-room cooldown for the in-room promotion |
+| `bin_cache/` | Raw 106/115 packets saved during lookups (protocol debugging, cleaned periodically) |
 
-A leftover `.rwinfo_stats.json` in the plugin directory is migrated on first load.
-
-The data directory is only `StarTools.get_data_dir()` (or `RWINFO_PLUGIN_DATA` when set,
-mainly for tests). If neither is available **nothing is persisted** — stats stay in memory
-and the probe runs without `--state-dir`; there is no silent fallback to `~/.rwinfo`.
-
----
+A leftover `.rwinfo_stats.json` in the plugin directory is migrated read-only on first load (the old file is kept). The data directory is only `StarTools.get_data_dir()` (or `RWINFO_PLUGIN_DATA` when set, mainly for tests); if neither is available nothing is persisted — stats stay in memory and the probe runs without `--state-dir`, never falling back to `~/.rwinfo`.
 
 ## Notes
 
-- Queries run in a subprocess calling `room_info.py`, isolated; sends 111 to leave afterwards, never occupies a room slot
-- Private messages are checked against `@userID`; group messages check both `#groupID` and the sender's `@userID` (user blacklist also applies in groups)
-- Player list is shown by slot order, empty names shown as `(空)`
-- When a room is in the "returned to battleroom after start" state the server does not update its status; humans can still join but probes are rejected, this is game behaviour
+- Queries run in a subprocess calling `room_info.py` and are isolated; the probe sends 111 to leave afterwards and never occupies a room slot
+- Private messages are checked against `@userID`; group messages check both `#groupID` and the sender's `@userID` (the user blacklist applies in groups too)
+- The player list follows slot order, empty names show as `(空)`; when a room is in the "returned to battleroom after start" state the server does not update its status, so humans can still join while probes are rejected — game behaviour
+- Some servers (e.g. 青阳云服务) require a human check after the handshake: the player must type an access code within 15 seconds. The probe never answers it. It exits immediately and reports two lines — `[房间查询失败] 该服务器启用了人机接入验证（或客户端白名单），探针无法自动完成，需玩家本人在客户端接入` plus `服务端提示：<server text>` — with exit code `6` (manual verification required). Those queries count as failures in the daily stats, without a separate category
 - This plugin is for learning and entertainment; do not use it to spam rooms or disturb other players
-
----
 
 ## License
 

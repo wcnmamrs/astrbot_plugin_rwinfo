@@ -5,6 +5,7 @@ AstrBot 插件: 铁锈战争房间查询 (rwinfo)
 """
 
 import asyncio
+import copy
 import datetime as _datetime
 import hashlib
 import io
@@ -53,24 +54,17 @@ PLUGIN_NAME = "astrbot_plugin_rwinfo"
 def plugin_data_dir() -> str:
     """返回本插件的持久化目录 data/plugin_data/<插件名>。
 
-    规范要求插件不要把运行时数据写进插件自身目录：插件更新/重装会整体
-    覆盖那个目录，用户数据会跟着丢，备份与迁移也识别不到。
+    插件不得把运行时数据写进插件自身目录：更新/重装会整体覆盖该目录，
+    用户数据随之丢失，备份与迁移也识别不到。
 
-    解析顺序（官方文档要求：「持久化数据请存储于 `data` 目录下，而非插件
-    自身目录」；审核侧还明确「必须且只能」用 `StarTools.get_data_dir()`，
-    禁止自己拼 `plugin_data` 路径）：
-
-      1. 环境变量 `RWINFO_PLUGIN_DATA`（测试/特殊部署用）
-      2. `StarTools.get_data_dir(PLUGIN_NAME)`（框架官方唯一入口）
-
-    两者都拿不到时返回空串，调用方据此**不落盘**（统计只在内存里攒着，
-    推广/冷却状态走不到），而不是偷偷写到家目录。审核侧明确建议过：不要有
-    `~/.rwinfo` 这种家目录兜底，数据目录必须可审计 —— 插件的数据只应该
-    出现在框架给的那个目录里。
-
-    不再自己按 `<插件目录>/../../plugin_data` 推算：那条路径看着对，其实
-    依赖目录层级，改了布局就静默写到别处；而且审核会按「硬编码 plugin_data」
-    判违规。
+    解析顺序（规范要求数据存于 `data` 下，且只能用 `StarTools.get_data_dir()`，
+    禁止自拼 `plugin_data` 路径）：
+    1. 环境变量 `RWINFO_PLUGIN_DATA`（测试/特殊部署用）
+    2. `StarTools.get_data_dir(PLUGIN_NAME)`（框架官方唯一入口）
+    都拿不到时返回空串，调用方据此不落盘（统计只在内存里攒，推广与冷却状态
+    同样不落盘）。不设家目录兜底（数据必须可审计），也不按
+    `<插件目录>/../../plugin_data` 推算：该路径依赖目录层级，布局一变就静默
+    写到别处，且属硬编码违规。
     """
     env = os.environ.get("RWINFO_PLUGIN_DATA", "").strip()
     candidates = []
@@ -106,7 +100,7 @@ def plugin_data_dir() -> str:
 # 不能向上一级目录回退：AstrBot 的标准布局是
 # `<data>/plugins/astrbot_plugin_rwinfo/`，回退会指向 `<data>/plugins/`，
 # 那是所有插件的公共父目录，既找不到目标，也可能误用他插件的同名文件。
-ROOM_INFO_API_REQUIRED = 4  # 需要的最低接口版本（对应 room_info.py 的 ROOM_INFO_API）
+ROOM_INFO_API_REQUIRED = 5  # 需要的最低接口版本（对应 room_info.py 的 ROOM_INFO_API）
 ROOM_INFO_DIR = _PLUGIN_DIR
 ROOM_INFO_PY = os.path.join(_PLUGIN_DIR, "room_info.py")
 
@@ -114,7 +108,7 @@ QUERY_TIMEOUT = 120
 COOLDOWN = 10
 # 全部已注册指令名（`@filter.command(...)` 的原文，一条一条抄在这里）。
 #
-# 用途：判断「这条消息是不是在使唤插件」。只看首字符靠不住 —— 用户常常先
+# 用途：判断「这条消息是不是在使唤插件」。只看首字符不够 —— 用户常常先
 # @机器人 再写指令，唤醒词也可能被改成 `>`、`!`，指令还可能写在句子中间。
 # 只要正文里出现下面任何一个名字，就不再从这条消息里自动提取房号。
 #
@@ -184,7 +178,7 @@ CMD_DEDUP_WINDOW = 10
 PROBE_MIN, PROBE_MAX = 1, 99
 
 # 插件版本（菜单与元数据展示用，与 metadata.yaml 的 version 保持一致）
-PLUGIN_VERSION = "2.0.7"
+PLUGIN_VERSION = "2.1.0"
 
 # ---- 协议侧常量（与 room_info.py 保持一致）----
 # 官方 masterserver 列表。插件侧解析中继房真实地址时要用，
@@ -222,7 +216,7 @@ REPO_RAW_BASE = "https://raw.githubusercontent.com/wcnmamrs/astrbot_plugin_rwinf
 ROOM_INFO_ALLOWED = ("room_info.py",)
 # 下载源（按顺序尝试，第一个成功即用）。
 #
-# 为什么需要多个源：实测在中国大陆网络下
+# 多源的原因：中国大陆网络下
 #   raw.githubusercontent.com  -> Connection reset by peer
 #   cdn.jsdelivr.net           -> Connection reset by peer
 #   而 ghproxy 镜像和 api.github.com 是通的。
@@ -237,7 +231,7 @@ _DOWNLOAD_SOURCES = (
 # 最后一环交给镜像运营者，等于把机器人的执行权外包出去。
 # 校验值随插件一起发布，用途是「恢复与本版本一模一样的探针」——
 # 不是「升级到最新探针」，所以哈希不匹配一律拒收，宁可让用户重装插件。
-ROOM_INFO_SHA256 = "064ecc848eb1566405e2de4d62d236c530a25893fd57fc0615d576c6c47313ed"
+ROOM_INFO_SHA256 = "43b8692876673cfa94fadf184f52c1adce7f3dee3fb8e3a3c32b914d4033d0e8"
 _DOWNLOAD_TIMEOUT = 15
 
 
@@ -396,18 +390,15 @@ _FORWARD_FIELD_RE = re.compile(r'^\s*\[(消息内容|发送者)\]\s?(.*)$')
 def extract_text_from_event(event, base: str = "") -> str:
     """尽最大努力从事件里取出「真实正文」。
 
-    为什么需要它：AstrBot 的 `message_str` 只是适配器的**渲染结果**，
-    不同适配器差异极大 —— 第三方（aiocqhttp）拿到合并转发时会渲染成
-    `[xxx的聊天记录] / === 消息 N ===` 文本；官方适配器（qq_official）
-    对某些元素类型可能干脆给空串，或只给一个占位标题。
+    `message_str` 只是适配器的渲染结果，各适配器差异极大：第三方（aiocqhttp）
+    把合并转发渲染成 `[xxx的聊天记录] / === 消息 N ===`；官方适配器
+    （qq_official）对某些元素可能给空串，或只给一个占位标题。
 
-    因此按「信息量优先」依次尝试：
-      1. 传入的 base（调用方已取的 message_str）
-      2. 事件对象里的原始消息段（message_obj / raw_message / data）
-         递归找出所有可读文本，包括 forward/node 的嵌套 content
-      3. 都拿不到则返回 base
-
-    返回的文本都会过一遍 `unwrap_forward_text`。
+    按「信息量优先」依次尝试，结果都会过一遍 `unwrap_forward_text`：
+    1. 传入的 base（调用方已取的 message_str）
+    2. 事件对象里的原始消息段（message_obj / raw_message / data），
+    递归找出所有可读文本，包括 forward/node 的嵌套 content
+    3. 都拿不到则返回 base
     """
 
     def _walk(obj, depth=0):
@@ -598,7 +589,7 @@ def ensure_room_info(auto=True):
             try:
                 if bak:
                     if os.path.exists(bak):
-                        os.remove(bak)  # 只删我们自己生成的 .bak
+                        os.remove(bak)  # 只删本插件生成的 .bak
                     shutil.copyfile(target, bak)
                     moved_old = True
             except OSError:
@@ -658,19 +649,19 @@ DEFAULT_CMD_PREFIX = "/"
 #   → 视为纯房号, 转换成 "<首字母>.relay.corrodinggames.com/<房号>"
 #   即客户端只取首字符当主机名, 对房号字符本身无限制。
 #
-# 实测可用的中继首字母 (5123 端口开放):
+# 可用的中继首字母 (5123 端口开放):
 #   a b h  → 官方中继 (Relay US1 / US2 / ASIA2)
 #   o q r s→ 第三方中继 (RELAY-CN / Tiexiu.xyz / Fancy-CN)
 #   c g j v→ 有 DNS 但端口未开放; 其余字母无 DNS
 #
-# 房号形态按中继区分(实测):
+# 房号形态按中继区分:
 #   o q r s   → 数字房, 如 r5132 / s1024 / o9999 / q7777
 #   其他字母   → 字母房, 如 hytvvi / aabcde / babc
 # 两种形态统一限制: 整串长度 >= 3。其他形式(纯数字 / 混合 / IP)一律不识别。
 # 注意: 不把首字母写死成白名单, 因为官方随时可能开通新中继;
 #       未开通的字母查询时会快速失败(连接错误), 不影响正常房间。
 
-# 实测确认可用的中继首字母（5123 端口开放）。用于**调度排序**，
+# 可用的中继首字母（5123 端口开放）。用于**调度排序**，
 # 不是识别白名单：未列出的字母照样识别、照样可查，只是排在后。
 #   a b h   → 官方中继 (Relay US1 / US2 / ASIA2)
 #   o q r s → 第三方中继 (RELAY-CN / Tiexiu.xyz / Fancy-CN)
@@ -696,7 +687,7 @@ def _relay_priority(rid: str) -> int:
 # 数字房号: 2 位以上数字 (整串 >= 3 字符)
 #   o12 / q99 / r5132 / s1024
 #
-# **宽松匹配 + 后处理归一化**，用于兼容用户的手滑：
+# **宽松匹配 + 后处理归一化**，用于兼容常见的输入重复与粘连：
 #   · rr5132      -> 前缀字母重复敲，归一化为 r5132
 #   · r5132r5132  -> 房号连写两遍，归一化后去重 -> 一个 r5132
 #   · s1024r5132  -> 两个不同房号连写（中间无空格）-> 都识别
@@ -721,7 +712,7 @@ RELAY_ALPHA_RE = re.compile(
 )
 
 # 自定义房号: 中继前缀字母 + 汉字（可夹字母/数字），如 `s九一大魔王`。
-# RW 允许玩家自定义房号，实测 `s九一大魔王` 能连上并返回「游戏已经开始」。
+# RW 允许玩家自定义房号，`s九一大魔王` 能连上并返回「游戏已经开始」。
 # 只认「单个 ASCII 字母 + 至少一个汉字 + 至少一个后续字符」：
 #   · 只在显式 `/铁锈查房` 里启用（extract_room_ids(allow_custom=True)），
 #     自动解析一律不认，避免把普通句子里的「字母+汉字」当房号；
@@ -734,7 +725,7 @@ CUSTOM_ROOM_RE = re.compile(
 )
 
 # 不识别纯数字房号(如 5232): 首字符为数字的中继主机无 DNS, 无法查询。
-# 不识别混合格式(如 a1b2c3): 不在实测的两种形态内, 排除以防误报。
+# 不识别混合格式(如 a1b2c3): 不属于上述两种形态, 排除以防误报。
 # 不识别 IP 直连: 自动触发时不连 IP(无法判断是 Web 还是游戏服务器);
 #   仅 /铁锈查房 显式指定 IP 时才允许, 由 IP_QUERY_RE 匹配。
 # 不设英文单词黑名单: 字母房号随机, 可能恰好是 "hello" / "game";
@@ -747,21 +738,15 @@ IP_QUERY_RE = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?$')
 def _split_relay_run(head: str, digits: str):
     """把「前缀字母串 + 数字串」拆成若干个合法房号。
 
-    兼容用户的手滑写法：
-      · "rr"   + "5132"      -> ["r5132"]        前缀字母重复
-      · "r"    + "5132"      -> ["r5132"]        正常
-      · "r"    + "51325132"  -> ["r5132"]        数字重复（同一房号连写两遍）
-      · "rs"   + "10245132"  -> ["r1024","s5132"] 两个房号连写（按前缀出现顺序等分）
+    兼容连写/重复：`rr5132` -> `r5132`（前缀字母重复）、`r51325132` -> `r5132`
+    （同一房号连写两遍）、`rs10245132` -> `r1024` + `s5132`（两个房号连写）。
 
-    拆分规则：
-      1. 前缀字母串逐字符剥离（每个字符是一个候选中继字母），
-         **仅去掉相邻重复**（"rr" -> ["r"]；"rsr" 仍是 ["r","s","r"]）
-      2. 前缀字母数 == 1 时，数字全给这一个房号
-      3. 前缀字母数 > 1 时，数字串按 `len(digits)//n` **固定等分**，
-         按前缀出现顺序配对；数字不够分（< 2*n）则只认第一个字母 + 全部数字
-
-    注：`r5132r5132` 不走本函数 —— 它由 RELAY_NUM_LOOSE_RE 匹配两次
-        再由 extract_room_ids 的 seen 去重，最终只留一个 r5132。
+    规则：前缀字母串逐字符剥离并**仅去相邻重复**（`rr` -> `r`，`rsr` 仍是
+    `r,s,r`）；字母数 == 1 时数字全给该房号；字母数 > 1 时按 `len(digits)//n`
+    **固定等分**并按前缀出现顺序配对，数字不够分（< 2*n）则只认第一个字母
+    加全部数字。
+    `r5132r5132` 不走本函数：由 RELAY_NUM_LOOSE_RE 匹配两次，再由
+    extract_room_ids 的 seen 去重，最终只留一个 `r5132`。
     """
     letters = []
     for ch in head or "":
@@ -773,7 +758,7 @@ def _split_relay_run(head: str, digits: str):
         return []
     # 单个前缀：整段数字都归它。
     #
-    # 「数字重复」手滑（r51325132 -> r5132）只在**总长 ≥8 且半段 ≥4** 时判。
+    # 数字重复（r51325132 -> r5132）只在**总长 ≥8 且半段 ≥4** 时判定。
     # 门槛不能再低：6 位的 r123123 / s111111 是合法房号，
     # 按 6 位判会把它们截成 r123 / s111，查错房且静默。
     # 游戏房号通常 3~5 位，8 位纯数字房几乎不存在，
@@ -828,7 +813,9 @@ def normalize_room_id(rid) -> str:
     CNKD 的 K 房走官方 r 中继并靠 `RKC497` 这种大写形式被服务器识别。
     """
     rid = str(rid or "").strip()
-    if rid.upper().startswith(("RKC", "KC")):
+    # 只认 RKC497 / KC497 这种「前缀 + 数字」：kcyy、kchat 是普通字母房，
+    # 大写补 R 会变成不存在的 K 房房号。
+    if re.fullmatch(r"R?KC\d{2,8}", rid, re.IGNORECASE):
         rid = rid.upper()
         if rid.startswith("KC"):
             rid = "R" + rid
@@ -840,27 +827,16 @@ def normalize_room_id(rid) -> str:
 def extract_room_ids(text: str, allow_custom: bool = False):
     """从文本中提取所有房间号, 按出现顺序去重返回(小写)。
 
-    `allow_custom` 控制是否识别「自定义房号」（中继字母 + 汉字，如 `s九一大魔王`）。
-    **默认关闭**：这种房号形态无法穷举，混进自动解析只会制造误判
-    （普通句子里夹着字母 + 汉字就可能被当成房号，白占探针）。
-    只有显式 `/铁锈查房 <房号>` 这条路径才传 True。
+    `allow_custom` 控制是否识别自定义房号（中继字母 + 汉字，如 `s九一大魔王`）。
+    **默认关闭**：该形态无法穷举，混进自动解析只会误判（普通句子里夹着的
+    字母 + 汉字会被当房号、白占探针）；只有 `/铁锈查房 <房号>` 传 True。
 
-    支持的房号形式(按中继区分, 实测):
-      0. K 服: RKC/KC + 2~8 位数字（如 RKC497），及 cnkd.fun 分享链接
-      1. 数字房: o/q/r/s + 2 位以上数字, 整串 >= 3 字符
-         如 r5132 / s1024 / o9999 / q7777
-      2. 字母房: 非 o/q/r/s 的字母开头 + 纯字母, 整串 >= 3 字符
-         如 hytvvi / aabcde / babc / cabcde
-      3. 自定义房号: 中继字母 + 汉字（可夹字母数字），如 s九一大魔王
-
-    **兼容用户手滑的连写/重复写法**:
-      · r5132r5132  -> r5132（同一房号连写两遍，去重）
-      · rr5132      -> r5132（前缀字母重复）
-      · s1024r5132  -> s1024、r5132（两个房号无分隔连写）
-
+    支持: 数字房(o/q/r/s + 2 位以上数字, 整串 >= 3 字符)、字母房(非 o/q/r/s
+    字母开头 + 纯字母)、自定义房号(中继字母 + 汉字)、K 服(RKC/KC + 2~8 位
+    数字, 如 RKC497, 及 cnkd.fun 分享链接)。连写/重复同样识别：
+    r5132r5132 / rr5132 -> r5132，s1024r5132 -> s1024 与 r5132。
     不识别: 纯数字 / 混合格式(a1b2c3) / IP / u_ 前缀 / URL 片段。
-    不做英文单词过滤: 字母房号随机, 可能恰好是 hello/game,
-    合法性由探针验证(查不到即失败, 不影响正常房间)。
+    不做英文单词过滤: 字母房号随机, 可能恰好是 hello/game, 合法性由探针验证。
     """
     ids = []
     seen = set()
@@ -883,7 +859,7 @@ def extract_room_ids(text: str, allow_custom: bool = False):
     # 1) 数字房(oqrs + 数字)：宽松匹配，再归一化拆分
     # `_glue` 收集「和房号粘在一起的 ASCII 字母数字」区间（r5132abc / abc123），
     # 这些是混合词、不是房号；必须整段屏蔽，否则剩下的 `abc` 会被下一步
-    # 当成字母房号抓出来（曾经的 bug：`r5132abc` -> 查出 `abc`）。
+    # 当成字母房号抓出来（如 `r5132abc` -> 查出 `abc`）。
     _glue = []
 
     def _alnum_run(i):
@@ -987,7 +963,7 @@ IGNORE_PATTERNS = (
 
 
 # 房间信息字段名（用于归一化匹配）。
-# 只放「我们自己会输出」的字段；用于判断探针返回的是不是有效房间信息
+# 只放本插件会输出的字段；用于判断探针返回的是不是有效房间信息
 # （is_room_info 在查房结果校验处被调用，决定回传结果还是报错）。
 # 注意：不要把 `版本` 和 `房间版本` 同时放进来 ——
 # `房间版本` 里含 `版本`，同一行会被计成两次命中，
@@ -1039,16 +1015,12 @@ def _field_has_value(s: str, name: str) -> bool:
     """字段名是否以「键 + 值」的形式出现，而不是被当作普通词语。
 
     判据：字段名之后 0~3 个字符内出现冒号或值的起始字符。
+    这一层不可省：光看「包含字段名」会把闲聊误判成房间信息 ——
+    「这个版本的地图名称好听」同时包含 `版本` 和 `地图名称`，只数命中个数
+    就会被当成房间信息，一句闲聊就能污染名单。
 
-    为什么需要这层：光看「包含字段名」会把闲聊误判成房间信息。
-    实测：「这个版本的地图名称好听」同时包含 `版本` 和 `地图名称`，
-    若只数命中个数就会被当成房间信息 —— 用户随口一句话就能污染
-    名单。
-
-    正常输出都满足这个判据：
-        房间版本：1.15        -> 后面是冒号
-        地图名称：Crossing    -> 后面是冒号
-        | 房间版本 | 1.15 |   -> 归一化成 `房间版本  1.15`，后面是空格+数字
+    正常输出都满足：`房间版本：1.15` / `地图名称：Crossing`（后面是冒号），
+    `| 房间版本 | 1.15 |` 归一化成 `房间版本  1.15`（后面是空格 + 数字）。
     """
     start = 0
     while True:
@@ -1066,16 +1038,12 @@ def is_room_info(text: str) -> bool:
     """判断一段文本是不是「房间信息」（用于探针返回结果校验）。
 
     判定标准：**归一化后同时命中至少两个房间字段**。
+    取 2 个而非 1 个的原因：1 个时随口一句「房间版本」就可能误判；2 个则
+    伪造成本明显提高，而正常输出有十几个字段，远远够用。
 
-    为什么是两个而不是一个：
-      · 要求 1 个 -> 用户随口打一句「房间版本」就可能被误判。
-      · 要求 2 个 -> 伪造成本明显提高，而正常输出通常有十几个字段，
-        远远够用。
-
-    为什么要归一化：官Q 的 Markdown 会把 `键：值` 清单渲染成表格
-    （`| 房间版本 | 1.15 |`），此时**冒号消失**；第三方转发时也可能
-    把全角冒号换成半角。旧实现只认原文里的 `房间版本：`，这些情况
-    一律漏判。
+    必须归一化的原因：官Q 的 Markdown 会把 `键：值` 清单渲染成表格
+    （`| 房间版本 | 1.15 |`），此时**冒号消失**；第三方转发也可能把全角
+    冒号换成半角。只认原文 `房间版本：` 会把这些全漏判。
 
     兼容旧版标签：`版本：1.15` 也算（老版本插件仍在用）。
     """
@@ -1172,10 +1140,10 @@ ERROR_TRANSLATIONS = [
 def translate_error(text: str) -> str:
     """给服务器错误说明补一句中文（只补注，不替换原文）。
 
-    早先是「命中关键词就把整条说明替换成固定中文」，实测会制造
-    错误结论：退出码 4 的文案是「房间已满或游戏已经开始」，命中
-    「游戏已经开始」后被替换成「游戏已经开始」，把「房间满了」
-    误报成「等游戏结束」，还顺手丢掉了退出码与 stderr 尾巴。
+    早先是「命中关键词就把整条说明替换成固定中文」，会制造错误结论：退出码 4
+    的文案是「房间已满或游戏已经开始」，命中「游戏已经开始」后整条被替换成
+    「游戏已经开始」，把「房间满了」误报成「等游戏结束」，还丢掉了退出码与
+    stderr 尾巴。
     """
     head = first_error_line(text) or str(text or "").strip()
     for eng, zh in ERROR_TRANSLATIONS:
@@ -1214,21 +1182,14 @@ def is_reportable_error(text: str) -> bool:
 def normalize_gid(gid) -> str:
     """规范化群号/用户号（用于名单匹配）。
 
-    ⚠️ 必须完整保留非纯数字标识！
-    官方机器人的群号/用户 openid 是 32 位十六进制哈希（如
-    "3A28BF3EF5FF4F023DB209648BB7921E"）。
+    **必须完整保留非纯数字标识**：官方机器人的群号/用户 openid 是 32 位
+    十六进制哈希（如 "3A28BF3EF5FF4F023DB209648BB7921E"）。
 
-    早期实现用 `re.search(r"\\d+")` 抽第一个数字段，会把上面这个串
-    截成 "3"，于是：
-      · 白名单里手填的是完整 "3A28BF3EF5FF..."（用户看到的是对的）
-      · 运行时比对用的却是 "#3"
-      · 结果永远不匹配 -> 明明填了白名单，命令却回「没有权限」
-    这是一个隐蔽的匹配失效 bug，只在官方机器人（哈希串群号）下暴露，
-    普通数字 QQ 群完全正常，所以长时间没被发现。
-
-    现在的规则：
-      · 纯数字（"3856554669"）-> 原样返回
-      · 其他（哈希串等）      -> 去空白后完整返回
+    早期实现用 re.search(r"\\d+") 抽第一个数字段，把该串截成 "3"：白名单里
+    手填的是完整哈希（用户看到的对），运行时比对用的却是 "#3"，永远匹配不
+    上 -> 明明填了白名单却回「没有权限」。该失效只在官方机器人（哈希串群号）
+    下暴露，数字 QQ 群完全正常。
+    规则：纯数字（"3856554669"）原样返回；其他（哈希串等）去空白后完整返回。
     """
     if gid is None:
         return ""
@@ -1281,7 +1242,7 @@ class RWInfoPlugin(Star):
                 f"[配置] 识别到 {len(self._conf_groups)} 个分组，schema 路径: {self._schema_path()}"
             )
         # 关键配置自检：无条件打印，这是排查「明明是官Q模式却发成纯文本」
-        # 最直接的入口 —— 只要看这行就知道插件当时读到的到底是什么值。
+        # 最直接的入口：这一行就是插件当时读到的值。
         try:
             self.logger.info(
                 f"[配置] 官Q模式={bool(self.cfg.get('官Q模式'))} "
@@ -1312,7 +1273,7 @@ class RWInfoPlugin(Star):
         # 10 = DEBUG，20 = INFO。改的是本插件专属 logger，不影响其它插件。
         try:
             # 框架若返回共享的日志对象，setLevel 会连内核和其它插件一起改
-            # （历史上踩过：debug=true 把整个实例拖进 DEBUG）。只认专属 logger。
+            # （`debug=true` 会把整个实例拖进 DEBUG）。只认专属 logger。
             if str(getattr(self.logger, "name", "") or "").endswith(PLUGIN_NAME):
                 self.logger.setLevel(10 if self.cfg.get("debug", False) else 20)
             if self.cfg.get("debug", False):
@@ -1366,8 +1327,6 @@ class RWInfoPlugin(Star):
             "success": 0,
             "failure": 0,
             "errors": {},
-            "k_total": 0,
-            "k_success": 0,
             "total_seconds": 0.0,
             "success_seconds": 0.0,
         }
@@ -1400,7 +1359,7 @@ class RWInfoPlugin(Star):
                 raw = json.load(f)
             if not isinstance(raw, dict) or raw.get("date") != empty["date"]:
                 return empty
-            for k in ("total", "success", "failure", "k_total", "k_success"):
+            for k in ("total", "success", "failure"):
                 v = raw.get(k, 0)
                 empty[k] = max(0, int(v)) if isinstance(v, (int, float)) else 0
             for k in ("total_seconds", "success_seconds"):
@@ -1438,8 +1397,6 @@ class RWInfoPlugin(Star):
         rate = (success * 100.0 / total) if total else 0.0
         avg = (st["total_seconds"] / total) if total else 0.0
         ok_avg = (st["success_seconds"] / success) if success else 0.0
-        k_total, k_success = st["k_total"], st["k_success"]
-        k_rate = (k_success * 100.0 / k_total) if k_total else 0.0
         lines = [
             "【今日查房状态】",
             f"日期：{st['date']}（本地时间）",
@@ -1447,7 +1404,6 @@ class RWInfoPlugin(Star):
             f"成功：{success} 次　失败：{st['failure']} 次",
             f"成功率：{rate:.1f}%",
             f"平均耗时：{avg:.1f} 秒　成功平均：{ok_avg:.1f} 秒",
-            f"K 房：{k_total} 次，成功 {k_success} 次（{k_rate:.1f}%）",
             f"探针当前占用：{len(self.probe_used)}　待执行任务：{len(self.pending_tasks)}",
         ]
         if st["errors"]:
@@ -1485,10 +1441,6 @@ class RWInfoPlugin(Star):
                 else:
                     kind = "其他失败"
                 st["errors"][kind] = st["errors"].get(kind, 0) + 1
-            if str(rid or "").upper().startswith(("RKC", "KC")):
-                st["k_total"] += 1
-                if ok:
-                    st["k_success"] += 1
             self._save_stats()
         except Exception as e:
             # 统计不能反过来影响查房；但日志要留原因，不能静默吞 bug。
@@ -1714,16 +1666,13 @@ class RWInfoPlugin(Star):
     def _migrate_to_groups(self):
         """把旧的顶层平铺配置搬进分组，并删除顶层副本。
 
-        背景：换用 object 分组 schema 后，AstrBot 会把 schema 里未定义的
-        顶层键当作「额外配置项」列在面板底部。老配置恰好就是全平铺的，
-        于是会看到一堆重复的原始条目。这里做一次性迁移：
-
-            {"mode": "black", "白名单": [...]}
-                ->  {"基础设置": {"mode": "black"},
-                     "名单管理": {"白名单": [...]}}
-
-        只在「该键属于某个分组，且分组里还没有它」时搬运，
-        不会覆盖用户在面板上新设的值。
+        背景：换用 object 分组 schema 后，AstrBot 会把 schema 未定义的顶层键
+        当作「额外配置项」列在面板底部，而老配置恰好全平铺，面板上会看到一
+        堆重复的原始条目。这里做一次性迁移：
+        {"mode": "black", "白名单": [...]}
+        -> {"基础设置": {"mode": "black"}, "名单管理": {"白名单": [...]}}
+        只在「该键属于某个分组，且分组里还没有它」时搬运，不覆盖用户在面板
+        上新设的值。
         """
         if not isinstance(self.config, dict) or not self._conf_groups:
             return
@@ -1759,18 +1708,14 @@ class RWInfoPlugin(Star):
     def _schema_path(self) -> str:
         """定位 _conf_schema.json 的路径。
 
-        **实测问题**：
-          [WARN] [配置] 未能识别分组结构（_conf_schema.json 读取失败）
-        后果：分组识别失败 -> 配置项全退回 _default_config() 的默认值
-        -> 「官Q模式」读成 False -> 消息走纯文本通道（无折叠、无按钮）。
+        读不到的后果：`[WARN] [配置] 未能识别分组结构` -> 分组识别失败 ->
+        配置项全退回 _default_config() 的默认值 -> 「官Q模式」读成 False ->
+        消息走纯文本通道（无折叠、无按钮）。
 
-        AstrBot 把插件放在 data/plugins/ 下，但实际目录层级可能多一层
-        （zip 安装解包出 `astrbot_plugin_rwinfo/astrbot_plugin_rwinfo/`），
-        或者 __file__ 指向的位置与实际文件不在一处。
-        `room_info.py` 那边早就踩过这个坑并加了父目录后备（见模块头部），
-        schema 这里却只试了单层 —— 这就是不一致的地方。
-
-        现在按可靠性排序，并为每一层都补上「父目录 / 子目录」兜底。
+        AstrBot 把插件放在 data/plugins/ 下，但实际层级可能多一层（zip 安装
+        会解出 `astrbot_plugin_rwinfo/astrbot_plugin_rwinfo/`），__file__ 也
+        可能与实际文件不在一处。`room_info.py` 有父目录后备，schema 这里过去
+        只试单层。现在按可靠性排序，并为每一层都补「父目录 / 子目录」兜底。
         """
         cands = self._schema_candidates()
         for p in cands:
@@ -1876,16 +1821,14 @@ class RWInfoPlugin(Star):
         """返回 {分组名: [组内键, ...]}。
 
         分组结构有两个来源，优先用磁盘 schema，读不到就从配置自身推断：
+        ① 磁盘 schema：顶层 `type == object` 的项。
+        ② 配置自身（兜底）：AstrBot 传进来的 `config` 本身就是嵌套结构
+        （`{"基础设置": {...}, "名单管理": {...}}`），只要某个顶层键的值
+        是 dict、且键名不在默认配置里，它就是分组。
 
-        **来源 ①（磁盘 schema）**：顶层 `type == object` 的项。
-        **来源 ②（配置自身，兜底）**：AstrBot 传进来的 `config` 本身
-        就是嵌套结构（`{"基础设置": {...}, "名单管理": {...}}`），
-        只要某个顶层键的值是 dict、且键名不在默认配置里，
-        它就是分组。这条兜底很关键 —— 实测线上 `_conf_schema.json`
-        读不到（`分组数=0`）时，`官Q模式` 仍然能正确读出 True，
-        正是因为 `_build_flat_config` 的嵌套兜底在起作用。
-        分组识别也该有同样的韧性，否则 `_write_config` 会把值写到
-        顶层去，面板上改配置就不生效了。
+        ② 不可省略：线上 `_conf_schema.json` 读不到（`分组数=0`）时，`官Q模式`
+        仍能正确读出 True，靠的就是 `_build_flat_config` 的嵌套兜底；分组识别
+        缺了它，`_write_config` 会把值写到顶层，面板上改配置不生效。
         """
         schema = self._load_schema()
         groups = {}
@@ -1932,7 +1875,7 @@ class RWInfoPlugin(Star):
                 continue
             for k, v in items.items():
                 if isinstance(v, dict) and "default" in v:
-                    flat[k] = v["default"]
+                    flat[k] = copy.deepcopy(v["default"])
 
         if not isinstance(self.config, dict):
             return flat
@@ -2136,18 +2079,13 @@ class RWInfoPlugin(Star):
     def _is_plugin_ui_text(self, text: str) -> bool:
         """判断这条消息是不是插件自己发出的「界面文本」。
 
-        特征：文本里出现插件固定的标题行，例如
-          · 【铁锈查房调试】
-          · 【铁锈查房插件指令】
-          · 【铁锈查房调试菜单】
-          · 【铁锈查房调试 · xxx】
+        特征：文本里出现插件固定的标题行，例如【铁锈查房调试】、
+        【铁锈查房插件指令】、【铁锈查房调试菜单】、【铁锈查房调试 · xxx】。
+        这类内容含真实房号和会误判成字母房号的英文单词（s5132 / black），
+        绝不能被当成用户的房号请求。
 
-        这类内容含真实房号和会误判成字母房号的英文单词
-        （如 s5132 / black），绝不能被当成用户的房号请求。
-
-        **不用 startswith 而用「标题行出现」**：跨框架收消息时，正文
-        可能被包进引用前缀（如 `[引用消息(...)] 正文`）或 Markdown，
-        开头不一定就是标题。
+        **不用 startswith 而用「标题行出现」**：跨框架收消息时正文可能被包进
+        引用前缀（如 `[引用消息(...)] 正文`）或 Markdown，开头不一定是标题。
         """
         t = (text or "").strip()
         if not t:
@@ -2203,16 +2141,14 @@ class RWInfoPlugin(Star):
     def _recall_parse(self, entry):
         """解析单条撤回配置。
 
-        新格式: "key:延迟"         例 "#123456:60" / "@3856554669:30" / "*:60"
-        显式关闭: "key:off"        例 "#123456:off"(延迟记为 -1，覆盖 "*" 继承)
-        旧格式: "key:开:延迟"      例 "#123456:1:60"(兼容迁移, 开=0 视为已关闭返回 None)
+        新格式: "key:延迟"     例 "#123456:60" / "@3856554669:30" / "*:60"
+        显式关闭: "key:off"    例 "#123456:off"（延迟记为 -1，覆盖 "*" 继承）
+        旧格式: "key:开:延迟"  例 "#123456:1:60"（兼容迁移，开=0 视为关闭返回 None）
 
         返回 {"key": str, "延迟": int} 或 None(格式非法 / 旧格式里标记为关闭)。
         延迟为 -1 表示「显式关闭」，只由 key:off 产生。
-
-        严格校验:
-          · key 必须匹配 #数字 / @标识 / *
-          · 延迟必须是 0-300 的整数, 非整数一律视为非法(不再静默取默认值)
+        严格校验: key 必须匹配 #数字 / @标识 / *；延迟必须是 0-300 的整数,
+        非整数一律非法(不再静默取默认值)。
         """
         s = str(entry or "").strip()
         if not s:
@@ -2738,7 +2674,7 @@ class RWInfoPlugin(Star):
         # 本方法只在 is_room_info(result) 为真时被调用，也就是探针真的
         # 拿到了房间信息；英文单词 game / hello 查不到信息，不会走到这里。
         try:
-            ck = f"{self._dedup_key(event)}|{str(rid).lower()}"
+            ck = f"{self._dedup_key(event)}|{normalize_room_id(rid)}"
             self._room_ok[ck] = time.time()
         except Exception as e:
             self.logger.debug(f"[查房] 结果记录失败(忽略): {e}")
@@ -2809,20 +2745,14 @@ class RWInfoPlugin(Star):
         """判断某一类内容是否该压缩。
 
         kind:
-          "room" 查房结果（单房详情，键值对）
-          "list" 房间列表（分页清单，多条房间）
-          "diag" 调试输出
-          "help" 帮助与菜单
-
+        "room" 查房结果（单房详情，键值对）  "list" 房间列表（分页清单）
+        "diag" 调试输出                      "help" 帮助与菜单
         all 覆盖全部四类，选了「全部压缩」即不再分别设置。
 
-        注意 help 这一档容易被漏：帮助文本很长（40+ 行），
-        是最需要折叠的内容之一。早期版本没接进来，
-        导致选了 all 之后帮助依旧是一大坨。
-
-        但 help 在官Q模式下又**不能折叠**（见 _compress_text 的例外），
-        因为 QQ 官方 Markdown 不支持代码块，折叠会退化成纯文本。
-        所以 help 的实际折叠只在个人机器人下发生。
+        help 这一档容易漏：帮助文本很长（40+ 行），是最需要折叠的内容之一。
+        但 help 在官Q模式下**不能折叠**（见 _compress_text 的例外），因为 QQ
+        官方 Markdown 不支持代码块，折叠会退化成纯文本；所以 help 的实际折叠
+        只在个人机器人下发生。
         """
         scope = self._compress_scope()
         if scope == "all":
@@ -2888,39 +2818,26 @@ class RWInfoPlugin(Star):
     def _strip_markdown(self, text: str, prefix: str = "") -> str:
         """把 Markdown 触发写法换成不会被渲染的等价写法。
 
-        第三方机器人（OneBot / NapCat 等）的 QQ 客户端仍会解析消息里的
-        Markdown 语法，即使插件只发纯文本。会被自动渲染的写法：
+        第三方机器人（OneBot / NapCat 等）的 QQ 客户端仍会解析消息里的 Markdown，即使
+        插件只发纯文本。会被渲染的写法：`|` 多次(表格)、`**x**`(粗体)、``` (代码块)、
+        行首 4 个以上空格(缩进式代码块)、`> `(引用块)、`- `/`* `/`+ `(无序列表)、
+        `1. `(有序列表)、`# `(标题)、连续 `---`(分割线)。
 
-          · `|` 多次出现            -> 表格
-          · `**x**`                 -> 粗体
-          · ``` ``` ```             -> 代码块
-          · 行首 4 个以上空格       -> 缩进式代码块
-          · 行首 `> ` / `>`         -> 引用块
-          · 行首 `- ` / `* ` / `+ `  -> 无序列表
-          · 行首 `1. `              -> 有序列表
-          · 行首 `# `               -> 标题
-          · 连续 `---`              -> 分割线
-
-        **行首缩进是最容易漏的一条**：room_info.py 输出的玩家列表是
-        ` 玩家列表:` + `  A1: xxx`，正好在空行之后，QQ 会把它整体识别成
-        缩进式代码块，消息里凭空多出一个「代码 / 复制 / 全屏」的框。
-        这里统一把前导空格换成全角空格：视觉缩进保留，但不再触发解析。
-
-        `prefix` 是当前唤醒词。它本身可能就是 Markdown 特殊字符（最常见的是
-        `>`），这时行首的 `>铁锈列表` 会被 QQ 整行渲染成引用块、把 `>` 吃掉，
-        用户看不见指令前缀。所以对行首唤醒词做全角替换：
-
-          `>` -> `＞`   `!` -> `！`   `#` -> `＃`
-          `-` -> `－`   `*` -> `＊`   `_` -> `＿`
-
-        全角字符视觉几乎一致，但不触发任何 Markdown 规则。
-        `/` 等非特殊字符保持原样（不影响复制粘贴）。
+        行首缩进最易漏：room_info.py 的 ` 玩家列表:` / `  A1: xxx` 位于空行之后，QQ 会
+        整体识别成缩进式代码块；前导空格换成全角空格即可保留缩进且不触发解析。
+        `prefix` 是当前唤醒词，本身可能是 Markdown 特殊字符（最常见 `>`），行首
+        `>铁锈列表` 会被渲染成引用块并吃掉 `>`；故对行首唤醒词做全角替换
+        （`>` -> `＞`、`!` -> `！`、`#` -> `＃`、`-` -> `－`、`*` -> `＊`、`_` -> `＿`），
+        视觉几乎一致但不触发 Markdown，`/` 等保持原样。
         """
         if not text:
             return text
         s = str(text)
         # 1. 竖线 -> 全角（表格触发）；粗体星号去掉
         s = s.replace("|", "｜")
+        # `[文字](链接)` 是唯一能凭空造出可点链接的写法，
+        # 官Q 通道（_md_neutralize）早就断了，这里必须同口径。
+        s = s.replace("](", "]\\(")
         s = s.replace("**", "")
         # 2. 代码块围栏整行去掉
         out = []
@@ -3007,20 +2924,16 @@ class RWInfoPlugin(Star):
         """非官方平台：把长内容发成「聊天记录」合并转发卡片。
 
         返回 (ok, mid, reason)：
-          ok=True  —— 已发出（或异常但可能已送达），调用方不要再发纯文本
-          ok=False —— 无法合并转发，reason 说明原因，调用方降级并提示
+        ok=True  —— 已发出（或异常但可能已送达），调用方不要再发纯文本
+        ok=False —— 无法合并转发，reason 说明原因，调用方降级并提示
 
-        为什么用合并转发：
-          个人机器人（aiocqhttp / NapCat 等）走 OneBot v11，支持
-          `send_group_forward_msg` 发「聊天记录」卡片，群里只占一条消息，
-          点开才展开全部内容 —— 这是个人机器人唯一能做到真折叠的方式。
-          官方机器人没有这个接口，那边用 Markdown 引用块代替（见 _fold_markdown）。
-
-        实现细节：
-          OneBot 的 node 有两种格式，不同实现支持的不一样，按顺序试：
-            ① {"type":"node","data":{"name":..,"uin":..,"content":..}}  标准
-            ② {"name":..,"uin":..,"content":..}                          简写
-          都不行再放弃，交给调用方降级。
+        个人机器人（aiocqhttp / NapCat 等）走 OneBot v11，支持
+        `send_group_forward_msg`，群里只占一条消息，点开才展开 —— 这是个人
+        机器人唯一能真折叠的方式；官方机器人没有该接口，那边用 Markdown 引用块
+        代替（见 _fold_markdown）。
+        node 有两种格式，不同实现支持的不一样，按顺序试，都不行再交给调用方
+        降级：① {"type":"node","data":{...}} 标准；② {"name":..,"uin":..,
+        "content":..} 简写。
         """
         bot = getattr(event, "bot", None)
         if bot is None:
@@ -3035,7 +2948,7 @@ class RWInfoPlugin(Star):
             return False, None, "私聊无法合并转发"
         # 整条内容做成**一条**记录：标题和正文放在同一个 node 里。
         # 早先按 400 字切块，卡片里会横着好几条聊天记录，点开还得一条条翻，
-        # 房间信息本来就一屏能看完，切块纯属添乱。
+        # 房间信息一屏能看完，切块反而更难读。
         body = str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
         if not body:
             return False, None, "内容为空"
@@ -3058,7 +2971,9 @@ class RWInfoPlugin(Star):
             if not isinstance(e, (TypeError, KeyError, AttributeError)):
                 reason = f"{type(e).__name__}: {e}"
                 self.logger.warning(f"[合并转发] 发送异常，可能已送达，不再重试: {reason}")
-                return False, None, reason
+                # ok=True：卡片大概率已经落群，调用方不能再补发纯文本，
+                # 否则群里就是两条重复结果。
+                return True, None, reason
             try:
                 simple = [
                     {
@@ -3348,27 +3263,22 @@ class RWInfoPlugin(Star):
     def _to_markdown(self, text: str) -> str:
         """把 `键：值` 形式的纯文本结果转成 Markdown。
 
-        只做**结构无损**的转换，不猜测内容：
-          · 首行的 `版本：1.15` 之类 -> 保留为普通行
-          · 连续的 `键：值` -> 转成两列表格
-          · ` 玩家列表:` 之后缩进的条目 -> 转成无序列表
-          · 其它不符合规则的行 -> 原样保留
-        这样即使 format_room 以后加字段，也不会漏掉。
+        只做**结构无损**的转换，不猜测内容：首行 `版本：1.15` 之类保留为普通
+        行；连续的 `键：值` 转两列表格；` 玩家列表:` 之后缩进的条目转无序列表；
+        其它不符合规则的行原样保留 —— format_room 以后加字段也不会漏。
 
-        **前置守卫**：如果文本里已经含 Markdown 结构（`***` 分割线、
-        `> ` 引用块、`| ... |` 表格行、``` 代码块），直接原样返回。
-        否则会把折叠后的内容二次加工成畸形表格 —— 实测过：
-        `> 筛选:` 会被转成 `| > 筛选 | |`，整个排版崩掉。
+        **前置守卫**：文本里已含 Markdown 结构（`***` 分割线、`> ` 引用块、
+        `| ... |` 表格行、``` 代码块）时直接原样返回，否则会把折叠后的内容二次
+        加工成畸形表格（`> 筛选:` 被转成 `| > 筛选 | |`，排版崩掉）。
 
-        **帮助文本特判**：首行是「【铁锈查房插件指令】」这类帮助内容时，
-        转成「粗体分类标题 + 指令列表」，不套键值表格。
-        原因：帮助里的 `|` 是参数分隔符（如 `/铁锈列表 房间中|游戏中`），
-        不是键值对；套表格会把整行塞进单元格，QQ 里排版全乱。
+        **帮助文本特判**：首行是「【铁锈查房插件指令】」这类内容时转成「粗体
+        分类标题 + 指令列表」，不套键值表格 —— 帮助里的 `|` 是参数分隔符
+        （如 `/铁锈列表 房间中|游戏中`），套表格会把整行塞进单元格。
         """
         if not text:
             return ""
         lines = str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n")
-        # ---- 已经是 Markdown 了，别再动 ----
+        # ---- 已经是 Markdown，不再处理 ----
         # 代码块折叠后含 ``` 围栏，必须原样返回，否则会被二次加工成畸形表格。
         # `> ` 引用块 / `***` 分割线保留判定，防御旧格式文本直接传入。
         for ln in lines:
@@ -3468,17 +3378,15 @@ class RWInfoPlugin(Star):
     def _help_to_markdown(self, lines):
         """把帮助文本转成 QQ 官方可渲染的 Markdown。
 
-        QQ 官方机器人的 Markdown 只认少数语法，未识别的行按纯文本渲染。
-        只转换部分行会导致同一条消息里出现「粗体标题 + 纯文本 + 列表项」
-        的混排，因此这里对每一类行都给出确定的目标格式：
-
-          · `【xxx】v1.5.7`        -> `**粗体**`
-          · `—— 分类 ——`          -> `**粗体**`
-          · 指令行（`/` `>` `!`）  -> `- ` 列表项，`|` 换全角 `｜`
-          · 缩进说明行             -> `  - ` 二级列表项（保住层级，不塌陷）
-          · `键: 值` 说明行        -> `- **键**：值`（粗体键，和列表同层级）
-          · 纯说明行               -> `- ` 列表项
-        这样整条消息只有「粗体 + 无序列表」两种结构，不会再半 Markdown 半纯文本。
+        QQ 官方机器人的 Markdown 只认少数语法，未识别的行按纯文本渲染；只转换
+        部分行会造成同一条消息里「粗体标题 + 纯文本 + 列表项」混排。因此对每
+        一类行都给出确定的目标格式：
+        · `【xxx】v1.5.7` / `—— 分类 ——` -> `**粗体**`
+        · 指令行（`/` `>` `!`）  -> `- ` 列表项，`|` 换全角 `｜`
+        · 缩进说明行             -> `  - ` 二级列表项（保住层级）
+        · `键: 值` 说明行        -> `- **键**：值`
+        · 纯说明行               -> `- ` 列表项
+        这样整条消息只有「粗体 + 无序列表」两种结构。
         """
         out = []
         for raw in lines:
@@ -3531,20 +3439,15 @@ class RWInfoPlugin(Star):
     def _pr(self, event, text, kind: str = "auto"):
         """构造面向用户的纯文本结果：替换指令前缀 + 按需压缩折叠。
 
-                **重要限制**：本方法返回的是 AstrBot 的纯文本组件，无法发送
-        _ag = self._send_text(...)
-        async for _r in _ag:
-            yield _r`。
-        _ag = self._send_text(...)
-        async for _r in _ag:
-            yield _r` 保持零改动。
+        返回的是 AstrBot 的纯文本组件，无法承载 Markdown / 图片等富文本；
+        发送层对 `_ag = self._send_text(...)` / `async for _r in _ag: yield _r`
+        这条链路保持零改动。
 
-                参数 kind：
-                  "auto"  —— 自动判断。有房号信息 -> room，有调试标记 -> diag，
-                             其余按 help 处理。
-                  "room" / "diag" / "help" —— 显式指定分类。
+        参数 kind：
+          "auto" —— 自动判断，有房号信息 -> room，有调试标记 -> diag，其余按 help 处理。
+          "room" / "diag" / "help" —— 显式指定分类。
 
-                只替换 `/铁锈`、`/rwinfo` 这类**指令名**，不会碰文件路径和 URL。
+        只替换 `/铁锈`、`/rwinfo` 这类**指令名**，不会碰文件路径和 URL。
         """
         if not text:
             return event.plain_result(text)
@@ -3609,7 +3512,7 @@ class RWInfoPlugin(Star):
         # 比原文长得多，代码块才是最短且保留对齐的形式。
         try:
             if k == "list" or not is_content:
-                # 回执型文本任何平台都不折：它本来就只有一两行
+                # 回执型文本任何平台都不折：只有一两行
                 pass
             elif official:
                 if k in ("help", "diag"):
@@ -3902,32 +3805,25 @@ class RWInfoPlugin(Star):
     def _keyboard_of(self, text: str, event=None):
         """根据结果内容生成快捷指令按钮（官方 Markdown 专用）。
 
-        action.type=2 = 指令按钮：点击后把 data 填进输入框。
-        enter=False：按钮不自动回车，避免误触直接刷屏。
+        `action.type=2` = 指令按钮：点击后把 `data` 填进输入框；`enter=False` 不自动回车，
+        避免误触刷屏。返回 None 时调用方不要传 `keyboard`，否则 QQ 会渲染空键盘。
 
-        按钮里的 data 必须是真能执行的指令。早期实现写了
-        `/铁锈查房 {rid} 玩家`，但 cmd_query_room 的 arg 只接受
-        序号/房号/IP:端口，「玩家」不会被解析，点下去整串会被当房号查，
-        会提示「房号不存在」。这里只放确实支持的指令：
-          · 刷新     —— /铁锈查房 <房号>        （重新查同一个房）
-          · 玩家列表 —— /铁锈玩家列表 开         （这是全局开关，不是按房查）
-          · 房间列表 —— /铁锈列表
-          · 帮助     —— /铁锈帮助
+        按钮 `data` 必须是真能执行的指令：`/铁锈查房 {rid} 玩家` 不行，`cmd_query_room`
+        的 `arg` 只接受 序号/房号/IP:端口，「玩家」不被解析，整串会被当房号查并提示
+        「房号不存在」。因此只放确实支持的指令：刷新（`/铁锈查房 <房号>`）、玩家列表
+        （`/铁锈玩家列表 开`，全局开关）、房间列表（`/铁锈列表`）、帮助（`/铁锈帮助`）。
 
-        **只给「房间信息」和「房间列表」挂按钮**：按钮是为「看完这条
-        房间信息，想马上再点一下」设计的；挂在指令回执上（保存成功、
-        已关闭、名单已更新、调试输出、帮助、报错）纯属噪音，还会把消息
-        撑高一大截。其余情况返回 None，由发送端跳过 keyboard 字段。
-
-        返回 None 时调用方不要传 keyboard，否则 QQ 会渲染出一个空键盘。
+        只有房间信息、房间列表、帮助菜单挂按钮；其余（保存成功、已关闭、名单已更新、
+        调试输出、报错）是回执，挂上去是噪音，还会撑高消息。
         """
         raw = str(text or "")
         rid = fingerprint_room_id(raw)
         p = self._prefix_of(event)
         is_list = raw.lstrip().startswith(("【房间列表】", "[房间列表]"))
         is_room = bool(rid and rid != "?") and is_room_info(raw)
-        if not is_list and not is_room:
-            # 指令回执 / 帮助 / 调试 / 错误提示：不挂按钮
+        is_help = raw.lstrip().startswith(("【铁锈查房插件指令】", "[铁锈查房插件指令]"))
+        if not is_list and not is_room and not is_help:
+            # 指令回执 / 调试 / 错误提示：不挂按钮
             return None
 
         rows = []
@@ -3964,7 +3860,7 @@ class RWInfoPlugin(Star):
             if nav:
                 rows.append({"buttons": nav})
 
-        if is_room:
+        elif is_room:
             rows.append(
                 {
                     "buttons": [
@@ -4024,6 +3920,44 @@ class RWInfoPlugin(Star):
                 }
             )
 
+        elif is_help:
+            # 帮助菜单：给「看完不知道点哪」的人两个最常用的入口。
+            # 不挂「帮助」按钮 —— 已经在帮助页上了，再点一次没意义。
+            cur = bool(self.cfg.get("show_players", False))
+            nxt = "关" if cur else "开"
+            rows.append(
+                {
+                    "buttons": [
+                        {
+                            "render_data": {
+                                "label": "玩家列表" + nxt,
+                                "visited_label": "已切换",
+                                "style": 0,
+                            },
+                            "action": {
+                                "type": 2,
+                                "permission": {"type": 2},
+                                "data": f"{p}铁锈玩家列表 {nxt}",
+                                "enter": False,
+                            },
+                        },
+                        {
+                            "render_data": {
+                                "label": "房间列表",
+                                "visited_label": "加载中",
+                                "style": 0,
+                            },
+                            "action": {
+                                "type": 2,
+                                "permission": {"type": 2},
+                                "data": f"{p}铁锈列表",
+                                "enter": False,
+                            },
+                        },
+                    ]
+                }
+            )
+
         # 项目主页按钮：type=0 URL 跳转（不受 Markdown 域名白名单限制）
         # 房间信息/房间列表都挂（单页列表没有翻页行时也要有）
         try:
@@ -4044,21 +3978,29 @@ class RWInfoPlugin(Star):
                 )
         except Exception:
             pass
+        # 「玩家列表开|关」对应 /铁锈玩家列表，是管理员指令。普通成员点了会被
+        # 权限过滤器拒掉，按钮上的「已切换」却是骗人的 —— 干脆不给他们看。
+        # event 为 None（无事件上下文的渲染）时按无权处理，宁可少一个按钮。
+        if rows and not self._is_admin(event):
+            for row in rows:
+                row["buttons"] = [
+                    b
+                    for b in row.get("buttons", [])
+                    if "铁锈玩家列表" not in str(b.get("action", {}).get("data", ""))
+                ]
+            rows = [r for r in rows if r.get("buttons")]
         return {"content": {"rows": rows}} if rows else None
 
     def _adapt_text(self, text: str, event=None) -> str:
         """按平台适配消息文本。
 
-        官方机器人对纯文本的支持较弱（有些接口会把长文本截断、
-        或对连续空白/特殊符号处理异常）。规整动作：
-          · 统一换行符，去掉行尾空白
-          · 压缩连续空行（最多保留一个）
-          · 过长的行按字符折行，避免单行超长被截断
+        官方机器人对纯文本支持较弱（有的接口会截断长文本，或对连续空白、特殊
+        符号处理异常）。规整动作：统一换行符、去掉行尾空白、压缩连续空行（最多
+        保留一个）、过长的行按字符折行避免被截断。
 
-        **开启「官Q模式」后生效**，不再强制要求判定为官方平台。
-        原因：平台判定依赖 event 上的 platform 属性 / self_id 形态，
-        不同适配器差异很大，判不出来时用户开了却完全没效果。
-        开着就等于「我要这套排版」，判定仅用于日志提示。
+        **开启「官Q模式」后生效**，不再强制判定为官方平台：平台判定依赖 event
+        上的 platform 属性 / self_id 形态，不同适配器差异很大，判不出来时用户
+        开了却完全没效果。开着就等于「我要这套排版」，判定仅用于日志提示；
         未开启时原样返回，零影响。
         """
         if not text:
@@ -4102,19 +4044,14 @@ class RWInfoPlugin(Star):
     async def _send_recallable(self, event, text: str):
         """发送一条消息, 返回 message_id; 拿不到则返回 None。
 
-        自动撤回需要 message_id。取 mid 的策略:
+        自动撤回需要 message_id。开启撤回时先试 `bot.send_msg(...)`
+        （OneBot v11 风格, 稳定返回 {"message_id": ...}）；没有该方法或调用抛
+        异常则退回 `event.send()` 保证消息发出去，此时大概率拿不到 mid，该条
+        无法撤回（记 info 日志说明原因）。未开启撤回时直接 `event.send()`。
 
-          开启撤回时:
-            ① `bot.send_msg(...)` —— OneBot v11 风格, 稳定返回 {"message_id": ...}
-            ② 若 bot 没这个方法 / 调用抛异常 → 退回 `event.send()` 保证消息能发出去,
-               但此时大概率拿不到 mid, 该条无法撤回(会记 info 日志说明原因)
-
-          未开启撤回:
-            直接 `event.send()`, 不关心 mid
-
-        **关键: 绝不重复发送。** 只要 `bot.send_msg` 被调用过(哪怕抛异常),
-        就不再走 `event.send` —— 因为异常也可能发生在消息已经送达之后
-        (网络超时、解析回包失败等), 再发一次群里就有两条了。
+        **绝不重复发送**：只要 `bot.send_msg` 被调用过（哪怕抛异常）就不再走
+        `event.send` —— 异常也可能发生在消息已送达之后（网络超时、解析回包失败
+        等），再发一次群里就有两条。
         """
         text = text.strip()
         if not text:
@@ -4195,7 +4132,7 @@ class RWInfoPlugin(Star):
         # **安全转换**：OneBot 的 group_id/user_id 必须是整数，
         # 但官方机器人的群号/用户号是 openid 字符串（A1B2...）。
         # 直接 int() 会抛 ValueError，而异常分支设计为「不重发」，
-        # 结果就是官方机器人一条消息都发不出去 —— 这是实测到的真实缺陷。
+        # 否则官方机器人一条消息都发不出去。
         # 取不到整数时**不能抛异常**（会被下面 except 吞掉并 return，
         # 消息彻底丢失），而是标记为「这个 bot 走不了 OneBot 路径」，
         # 静默降级到原生发送。
@@ -4441,7 +4378,7 @@ class RWInfoPlugin(Star):
         """探针池快照, 供调试展示。语义明确化, 避免"下一个编号"造成误解。"""
         used = sorted(self.probe_used)
         released = sorted(self.probe_released)
-        # 该编号是否曾经分配过(用于解释 probe_next 的含义)
+        # 该编号是否已分配过(用于解释 probe_next 的含义)
         ever_allocated_max = self.probe_next - 1
         return {
             "范围": f"{PROBE_MIN}-{PROBE_MAX}",
@@ -4518,12 +4455,12 @@ class RWInfoPlugin(Star):
         """由列表第 21 列(A 字段)推导 masterserver get 的挑战码。
 
         反推自客户端 gameFramework/j/m.java 的 a(int i):
-            i < 100000  -> MD5("x"  + i)[:10]
-            i < 200000  -> MD5("y"  + i)[:11]
-            i < 300000  -> MD5("z"  + i)[:12]
-            i < 1000000 -> MD5("xx" + i)[:13]
-            i < 2000000 -> MD5("yy" + i)[:14]
-        实测 A=10605 -> "da7821ccf7"
+        i < 100000  -> MD5("x"  + i)[:10]
+        i < 200000  -> MD5("y"  + i)[:11]
+        i < 300000  -> MD5("z"  + i)[:12]
+        i < 1000000 -> MD5("xx" + i)[:13]
+        i < 2000000 -> MD5("yy" + i)[:14]
+        已知取值: A=10605 -> "da7821ccf7"
         """
         try:
             a = int(a)
@@ -4641,7 +4578,7 @@ class RWInfoPlugin(Star):
             "--max-players",
             str(self.cfg.get("max_players_display", 10)),
         ]
-        # 推广冷却状态也写到插件数据目录，别落进插件自身目录；
+        # 推广冷却状态也写到插件数据目录，不要落进插件自身目录；
         # 没有数据目录时不传，探针就只在本次进程内计数（不落盘）
         if self._data_dir:
             cmd_args += ["--state-dir", self._data_dir]
@@ -4658,6 +4595,9 @@ class RWInfoPlugin(Star):
             ]
         if self.cfg.get("debug", False):
             cmd_args.append("--debug")
+        # 探针输出是插件的解析输入，绝不能带 ANSI：万一环境里设置了
+        # RWINFO_COLOR=always，`房间版本：` 前会多出转义序列，前缀匹配就失效了。
+        cmd_args += ["--color", "never"]
         self.logger.debug(f"[DBG] _query_room 调用: rid={rid} name={probe_name}")
         self.logger.debug(
             f"[DBG] python={python} exists={os.path.exists(python) if python else False}"
@@ -4746,7 +4686,7 @@ class RWInfoPlugin(Star):
                 # 「进程没起来 / 网络不通 / 脚本自己崩了」三种情况。
                 tail = [ln.strip() for ln in (err or "").splitlines() if ln.strip()][-3:]
                 detail = "；".join(tail)[:240]
-                # 退出码是 room_info.py 的分类（EXIT_NET/NO_ROOM/ROOM_BUSY/PROTO），
+                # 退出码是 room_info.py 的分类（EXIT_NET/NO_ROOM/ROOM_BUSY/PROTO/HUMAN），
                 # 能直接说清是哪一类问题，比「无响应」有用得多。
                 rc_hint = {
                     2: "探针连不上中继（DNS 解析失败或端口不通），"
@@ -4754,6 +4694,7 @@ class RWInfoPlugin(Star):
                     3: "房间不存在或已关闭",
                     4: "房间已满或游戏已经开始，探针进不去",
                     5: "房间信息解析或查询链路异常（房间可能刚开或在迁移，稍后重试）",
+                    6: "该服务器要求人机接入验证，探针无法自动完成",
                 }.get(rc)
                 if rc_hint:
                     msg = f"[房间查询失败] {rc_hint}（退出码 {rc}）"
@@ -4783,15 +4724,12 @@ class RWInfoPlugin(Star):
         """判断 ident 是否命中名单 lst（kind 为 "#" 群或 "@" 用户）。
 
         **严格匹配前缀**：条目必须带正确前缀，标识部分完全相等。
-          · "#3A28BF..." 配 "#" + "3A28BF..."  -> 命中
-          · "3A28BF..."  裸值（缺前缀）        -> 不命中
-          · "@3A28BF..." 前缀类型不符          -> 不命中
+        "#3A28BF..." 配 "#" + "3A28BF..." -> 命中；裸值 "3A28BF..." -> 不命中；
+        "@3A28BF..." -> 前缀类型不符，不命中。
 
-        **标识部分忽略大小写**：官方机器人的 openid 是十六进制哈希，
-        不同适配器/事件给出的字母大小写可能不一致（有时全大写、有时全小写）。
-        对十六进制串来说大小写是同一个 ID，比对必须归一化，
-        否则会随机出现「填对了却提示没权限」。
-        数字 QQ 不含字母，归一化无副作用。
+        **标识部分忽略大小写**：官方机器人的 openid 是十六进制哈希，不同适配器/
+        事件给出的字母大小写可能不一致（有时全大写、有时全小写），必须归一化，
+        否则会随机出现「填对了却提示没权限」。数字 QQ 不含字母，归一化无副作用。
         """
         if not ident:
             return False
@@ -4804,7 +4742,7 @@ class RWInfoPlugin(Star):
     def _near_miss(self, lst, kind: str, ident: str):
         """找出「标识相同、但前缀缺失或写错」的条目。
 
-        用于把配置错误讲清楚：条目内容其实是对的，只是少了 `#` 或 `@`。
+        用于把配置错误讲清楚：条目内容是对的，只是少了 `#` 或 `@`。
         返回原始条目字符串列表（可能为空）。
         """
         if not ident:
@@ -4858,7 +4796,7 @@ class RWInfoPlugin(Star):
                 return True  # 用户在混合白名单 -> 放
             # 用户不在两名单: 跟随配置的私聊默认策略
             # 只认明确的 black；None/拼错/大小写不符一律按 white 处理。
-            # 原来是 `policy != "white"`，配置被改坏时会 fail-open（谁都放行）。
+            # 旧实现是 `policy != "white"`，配置被改坏时会 fail-open（谁都放行）。
             policy = str(self.cfg.get("混合_私聊策略") or "white").strip().lower()
             return policy == "black"  # white=不在白->拦(False); black=在黑才拦->放(True)
         # 群聊
@@ -4886,16 +4824,13 @@ class RWInfoPlugin(Star):
     def _migrate_broken_list_entries(self):
         """启动时检查四个名单里的写法问题，只告警、不改数据。
 
-        检查两类：
-          ① 缺前缀：条目是不带 `#` / `@` 的裸标识。
-             名单前缀是有语义的（# 群、@ 用户），代码严格按前缀匹配，
-             裸值永远匹配不上。这类必须由配置者自己补上。
-          ② 截断残留：形如 `#3` 这种超短纯数字条目。
-             v1.5.7 及更早用 re.search(r"\\d+") 抽数字段，把官方机器人的
-             32 位哈希 openid 截成了 "#3"，属于死数据。
+        检查两类：① 缺前缀 —— 条目是不带 `#` / `@` 的裸标识；名单前缀有语义
+        （# 群、@ 用户），代码严格按前缀匹配，裸值永远匹配不上。② 截断残留 ——
+        形如 `#3` 的超短纯数字条目：v1.5.7 及更早用 re.search(r"\\d+") 抽数字段，
+        把官方机器人 32 位哈希 openid 截成 "#3"，属于死数据。
 
-        只告警不自动改，理由：自动补前缀会把「用户本来想加群却写成用户」
-        这类真实语义错误一起糊过去，问题只是被推迟到下次。
+        只告警不自动改：自动补前缀会把「本意加群却写成用户」这类真实语义错误
+        一起糊过去，问题只被推迟到下次。
         """
         try:
             groups = ("白名单", "黑名单", "混合_白名单", "混合_黑名单")
@@ -4936,20 +4871,16 @@ class RWInfoPlugin(Star):
         """当前会话是否整体禁止使用本插件（管理/辅助指令的准入闸门）。
 
         **调用时机**：本方法在 AstrBot 的权限校验之后执行，构成两级串联：
+        事件 → [AstrBot] command 匹配
+        → [AstrBot] permission_type(ADMIN)  ← 非管理员在此被框架拦下
+        → [插件]   _session_blocked()       ← 名单外的管理员在此被拦下
+        → 业务逻辑
+        即**名单的约束力高于 AstrBot 管理员身份**：管理员先过框架那关，再过名单
+        这关，任一不过都无法执行。
 
-            事件 → [AstrBot] command 匹配
-                 → [AstrBot] permission_type(ADMIN)  ← 非管理员在此被框架拦下
-                 → [插件]   _session_blocked()       ← 名单外的管理员在此被拦下
-                 → 业务逻辑
-
-        也就是说：**名单的约束力高于 AstrBot 管理员身份**。
-        管理员先过框架那关，再过名单这关，任一不过都无法执行。
-
-        与 `_is_allowed` 的分工：
-          · `_is_allowed`      —— 能不能查房（黑名单模式下默认放行）
-          · `_session_blocked` —— 能不能用插件（名单说不让用就是不让用）
-
-        返回值：None 表示放行；返回字符串表示应直接回这句拒绝理由。
+        与 `_is_allowed` 的分工：`_is_allowed` 管能不能查房（黑名单模式默认放行）；
+        本方法管能不能用插件（名单说不让用就不让用）。返回值：None 放行；返回
+        字符串表示应直接回这句拒绝理由。
         """
         try:
             is_private = bool(event.is_private_chat())
@@ -5020,20 +4951,17 @@ class RWInfoPlugin(Star):
     async def cmd_help(self, event: AstrMessageEvent, arg: str = ""):
         """显示本插件全部指令与用法。
 
-        把房间列表、查房、插件设置、其他、自动触发五类指令一次列全，
-        适合第一次使用、或忘记某个指令怎么拼的时候查看。
+        五类指令一次列全，适合第一次使用或忘记某个指令怎么拼时查看：
+        · 房间列表：/铁锈列表 及筛选词（房间中 / 不满 / 真人 / 官方）、页码、
+        刷新、搜索的组合用法，以及翻页指令与全部别名
+        · 查房：/铁锈查房 的三种目标形式（列表序号 / 房号 / IP:端口）
+        · 插件设置：全局解析、名单模式、白名黑名、私聊策略与开关、玩家列表、
+        重试次数、自动撤回
+        · 其他：运行时调试、探针时间反解
+        · 自动触发：什么样的房号会被自动识别、多长的房号才有效、查房结果
+        本身为什么不会再次触发查房
 
-        输出内容：
-          · 房间列表：/铁锈列表 及其筛选词（房间中 / 不满 / 真人 / 官方）、
-            页码、刷新、搜索的组合用法，以及翻页指令与全部别名
-          · 查房：/铁锈查房 的三种目标形式（列表序号 / 房号 / IP:端口）
-          · 插件设置：全局解析、名单模式、白名黑名、私聊策略与开关、
-            玩家列表、重试次数、自动撤回
-          · 其他：运行时调试、探针时间反解
-          · 自动触发：什么样的房号会被自动识别、多长的房号才有效、
-            为什么查房结果本身不会再次触发查房
-
-        别名：铁锈查房菜单 / 铁锈帮助 / rwhelp 四个指令输出完全相同。
+        别名：铁锈查房菜单 / 铁锈帮助 / rwhelp，四个指令输出完全相同。
         """
         _why = self._session_blocked(event)
         if _why:
@@ -5048,7 +4976,7 @@ class RWInfoPlugin(Star):
 
     # ---- 帮助别名 ----
     # 三个别名一律转发到 cmd_help：会话拦截、拼文本、发送这套逻辑抄四份的
-    # 后果是改一处漏三处（历史上就漏过一次会话拦截）。
+    # 后果是改一处漏三处（会话拦截就漏过）。
     @filter.command("铁锈查房菜单")
     async def cmd_help_alias1(self, event: AstrMessageEvent, arg: str = ""):
         """显示本插件全部指令与用法（铁锈查房帮助 的别名）。
@@ -5184,13 +5112,12 @@ class RWInfoPlugin(Star):
         """按 QQ 号隔离的翻页/筛选状态。key=QQ号, value=状态字典。
 
         内存字典是**主存储**（每次翻页都要读写，必须同步、零 await）。
-        AstrBot 的 KV 存储（`self.put_kv_data` / `self.get_kv_data`）
-        是**可选镜像**：插件重启后内存丢失，KV 能让翻页状态续上。
+        AstrBot 的 KV 存储（`self.put_kv_data` / `self.get_kv_data`）是**可选
+        镜像**：插件重启后内存丢失，KV 能让翻页状态续上。
 
-        为什么不直接用 KV 当主存储：`_state_get` / `_state_put` 被
-        `_cmd_list_impl` 等**同步**路径调用，改成 await 要传染整条调用链，
-        风险远大于收益。镜像写入失败一律静默忽略 —— 这只是"重启后还能
-        翻页"的锦上添花，不能影响正常流程。
+        不直接用 KV 当主存储的原因：`_state_get` / `_state_put` 被 `_cmd_list_impl`
+        等**同步**路径调用，改成 await 要传染整条调用链，风险远大于收益。镜像
+        写入失败一律静默忽略 —— 它只是「重启后还能翻页」的附加能力。
         """
         if not hasattr(self, "_room_page_state"):
             self._room_page_state = {}
@@ -5481,7 +5408,8 @@ class RWInfoPlugin(Star):
             cache["ts"] = now  # 滑动续期: 有人用就续命
             return cache["rooms"], True  # 命中缓存
 
-        cmd_args = [sys.executable, "-u", ROOM_INFO_PY, "--list-json"]
+        _py = sys.executable or "python3"
+        cmd_args = [_py, "-u", ROOM_INFO_PY, "--list-json", "--color", "never"]
         # 房间列表也依赖 room_info.py，同样做一次可用性保障
         # 与 _query_room 同一套门控：缺失或接口过旧都触发补齐，
         # 失败时直接返回错误信息，不能落进 create_subprocess_exec
@@ -5501,6 +5429,15 @@ class RWInfoPlugin(Star):
                 cwd=ROOM_INFO_DIR,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
+        except asyncio.CancelledError:
+            # 任务被取消（terminate / 卸载 / 上层超时）时子进程不会自己退出，
+            # 不杀就会一直挂着等它跑完。
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                pass
+            raise
         except asyncio.TimeoutError:
             try:
                 proc.kill()
@@ -5551,28 +5488,16 @@ class RWInfoPlugin(Star):
     async def cmd_list(self, event: AstrMessageEvent, arg: str = ""):
         """查看铁锈战争房间列表（分页显示）。
 
-        用法：
-          /铁锈列表                查看第一页（有缓存则直接用缓存，不重新抓取）
-          /铁锈列表 2              直接跳到第 2 页
-          /铁锈列表 刷新           忽略缓存重新抓取
-          /铁锈列表 房间中         只看已开始的房间
-          /铁锈列表 不满           只看未满员的房间
-          /铁锈列表 真人           只看真人房
-          /铁锈列表 官方           只看官方 Auto Server
-          /铁锈列表 搜索 关键词    按房名或房号搜索
-          /铁锈列表 房间中 2       筛选条件与页码可组合
+        用法：`/铁锈列表`（第一页，有缓存用缓存）、`/铁锈列表 2`（跳页）、
+        `/铁锈列表 刷新`（忽略缓存重抓）、`/铁锈列表 房间中|不满|真人|官方`（筛选）、
+        `/铁锈列表 搜索 词`（按房名或房号搜）、`/铁锈列表 房间中 2`（筛选与页码组合）。
+        筛选规则：新筛选词整体替换旧筛选；只给页码沿用旧筛选；无参数则重新查全部。
 
-        筛选规则：给新的筛选词会整体替换旧筛选；只给页码则沿用旧筛选；
-        不带任何参数则重新查全部。
+        数据来源两路：真人房走 RTSBox 第三方聚合接口（非官方），房多但字段有限；
+        官方 Auto Server 走官方列表，带区域标记，只有官方开的房。
 
-        数据来源有两路：
-          · 真人房：RTSBox 第三方聚合接口（不是官方接口），房多但字段有限
-          · 官方 Auto Server：官方列表，带区域标记，但只有官方开的房
-
-        每行会标出序号，之后可用 /铁锈查房 <序号> 直接查该房；
-        序号对应的真实地址会随本次列表一起缓存（默认 10 分钟有效），
-        过期后需要重新发一次列表。
-        翻页也可用 /铁锈下一页 与 /铁锈上一页。
+        每行标序号，之后用 `/铁锈查房 <序号>` 查该房；序号对应的真实地址随本次列表缓存
+        （默认 10 分钟），过期后需重新发列表。翻页用 `/铁锈下一页`、`/铁锈上一页`。
         别名：房间列表 / 铁锈房列表 / rwlist。
         """
         _src = self._cmd_list_impl(event, arg)
@@ -5634,7 +5559,7 @@ class RWInfoPlugin(Star):
 
         # 取该 QQ 的历史状态(已过期则视为无)
         st = self._state_get(event)
-        # 顺手清理其它已过期的 QQ 状态
+        # 一并清理其它已过期的 QQ 状态
         if len(self._list_page_state()) > 50:
             self._cleanup_states()
 
@@ -5848,7 +5773,7 @@ class RWInfoPlugin(Star):
         )
         # 落盘到 KV：翻页状态要能撑过插件重启 / 长时间不操作。
         # 这里 await 而不是 create_task —— 列表指令本身是异步的，
-        # 顺手写完更确定（见 _state_save_kv 的说明）。
+        # await 写完更确定（见 _state_save_kv 的说明）。
         await self._state_save_kv(event)
 
         # ---- 组装消息 ----
@@ -5924,7 +5849,7 @@ class RWInfoPlugin(Star):
         if total_pages > 1:
             nav.append(f"/铁锈列表 <页码> 直达 1-{total_pages}")
         if nav:
-            # 翻页相关指令并到一行，别占三四行结尾
+            # 翻页相关指令并到一行，避免占三四行结尾
             lines.append("　".join(nav))
         _ag = self._send_text(event, "\n".join(lines))
         async for _r in _ag:
@@ -5934,17 +5859,14 @@ class RWInfoPlugin(Star):
     async def cmd_list_next(self, event: AstrMessageEvent, arg: str = ""):
         """房间列表翻到下一页。
 
-        沿用上一次的筛选条件（房间中 / 不满 / 真人 / 官方 / 搜索关键词）
-        与已抓取的数据缓存，只改变页码。
+        沿用上一次的筛选条件（房间中 / 不满 / 真人 / 官方 / 搜索关键词）与已抓取
+        的数据缓存，只改变页码。
 
-        **页码跨会话持久保存（内存 + KV）**：
-          缓存过期后点「下一页」又回到第 1/4 页，根因是旧版把整套状态
-          一起过期、页码跟着一起丢了。
-          现在页码不过期：内存没有就从 KV 读（`_state_load`），
-          真的从未翻过页才从第 1 页开始。
-
-        第 1 次点「下一页」（还没有任何基准）→ 展示第 1 页，
-        用户看到列表后再点一次才是第 2 页 —— 与「翻到下一页」的直觉一致。
+        **页码跨会话持久保存（内存 + KV）**：页码不过期 —— 内存没有就从 KV 读
+        （`_state_load`），真的从未翻过页才从第 1 页开始。缓存过期后点「下一页」
+        又回到第 1 页，根因是旧版把页码和整套状态一起过期。
+        第 1 次点「下一页」（还没有任何基准）展示第 1 页，看到列表后再点一次才是
+        第 2 页，与「翻到下一页」的直觉一致。
         """
         _why = self._session_blocked(event)
         if _why:
@@ -6016,24 +5938,16 @@ class RWInfoPlugin(Star):
     async def cmd_query_room(self, event: AstrMessageEvent, arg: str = ""):
         """查询单个铁锈战争房间的详细信息（显式查房）。
 
-        用法：
-          /铁锈查房 2              查列表里第 2 号房间（需先发 /铁锈列表）
-          /铁锈查房 r5132          直接按房号查询
-          /铁锈查房 1.2.3.4:5123   按 IP:端口 直连查询
-          /铁锈查房 状态           查看今日查房统计
+        用法：`/铁锈查房 2`（列表第 2 号，需先发 `/铁锈列表`）、`/铁锈查房 r5132`（房号）、
+        `/铁锈查房 1.2.3.4:5123`（IP:端口 直连）、`/铁锈查房 状态`（今日查房统计）。
 
-        输出包含：房名、房号、地图、当前/最大人数、房主、收入倍率、
-        初始资金、迷雾、游戏模式、初始单位、是否禁核、共享控制、
-        允许旁观、队伍锁定、玩家列表（需开启玩家列表显示）等。
+        输出：房名、房号、地图、当前/最大人数、房主、收入倍率、初始资金、迷雾、游戏
+        模式、初始单位、禁核、共享控制、允许旁观、队伍锁定、玩家列表（需开启显示）。
 
-        与自动识别不同，这里是用户明确指定目标，所以一定会给出回复：
-        成功返回房间详情，失败也明确说明原因（房号不存在 / 连接超时 /
-        验证码房等），不参与防重复发送的去重，也不会被静默吞掉。
-
-        遇到验证码房会提示「验证码房无法继续」。这是官方中继的反机器人
-        验证机制，硬闯会导致 IP 被封，因此不做重试。
-        使用「序号」形式时，若列表缓存已过期，会提示先重新发一次列表。
-        另：/铁锈查房 状态 查看今日查询统计。
+        用户明确指定目标，一定给回复：成功返回详情，失败说明原因（房号不存在 / 连接
+        超时 / 验证码房），不参与防重复发送去重，也不被静默吞掉。验证码房提示「验证码
+        房无法继续」—— 官方中继的反机器人验证，硬闯会导致 IP 被封，故不重试。用序号
+        形式时若列表缓存已过期，会提示先重新发一次列表。
         """
         # 状态命令走原始参数补全，避免不同框架版本对空格参数分派不一致。
         _raw_arg = self._raw_args(event, arg, "铁锈查房")
@@ -6203,15 +6117,23 @@ class RWInfoPlugin(Star):
             # 解析，被丢掉的房号不会有人捡，静默丢弃等于吞掉用户请求。
             _extra_rids = [r for r in rids[1:] if r != target]
 
-        # 记账：同一条消息若还命中了「自动解析」路径，靠这条时间戳把它挡掉
-        # （避免探针被白占一次、群里出现两条一样的回复）
-        try:
-            self._recent_cmd[f"{self._dedup_key(event)}|{target}"] = time.time()
-        except Exception as e:
-            self.logger.debug(f"[查房] 记录指令查询时间失败(忽略): {e}")
-
         # ---- 分配探针并查询 ----
         idx = self._acquire_probe()
+        # 记账：同一条消息若还命中了「自动解析」路径，靠这条时间戳把它挡掉
+        # （避免探针被白占一次、群里出现两条一样的回复）。
+        # 只在实际拿到探针后记：探针全忙时这条指令根本没查成，
+        # 占用去重窗口会让用户接下来的自动触发也被挡掉。
+        if idx is not None:
+            try:
+                _now = time.time()
+                _ck = f"{self._dedup_key(event)}|{target}"
+                self._recent_cmd[_ck] = _now
+                if len(self._recent_cmd) > 64:
+                    for _k, _ts in list(self._recent_cmd.items()):
+                        if _now - _ts > CMD_DEDUP_WINDOW * 3:
+                            del self._recent_cmd[_k]
+            except Exception as e:
+                self.logger.debug(f"[查房] 记录指令查询时间失败(忽略): {e}")
         if idx is None:
             _ag = self._send_text(event, "探针全部被占用，请稍后再试")
             async for _r in _ag:
@@ -6236,7 +6158,9 @@ class RWInfoPlugin(Star):
                 try:
                     result = await asyncio.wait_for(
                         self._query_room(target, probe_name, gid, explain=True),
-                        timeout=QUERY_TIMEOUT,
+                        # 比探针内部多留 15 秒：内层按退出码给结论，
+                        # 外层同值会先到期，把细分原因全压成「查询超时」。
+                        timeout=QUERY_TIMEOUT + 15,
                     )
                 except asyncio.TimeoutError:
                     result = (
@@ -6244,7 +6168,7 @@ class RWInfoPlugin(Star):
                         f"探针进程没有按期返回，通常是到中继的连接卡住了"
                     )
                 except Exception as e:
-                    # 代码错误 ≠ 房间问题。以前两者都落到「查房无响应」，
+                    # 代码错误 ≠ 房间问题。两者都落到「查房无响应」时，
                     # 结果真出 bug 时反而更难查（要翻日志才知道是 AttributeError）。
                     self.logger.error(f"[查房] {target} 插件内部异常", exc_info=True)
                     result = (
@@ -6272,7 +6196,7 @@ class RWInfoPlugin(Star):
             )
             result = (result or "") + _extra_note if is_room_info(result) else result
         if is_room_info(result):
-            # 记住「这个会话上次查的是哪个房」，供刷新/复述使用。
+            # 记录「这个会话上次查的是哪个房」，供刷新/复述使用。
             # 与翻页状态同源（内存 + KV），重启后仍然有效。
             try:
                 self._remember_room(event, target, desc, result)
@@ -6435,7 +6359,7 @@ class RWInfoPlugin(Star):
         if not arg:
             state = "开启" if self.cfg.get("show_players", False) else "关闭"
             # 这里不写「当前状态：关闭」——官Q 的 Markdown 会把
-            # 「键：值」渲染成单行表格，一句回执套个表头很别扭。
+            # 「键：值」渲染成单行表格，一句回执套表头没有意义。
             _ag = self._send_text(event, f"玩家列表显示当前为「{state}」")
             async for _r in _ag:
                 yield _r
@@ -6458,15 +6382,11 @@ class RWInfoPlugin(Star):
     async def cmd_white(self, event: AstrMessageEvent, arg: str = ""):
         """维护白名单（名单模式为「白」或「混合」时生效）。
 
-        用法：
-          /铁锈白名                      查看当前名单
-          /铁锈白名 +#群号               把群加入白名单
-          /铁锈白名 +@QQ号               把用户加入白名单
-          /铁锈白名 -#群号               从白名单移除
-          /铁锈白名 -@QQ号               从白名单移除
+        用法：/铁锈白名（查看当前名单）、/铁锈白名 +#群号 / +@QQ号（加入）、
+        /铁锈白名 -#群号 / -@QQ号（移除）。
 
-        白名单模式下：只有名单内的群/用户才会自动查房，其余一律不响应。
-        混合模式下会写入「混合白名单」，与黑名单分开管理。
+        白名单模式下只有名单内的群/用户才会自动查房，其余一律不响应。
+        混合模式下写入「混合白名单」，与黑名单分开管理。
         加号与减号可连写多条，用空格分隔。
         """
         _why = self._session_blocked(event)
@@ -6494,15 +6414,11 @@ class RWInfoPlugin(Star):
     async def cmd_black(self, event: AstrMessageEvent, arg: str = ""):
         """维护黑名单（名单模式为「黑」或「混合」时生效）。
 
-        用法：
-          /铁锈黑名                      查看当前名单
-          /铁锈黑名 +#群号               把群加入黑名单
-          /铁锈黑名 +@QQ号               把用户加入黑名单
-          /铁锈黑名 -#群号               从黑名单移除
-          /铁锈黑名 -@QQ号               从黑名单移除
+        用法：/铁锈黑名（查看当前名单）、/铁锈黑名 +#群号 / +@QQ号（加入）、
+        /铁锈黑名 -#群号 / -@QQ号（移除）。
 
-        黑名单模式下：名单内的群/用户不响应，其余都自动查房。
-        混合模式下会写入「混合黑名单」，其中 @用户 优先级高于 #群号。
+        黑名单模式下名单内的群/用户不响应，其余都自动查房。
+        混合模式下写入「混合黑名单」，其中 @用户 优先级高于 #群号。
         加号与减号可连写多条，用空格分隔。
         """
         _why = self._session_blocked(event)
@@ -6568,17 +6484,14 @@ class RWInfoPlugin(Star):
     async def cmd_ignore(self, event: AstrMessageEvent, arg: str = ""):
         """维护「忽略正则」：命中的消息不解析房号。
 
-        用法：
-          /铁锈忽略                    查看内置/自定义规则
-          /铁锈忽略 + <正则>           添加一条（多行可连写多条）
-          /铁锈忽略 - <序号>           按序号删除自定义规则
-          /铁锈忽略 - <正则原文>       按内容删除
-          /铁锈忽略 测试 <文本>        看这段文本会命中哪条规则
-          /铁锈忽略 开|关              总开关
+        用法：/铁锈忽略（查看内置/自定义规则）、/铁锈忽略 + <正则>（添加，多行
+        可连写多条）、/铁锈忽略 - <序号>（按序号删除）、
+        /铁锈忽略 - <正则原文>（按内容删除）、/铁锈忽略 测试 <文本>（看这段文本
+        会命中哪条规则）、/铁锈忽略 开|关（总开关）。
 
-        用途：别的机器人（或本插件的另一个实例）发出来的房间信息、
-        房间列表、错误提示里也全是房号。不挡住就会形成
-        「A 发结果 → B 去查房 → 又发结果」的循环。
+        用途：别的机器人（或本插件的另一个实例）发出来的房间信息、房间列表、
+        错误提示里也全是房号，不挡住就会形成「A 发结果 → B 去查房 → 又发结果」
+        的循环。
         """
         _why = self._session_blocked(event)
         if _why:
@@ -6987,7 +6900,7 @@ class RWInfoPlugin(Star):
                 f"诊断输出异常(已降级为部分输出): {type(err).__name__}: {err}{where}", exc_info=True
             )
             if section:
-                # 用户只要了这一分类 -> 直接说明它挂了，别假装成功
+                # 用户只要了这一分类 -> 直接说明它失败，不要假装成功
                 return f"（该分类生成时抛出 {type(err).__name__}：{err}{where}）"
             # 全量输出时中途崩: 逐分类重跑，能出的都出
             parts = []
@@ -7096,34 +7009,17 @@ class RWInfoPlugin(Star):
     async def cmd_diag(self, event: AstrMessageEvent, arg: str = ""):
         """打印运行时诊断信息，用于排查配置与状态问题。
 
-        输出内容：
-          · 当前会话：群聊/私聊、群号、发送者、是否管理员、
-            撤回配置实际匹配到的键
-          · 撤回配置：本会话是否生效、延迟多少、全部配置条目
-            （格式非法的条目会单独标出来并注明已忽略）
-          · 待撤回消息：逐条显示属于哪个会话、还剩多久撤回、设定延迟多少
-          · 探针池：占用中的编号、可复用编号、空闲容量、在途查询任务数
-          · 房间列表：数据缓存是否还有效、本会话的页码/筛选/序号缓存情况
-          · 主要配置：全局解析、名单模式、私聊查房、显示玩家、重试次数、
-            每页条数、四个名单的条目数、房号冷却与冷却提示、官Q模式、debug
+        分类输出：会话（群聊/私聊、群号、发送者、管理员、撤回配置命中的键）；撤回配置
+        （是否生效、延迟、全部条目、非法条目单列）；待撤回（所属会话、剩余时间、设定
+        延迟）；探针池（占用/可复用编号、空闲容量、在途查询数）；房间列表（缓存有效性、
+        本会话页码/筛选/序号缓存）；主要配置（全局解析、名单模式、私聊查房、显示玩家、
+        重试次数、每页条数、四个名单条目数、房号冷却与提示、官Q模式、debug）。
 
-        为了便于直接判断问题，内部标识已翻译成人话：
-          · 会话键 g#群号@QQ号 显示为「群 123456 / 用户 789」
-          · 时间统一换算成「还剩 1分23秒」这类可读形式
-          · 探针编号不再显示内部递增指针，改为「占用中 / 可复用 / 空闲容量」
-
-        权限：仅管理员（群聊/私聊一致，由 AstrBot 权限系统拦截）
-             —— 私聊用户排查自己会话的问题不需要群主授权。
-        本指令只读不写，不会改动任何配置或状态，可随时执行。
-
-        用法：
-          /铁锈查房调试            输出全部运行时状态
-          /铁锈查房调试 探针       只看某一分类（会话|撤回|探针|列表|配置）
-          /铁锈查房调试菜单        查看「可修改的内部数值」
-
-        关于「调试菜单」配置：它现在只影响本命令的展示方式
-        （关闭后 /铁锈查房调试 <分类> 会被忽略，总是输出全部），
-        不再影响「/铁锈查房调试菜单」这条独立命令。
+        权限：仅管理员（群聊/私聊一致，由 AstrBot 权限系统拦截）；私聊排查自己的会话
+        无需群主授权。只读不写，不改配置与状态。
+        用法：`/铁锈查房调试`（全部）、`/铁锈查房调试 <会话|撤回|探针|列表|配置>`、
+        `/铁锈查房调试菜单`（可修改数值）。「调试菜单」配置只影响本命令展示（关闭后
+        分类参数被忽略、总是输出全部），不影响该独立命令。
         """
         _why = self._session_blocked(event)
         if _why:
@@ -7331,18 +7227,10 @@ class RWInfoPlugin(Star):
     async def cmd_compress(self, event: AstrMessageEvent, arg: str = ""):
         """切换消息压缩范围（视觉折叠）。
 
-        压缩范围统一改一个配置项，按钮不再占用卡片位置，
-        改由本命令与配置面板调整。
-
-        用法：
-          /铁锈压缩                查看当前值
-          /铁锈压缩 关             关闭压缩（= none）
-          /铁锈压缩 查房           只压缩查房结果（= room）
-          /铁锈压缩 列表           只压缩房间列表（= list）
-          /铁锈压缩 调试           只压缩调试输出（= diag）
-          /铁锈压缩 帮助           只压缩帮助与菜单（= help）
-          /铁锈压缩 全部           全部压缩（= all，覆盖前四项）
-
+        压缩范围统一改一个配置项，按钮不再占用卡片位置，改由本命令与配置面板
+        调整。
+        用法：/铁锈压缩（查看当前值）、关（= none）、查房（= room）、列表
+        （= list）、调试（= diag）、帮助（= help）、全部（= all，覆盖前四项）。
         权限：仅管理员（改的是全局配置）。
         """
         _why = self._session_blocked(event)
@@ -7707,24 +7595,16 @@ class RWInfoPlugin(Star):
     async def cmd_probe_ts(self, event: AstrMessageEvent, arg: str = ""):
         """解析探针名后缀，还原探针的进房时间。
 
-        探针在游戏内显示为「ABAB探针NN_xxxxx」，下划线后的 5 位是用
-        base36 编码的「月日时分秒」压缩值，可以无损反解回具体时间。
+        探针在游戏内显示为「ABAB探针NN_xxxxx」，下划线后的 5 位是 base36 编码的
+        「月日时分秒」压缩值，可无损反解回具体时间。
+        用法：/铁锈探针时解 fkhk3（只给 5 位后缀）、
+        /铁锈探针时解 ABAB探针01_fkhk3（直接贴完整探针名）。
+        输出：进房时间（年月日时分秒）及距今多久。用途：在游戏里看到某个探针还
+        占着房间时，反查它是哪一次查房留下的、已待了多久，判断是否为陈旧残留。
 
-        用法：
-          /铁锈探针时解 fkhk3              只给 5 位后缀
-          /铁锈探针时解 ABAB探针01_fkhk3   直接贴完整探针名
-
-        输出：探针的进房时间（年月日时分秒），以及距今已经过去多久。
-        用途：在游戏里看到某个探针还占着房间，可反查它是哪一次查房留下的、
-        已经待了多长时间，用来判断是不是陈旧的残留连接。
-
-        三层校验，避免给出错误时间：
-          · 长度必须正好 5 位
-          · 字符必须在 0-9 / a-z 的 base36 表内
-          · 回环校验：解出的时间重新编码后必须与原串完全一致
-        因此随手编一串字母会被明确拒绝，而不会返回一个看起来合理、
-        实际错误的进房时间。
-
+        三层校验，避免给出错误时间：长度必须正好 5 位；字符必须在 0-9 / a-z 的
+        base36 表内；回环校验（解出的时间重新编码后必须与原串完全一致）。因此
+        随手编一串字母会被明确拒绝，而不会返回看起来合理的错误时间。
         年份按当前年推断；若解出的日期比现在晚超过一天，则判定为去年。
         """
         _why = self._session_blocked(event)
@@ -7803,7 +7683,7 @@ class RWInfoPlugin(Star):
             return
 
         # 回环校验: 把解出的时间重新编码, 必须与原后缀完全一致。
-        # 这一层能挡住"碰巧落在合法范围内、但其实不是编码产物"的字符串
+        # 这一层能挡住"碰巧落在合法范围内、却不是编码产物"的字符串
         # (如 fffff 会解出 12月32日 这种越界值; 而 aaaaa 之类可能解出
         #  看似合法、但重新编码对不上的时间)。
         re_enc = self._ts_encode(month, day, hour, minute, sec)
@@ -7829,19 +7709,15 @@ class RWInfoPlugin(Star):
     async def cmd_recall(self, event: AstrMessageEvent, arg: str = ""):
         """自动撤回配置：按会话独立管理消息自动撤回。
 
-        用法：
-          /铁锈撤回                  查看本会话生效配置
-          /铁锈撤回 列出             列出全部配置（群 / 私聊 / 默认）
-          /铁锈撤回 + #群号:60       添加或修改（可跟多条）
-          /铁锈撤回 - #群号          删除（可跟多条）
-          /铁锈撤回 重置             清空全部配置
-          /铁锈撤回 开|关|秒数       快捷设置本会话
-          /铁锈撤回 + *:60           展开到机器人加入的所有群
+        用法：/铁锈撤回（本会话生效配置）、列出（全部配置：群 / 私聊 / 默认）、
+        + #群号:60（添加或修改，可跟多条）、- #群号（删除，可跟多条）、重置
+        （清空全部）、开|关|秒数（快捷设置本会话）、+ *:60（展开到机器人加入的
+        所有群）。
 
-        权限：仅管理员。由 @filter.permission_type(ADMIN) 统一拦截，
-              群聊与私聊一致，函数内不再做任何权限判断。
-        说明：配置格式为 key:延迟，key 前缀 # 表示群、@ 表示用户、* 表示所有群。
-             写进配置即启用，删掉即关闭。参数末尾加 * 表示对所有群生效。
+        权限：仅管理员，由 @filter.permission_type(ADMIN) 统一拦截，群聊与私聊
+        一致，函数内不再做权限判断。
+        配置格式为 key:延迟，key 前缀 # 表示群、@ 表示用户、* 表示所有群；写进
+        配置即启用，删掉即关闭；参数末尾加 * 表示对所有群生效。
         """
         _why = self._session_blocked(event)
         if _why:
@@ -8066,18 +7942,13 @@ class RWInfoPlugin(Star):
     async def cmd_private_policy(self, event: AstrMessageEvent, arg: str = ""):
         """设置混合模式下私聊的默认策略。
 
-        用法：
-          /铁锈私聊策略           查看当前策略
-          /铁锈私聊策略 白        跟随白名单：不在白名单里的私聊不响应
-          /铁锈私聊策略 黑        跟随黑名单：只拦黑名单里的私聊，其余响应
+        用法：/铁锈私聊策略（查看当前策略）、白（跟随白名单：不在白名单里的私聊
+        不响应）、黑（跟随黑名单：只拦黑名单里的私聊，其余响应）。
 
-        作用范围：仅在 /铁锈模式 为「混合」时生效。
-        用来说明「既不在用户白名单、也不在用户黑名单」的私聊用户该
-        如何处理——默认放行还是默认拦截。
-
-        白名单 / 黑名单模式下不使用此项，直接按对应名单判断即可。
-        选择白（跟随白名单）更保守，能避免陌生人私聊消耗资源；
-        选择黑（跟随黑名单）更开放，只拦黑名单里的人。
+        作用范围：仅在 /铁锈模式 为「混合」时生效，用来说明「既不在用户白名单、
+        也不在用户黑名单」的私聊用户如何处理 —— 默认放行还是默认拦截。
+        白名单 / 黑名单模式下不使用此项，直接按对应名单判断。
+        白更保守，能避免陌生人私聊消耗资源；黑更开放，只拦黑名单里的人。
         """
         _why = self._session_blocked(event)
         if _why:
@@ -8115,17 +7986,14 @@ class RWInfoPlugin(Star):
     async def cmd_private_switch(self, event: AstrMessageEvent, arg: str = ""):
         """开关私聊查房功能。
 
-        用法：
-          /铁锈私聊开关           查看当前状态
-          /铁锈私聊开关 开        允许在私聊中查房
-          /铁锈私聊开关 关        只允许群聊查房，私聊不响应
+        用法：/铁锈私聊开关（查看当前状态）、开（允许在私聊中查房）、关（只允许
+        群聊查房，私聊不响应）。
 
-        关闭后私聊发房号不会触发自动查房，显式 /铁锈查房 也不会响应，
-        可减少陌生人私聊带来的资源消耗与骚扰。
-
-        注意：该开关只管「查房」，不影响自动撤回配置——撤回配置在私聊
-        中依然按 @QQ号 独立生效，不受此开关控制。
-        启用私聊查房时，建议同时用 /铁锈私聊策略 明确陌生人的默认策略。
+        关闭后私聊发房号不会触发自动查房，显式 /铁锈查房 也不响应，可减少陌生人
+        私聊带来的资源消耗与骚扰。
+        该开关只管「查房」，不影响自动撤回配置 —— 撤回配置在私聊中依然按 @QQ号
+        独立生效，不受此开关控制。启用私聊查房时，建议同时用 /铁锈私聊策略 明确
+        陌生人的默认策略。
         """
         _why = self._session_blocked(event)
         if _why:
@@ -8271,8 +8139,7 @@ class RWInfoPlugin(Star):
             text = extract_text_from_event(event, event.message_str or "")
             if not text.strip():
                 return
-            # 先剥掉开头的 @提及：`@机器人 /铁锈查房 s5132` 以前判不出是指令，
-            # 于是显式指令查一次、自动解析又查一次，群里出现两条一样的回复。
+            # 先剥掉开头的 @提及：`@机器人 /铁锈查房 s5132` 不剥则判不出是指令，于是显式指令查一次、自动解析又查一次，群里出现两条一样的回复。
             text = self._strip_leading_mentions(text)
             if not text.strip():
                 return
@@ -8291,7 +8158,7 @@ class RWInfoPlugin(Star):
             # 兜底：正文**任何位置**出现已注册的指令名，都算「在使唤插件」，
             # 一律不从这句话里抽房号。上面两条只覆盖「以指令开头」的写法，
             # 而实际群里会出现 `@机器人 /铁锈查房 s5132`、`帮我 /铁锈列表 一下`、
-            # `。铁锈查房 r5132` 这些形态 —— 以前每一种都会多查一次房。
+            # `。铁锈查房 r5132` 这些形态，不处理则每一种都会多查一次房。
             _cmd = command_in_text(text)
             if _cmd:
                 self.logger.debug(f"[自动查房] 正文含指令「{_cmd}」，跳过房号解析")
@@ -8336,7 +8203,7 @@ class RWInfoPlugin(Star):
             # 「本机待撤回候选: 1 条（s5132）」）和会误判成字母房号的单词
             # （如「名单模式: black」）。若不拦下，别的机器人会把这段
             # 界面文本当作用户查房请求，提取出 ['s5132','black'] 后去查房
-            # —— 实测：第三方发调试信息，官方机器人立刻去查 s5132 并回传。
+            # —— 第三方发调试信息时，官方机器人会立刻去查 s5132 并回传。
             if self._is_plugin_ui_text(text):
                 return
 
